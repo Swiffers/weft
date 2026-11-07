@@ -68,6 +68,43 @@ pub fn upstream_by_wires(g: &ProjectGraph, seeds: &[Located]) -> BTreeSet<Locate
     reached
 }
 
+/// Every place that reads a per-instance value when `seeds` (the places
+/// of `@per_instance` and `@instance_filled` nodes) are per instance: what
+/// runs per instance with them (`super::NodeDefinition::per_instance`).
+/// The walk follows wires, with one more step: a wire landing on a
+/// group's gate decides whether the group runs, so reaching the group's
+/// place reaches everything inside it there (the body behind each call
+/// site among it, one site deeper). A loop's gate lands on its `LoopIn`,
+/// which launches every iteration, so reaching it reaches the loop's
+/// inside. A group's own port (a wire from it) is reached only through
+/// its gate, never on its own: a literal is no instance's value. A body
+/// entered through one site is walked under that site alone ([`step`]),
+/// so one site's instance value never reaches another site's places.
+pub fn per_instance_reach(g: &ProjectGraph, seeds: Vec<Located>) -> BTreeSet<Located> {
+    let mut reached = BTreeSet::new();
+    let mut frontier = seeds;
+    while let Some(at) = frontier.pop() {
+        let opens = if g.group(&at.id).is_some() {
+            Some(at.id.clone())
+        } else {
+            g.node(&at.id)
+                .and_then(|n| n.group_boundary.as_ref())
+                .filter(|b| b.role == super::GroupBoundaryRole::In)
+                .map(|b| b.group_id.clone())
+        };
+        let next: Vec<Located> = outgoing(g, &at)
+            .map(|(_, target)| target)
+            .chain(opens.into_iter().flat_map(|group| members_in(g, &group, &at.path)))
+            .collect();
+        for next in next {
+            if reached.insert(next.clone()) {
+                frontier.push(next);
+            }
+        }
+    }
+    reached
+}
+
 /// Where a value that arrives at a port ends up needed: the input that
 /// would leave its node skipped without it, and the first start of the
 /// run the value passes on the way (where a person hands it).
@@ -241,8 +278,8 @@ pub enum StatePlace {
 
 /// The place `spelled` names (written the way `--from` takes it, read by
 /// [`named`]) whose state a run can tell, or why it has none. A node
-/// inside a loop fires once per iteration, so it is refused like a cut
-/// inside a loop, and the outermost loop around it is named instead; a
+/// inside a loop fires once per iteration, so it is refused, and the
+/// outermost loop around it is named instead; a
 /// plain group or an include's site has no state of its own (it is a
 /// scope: whether it ran is the state of the nodes inside it).
 pub fn state_place(project: &ProjectDefinition, spelled: &str) -> Result<StatePlace, String> {
@@ -278,7 +315,10 @@ pub fn running_places(project: &ProjectDefinition) -> BTreeSet<Located> {
     let index = super::ProgramIndex::build(project);
     every_place(project)
         .into_iter()
-        .filter(|place| index.admits(&place.id, &place.frames()) && !index.stands_in(&place.id, &place.frames()))
+        .filter(|place| {
+            let frames = index.frames_at(project, place);
+            index.admits(&place.id, &frames) && !index.stands_in(&place.id, &frames)
+        })
         .collect()
 }
 
@@ -446,10 +486,10 @@ pub fn named(g: &impl GraphView, spelled: &str) -> Result<Named, String> {
 
 /// The outermost loop `named` runs inside, at the place the loop runs, if
 /// any: a loop around the node or group itself, or around any site on its
-/// call path (a call inside a loop runs whole with the loop). A loop's own
-/// boundaries are inside it; a loop is not inside itself. A loop runs once
-/// per iteration as a whole, so a place inside one is no end of a run and
-/// has no one state: the loop is what is named instead.
+/// call path (a call inside a loop runs once per iteration with the loop).
+/// A loop's own boundaries are inside it; a loop is not inside itself. A
+/// place inside a loop fires once per iteration, so it has no one state:
+/// the loop is what is named instead.
 pub fn loop_around(g: &impl GraphView, named: &Named) -> Option<Located> {
     match named {
         Named::Node(place) => enclosing_loops(g, place).into_iter().next(),

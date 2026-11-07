@@ -174,12 +174,13 @@
                 },
             ],
             features: Default::default(),
-            requires_infra: false, per_instance: None,
-            fires_with: Default::default(), baked_outputs: Default::default(),
+            requires_infra: false, per_instance: None, per_instance_paths: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
             images: vec![],
             published_service: None,
             instance_service: None,
             instance_rules: None,
+            recheck: Vec::new(),
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -236,12 +237,13 @@
                 declared_type: None,
             }],
             features: Default::default(),
-            requires_infra: false, per_instance: None,
-            fires_with: Default::default(), baked_outputs: Default::default(),
+            requires_infra: false, per_instance: None, per_instance_paths: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
             images: vec![],
             published_service: None,
             instance_service: None,
             instance_rules: None,
+            recheck: Vec::new(),
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -285,12 +287,13 @@
                 declared_type: None,
             }],
             features: Default::default(),
-            requires_infra: false, per_instance: None,
-            fires_with: Default::default(), baked_outputs: Default::default(),
+            requires_infra: false, per_instance: None, per_instance_paths: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
             images: vec![],
             published_service: None,
             instance_service: None,
             instance_rules: None,
+            recheck: Vec::new(),
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -325,12 +328,13 @@
             }]),
             outputs: vec![],
             features: Default::default(),
-            requires_infra: false, per_instance: None,
-            fires_with: Default::default(), baked_outputs: Default::default(),
+            requires_infra: false, per_instance: None, per_instance_paths: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
             images: vec![],
             published_service: None,
             instance_service: None,
             instance_rules: None,
+            recheck: Vec::new(),
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -1083,12 +1087,13 @@
                 })
                 .collect(),
             features: Default::default(),
-            requires_infra: false, per_instance: None,
-            fires_with: Default::default(), baked_outputs: Default::default(),
+            requires_infra: false, per_instance: None, per_instance_paths: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
             images: vec![],
             published_service: None,
             instance_service: None,
             instance_rules: None,
+            recheck: Vec::new(),
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -1144,10 +1149,11 @@
                 PortDefinition { name: "acc".into(),   port_type: primitive(WeftPrimitive::String), required: false, description: None, synthesized_from_carry: false, declared_type: None },
                 PortDefinition { name: "index".into(), port_type: primitive(WeftPrimitive::Number), required: false, description: None, synthesized_from_carry: false, declared_type: None },
             ],
-            features: Default::default(), requires_infra: false, per_instance: None, images: vec![], fires_with: Default::default(), baked_outputs: Default::default(),
+            features: Default::default(), requires_infra: false, per_instance: None, per_instance_paths: Default::default(), images: vec![], fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
             published_service: None,
             instance_service: None,
             instance_rules: None,
+            recheck: Vec::new(),
             span: None, header_span: None, config_spans: Default::default(),
             optional_ports: Default::default(),
             port_literals: Default::default(), port_literal_spans: Default::default(), port_literal_types: Default::default(), metadata_ports: Vec::new(),
@@ -1169,10 +1175,11 @@
                 PortDefinition { name: "results".into(), port_type: list_of_nullable(primitive(WeftPrimitive::String)), required: false, description: None, synthesized_from_carry: false, declared_type: None },
                 PortDefinition { name: "acc".into(),     port_type: primitive(WeftPrimitive::String),                   required: false, description: None, synthesized_from_carry: false, declared_type: None },
             ],
-            features: Default::default(), requires_infra: false, per_instance: None, images: vec![], fires_with: Default::default(), baked_outputs: Default::default(),
+            features: Default::default(), requires_infra: false, per_instance: None, per_instance_paths: Default::default(), images: vec![], fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
             published_service: None,
             instance_service: None,
             instance_rules: None,
+            recheck: Vec::new(),
             span: None, header_span: None, config_spans: Default::default(),
             optional_ports: Default::default(),
             port_literals: Default::default(), port_literal_spans: Default::default(), port_literal_types: Default::default(), metadata_ports: Vec::new(),
@@ -1195,10 +1202,11 @@
                 PortDefinition { name: "acc".into(), port_type: primitive(WeftPrimitive::String), required: false, description: None, synthesized_from_carry: false, declared_type: None },
                 PortDefinition { name: "done".into(), port_type: primitive(WeftPrimitive::Boolean), required: false, description: None, synthesized_from_carry: false, declared_type: None },
             ],
-            features: Default::default(), requires_infra: false, per_instance: None, images: vec![], fires_with: Default::default(), baked_outputs: Default::default(),
+            features: Default::default(), requires_infra: false, per_instance: None, per_instance_paths: Default::default(), images: vec![], fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
             published_service: None,
             instance_service: None,
             instance_rules: None,
+            recheck: Vec::new(),
             span: None, header_span: None, config_spans: Default::default(),
             optional_ports: Default::default(),
             port_literals: Default::default(), port_literal_spans: Default::default(), port_literal_types: Default::default(), metadata_ports: Vec::new(),
@@ -1212,10 +1220,11 @@
                 PortDefinition { name: "data".into(),  port_type: list_of_nullable(primitive(WeftPrimitive::String)), required: true, description: None, synthesized_from_carry: false, declared_type: None },
                 PortDefinition { name: "final".into(), port_type: primitive(WeftPrimitive::String),                    required: true, description: None, synthesized_from_carry: false, declared_type: None },
             ]),
-            outputs: vec![], features: Default::default(), requires_infra: false, per_instance: None, images: vec![], fires_with: Default::default(), baked_outputs: Default::default(),
+            outputs: vec![], features: Default::default(), requires_infra: false, per_instance: None, per_instance_paths: Default::default(), images: vec![], fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
             published_service: None,
             instance_service: None,
             instance_rules: None,
+            recheck: Vec::new(),
             span: None, header_span: None, config_spans: Default::default(),
             optional_ports: Default::default(),
             port_literals: Default::default(), port_literal_spans: Default::default(), port_literal_types: Default::default(), metadata_ports: Vec::new(),
@@ -1523,4 +1532,575 @@
             .map(|p| (*p.value).clone())
             .collect();
         assert_eq!(carry_at_2, vec![serde_json::json!("a")], "iteration 2 starts from the kept carry");
+    }
+
+    // A loop run through the real run loop, from the kicks a run's start
+    // makes (`KickPlan::for_program`) to its terminal: what a loop with no
+    // output port needs, an iteration that ends with nothing written into
+    // its `LoopOut`, only exists once a whole run runs.
+
+    /// Emits the list the test gives it, for the loop to walk.
+    struct Lister {
+        items: serde_json::Value,
+    }
+    super::engine_test_rig::test_manifest!(Lister, "Lister");
+    #[async_trait]
+    impl weft_core::Node for Lister {
+        async fn run(&self, ctx: weft_core::RunContext) -> weft_core::error::WeftResult<()> {
+            ctx.pulse_downstream(weft_core::node::NodeOutput::new().set("items", self.items.clone())).await
+        }
+    }
+
+    /// The loop's body: writes down each value it is handed and passes it on.
+    struct Tally {
+        seen: Arc<StdMutex<Vec<serde_json::Value>>>,
+    }
+    super::engine_test_rig::test_manifest!(Tally, "Tally");
+    #[async_trait]
+    impl weft_core::Node for Tally {
+        async fn run(&self, ctx: weft_core::RunContext) -> weft_core::error::WeftResult<()> {
+            let value: serde_json::Value = ctx.inputs.get("value")?;
+            self.seen.lock().unwrap().push(value.clone());
+            ctx.pulse_downstream(weft_core::node::NodeOutput::new().set("value", value)).await
+        }
+    }
+
+    /// `lister.items -> l (Loop over items) -> ...`, the body `tally` fed
+    /// each item. With `gathers`, `tally.value` is written into the loop's
+    /// `results` and the gathered list reaches `sink`; without, the loop
+    /// has no output port and nothing writes into its `LoopOut`.
+    fn walked_loop_project(parallel: bool, gathers: bool) -> ProjectDefinition {
+        let loop_config = serde_json::json!({ "parallel": parallel, "over": ["items"], "carry": [] });
+        let mut loop_out_inputs = vec![serde_json::json!({ "name": "done", "portType": "Boolean", "required": false, "optional": true })];
+        let mut loop_out_outputs = Vec::new();
+        let mut nodes = vec![
+            serde_json::json!({
+                "id": "lister", "nodeType": "Lister", "label": null, "config": null, "position": { "x": 0.0, "y": 0.0 },
+                "inputs": [], "outputs": [{ "name": "items", "portType": "List[Number]", "required": false }],
+                "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
+            }),
+            serde_json::json!({
+                "id": "l__in", "nodeType": "LoopIn", "label": null,
+                "config": { "parentId": "l", "parallel": parallel, "over": ["items"], "carry": [] },
+                "position": { "x": 0.0, "y": 0.0 },
+                "inputs": [{ "name": "items", "portType": "List[Number]", "required": true }],
+                "outputs": [
+                    { "name": "items", "portType": "Number", "required": false },
+                    { "name": "index", "portType": "Number", "required": false }
+                ],
+                "features": {}, "scope": [], "requiresInfra": false, "images": [],
+                "groupBoundary": { "groupId": "l", "role": "In" }
+            }),
+            serde_json::json!({
+                "id": "tally", "nodeType": "Tally", "label": null, "config": null, "position": { "x": 0.0, "y": 0.0 },
+                "inputs": [{ "name": "value", "portType": "Number", "required": true }],
+                "outputs": [{ "name": "value", "portType": "Number", "required": false }],
+                "features": {}, "scope": ["l"], "groupBoundary": null, "requiresInfra": false, "images": []
+            }),
+        ];
+        let mut edges = vec![
+            serde_json::json!({ "id": "e1", "source": "lister", "sourceHandle": "items", "target": "l__in", "targetHandle": "items" }),
+            serde_json::json!({ "id": "e2", "source": "l__in", "sourceHandle": "items", "target": "tally", "targetHandle": "value" }),
+        ];
+        if gathers {
+            loop_out_inputs.insert(0, serde_json::json!({ "name": "results", "portType": "Number", "required": false, "optional": true }));
+            loop_out_outputs.push(serde_json::json!({ "name": "results", "portType": "List[Number | Null]", "required": true }));
+            nodes.push(serde_json::json!({
+                "id": "sink", "nodeType": "Tally", "label": null, "config": null, "position": { "x": 0.0, "y": 0.0 },
+                "inputs": [{ "name": "value", "portType": "List[Number | Null]", "required": true }],
+                "outputs": [{ "name": "value", "portType": "List[Number | Null]", "required": false }],
+                "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
+            }));
+            edges.push(serde_json::json!({ "id": "e3", "source": "tally", "sourceHandle": "value", "target": "l__out", "targetHandle": "results" }));
+            edges.push(serde_json::json!({ "id": "e4", "source": "l__out", "sourceHandle": "results", "target": "sink", "targetHandle": "value" }));
+        }
+        nodes.push(serde_json::json!({
+            "id": "l__out", "nodeType": "LoopOut", "label": null,
+            "config": { "parentId": "l" }, "position": { "x": 0.0, "y": 0.0 },
+            "inputs": loop_out_inputs, "outputs": loop_out_outputs,
+            "features": {}, "scope": [], "requiresInfra": false, "images": [],
+            "groupBoundary": { "groupId": "l", "role": "Out" }
+        }));
+        serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4(),
+            "nodes": nodes,
+            "edges": edges,
+            "groups": [{ "id": "l", "kind": "loop", "nodeIds": ["tally"], "loopConfig": loop_config }],
+            "createdAt": parse_dt(),
+            "updatedAt": parse_dt(),
+        }))
+        .expect("walked loop project")
+    }
+
+    /// A run's birth rows: its start, and a kick for every root its start
+    /// kicks, as the dispatcher writes them.
+    fn born(project: &ProjectDefinition, run_id: RunId) -> Vec<RunEvent> {
+        let mut rows = vec![RunEvent::RunStarted { given: Default::default(),
+            run_id, project_id: project.id, entry_node: "lister".into(),
+            phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()), cut_from: None, binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
+            seed: None, instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            settings: Default::default(),
+        }];
+        rows.extend(weft_core::run_spec::KickPlan::for_program(project, None, None).into_iter().map(|kick| RunEvent::NodeKicked {
+            run_id, node_id: kick.node, frames: kick.frames, firing: false, payload: None, port_snapshot: None, at_unix: 0,
+        }));
+        rows
+    }
+
+    /// Drive a run of `project` over `rows` (its birth rows, or a resume's
+    /// whole journal so far) with a lister handing `items`: the worker's
+    /// tables, every row the journal holds after, and what `tally` saw.
+    async fn walk(
+        project: &ProjectDefinition,
+        items: serde_json::Value,
+        run_id: RunId,
+        rows: Vec<RunEvent>,
+    ) -> (Drove, Vec<RunEvent>, Vec<serde_json::Value>) {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let cat = super::engine_test_rig::catalog(vec![
+            ("Lister", Box::new(Lister { items })),
+            ("Tally", Box::new(Tally { seen: seen.clone() })),
+        ]);
+        let (drove, events) = super::engine_test_rig::drive_journal_observed(project.clone(), cat, run_id, rows, CancellationFlag::new_arc()).await;
+        let drove = drove.expect("the loop run drives");
+        super::engine_test_rig::assert_fold_matches_live(project, &events, Default::default(), &drove);
+        let seen = seen.lock().unwrap().clone();
+        (drove, events, seen)
+    }
+
+    /// The frames each of `node`'s firings completed at, sorted.
+    fn completed_at(events: &[RunEvent], node: &str) -> Vec<Vec<u32>> {
+        let mut at: Vec<Vec<u32>> = events.iter().filter_map(|event| match event {
+            RunEvent::NodeCompleted { node_id, frames, .. } if node_id == node => Some(weft_core::frames::loop_indices(frames)),
+            _ => None,
+        }).collect();
+        at.sort();
+        at
+    }
+
+    weft_core::stress_test! {
+        name: a_loop_with_no_output_ends_over_an_empty_list_and_over_items,
+        runs: 8,
+        worker_threads: 4,
+        async fn body() {
+            for parallel in [false, true] {
+                let project = walked_loop_project(parallel, false);
+                assert!(
+                    !born(&project, uuid::Uuid::nil()).iter().any(|row| matches!(row, RunEvent::NodeKicked { node_id, .. } if node_id == "l__out")),
+                    "a run's start never kicks a LoopOut (parallel {parallel})",
+                );
+
+                // Zero iterations: the LoopIn ends the loop on its own.
+                let run_id = uuid::Uuid::new_v4();
+                let (drove, events, seen) = walk(&project, serde_json::json!([]), run_id, born(&project, run_id)).await;
+                assert!(matches!(drove.outcome, RunOutcome::Completed), "parallel {parallel}, []: {:?}", drove.outcome);
+                assert!(seen.is_empty(), "parallel {parallel}: no iteration, no body: {seen:?}");
+                assert!(completed_at(&events, "l__out").is_empty(), "parallel {parallel}: no iteration, no LoopOut");
+
+                // Two iterations: each fires its LoopOut, and the body ran in each.
+                let run_id = uuid::Uuid::new_v4();
+                let (drove, events, mut seen) = walk(&project, serde_json::json!([1, 2]), run_id, born(&project, run_id)).await;
+                assert!(matches!(drove.outcome, RunOutcome::Completed), "parallel {parallel}, [1, 2]: {:?}", drove.outcome);
+                seen.sort_by_key(|value| value.as_i64());
+                assert_eq!(seen, vec![serde_json::json!(1), serde_json::json!(2)], "parallel {parallel}: the body ran once per item");
+                assert_eq!(completed_at(&events, "tally"), vec![vec![0], vec![1]], "parallel {parallel}");
+                assert_eq!(completed_at(&events, "l__out"), vec![vec![0], vec![1]], "parallel {parallel}: one LoopOut per iteration, none at the loop's frames");
+            }
+        }
+    }
+
+    weft_core::stress_test! {
+        name: a_loop_with_no_output_resumed_after_its_first_launch_ends_without_running_an_iteration_twice,
+        runs: 8,
+        worker_threads: 4,
+        async fn body() {
+            let project = walked_loop_project(false, false);
+            let run_id = uuid::Uuid::new_v4();
+            let (_, whole, _) = walk(&project, serde_json::json!([1, 2]), run_id, born(&project, run_id)).await;
+            // The worker went away right after launching iteration 0,
+            // before anything inside it fired: a new one folds the journal
+            // so far, which kicks that iteration's LoopOut again, and
+            // carries on from there. (A later cut would catch `tally`
+            // mid-run, which a resume fails on purpose.)
+            let cut = whole.iter().position(|row| matches!(row, RunEvent::LoopIterationLaunched { index: 0, .. }))
+                .expect("iteration 0 launched");
+            assert!(!whole[..=cut].iter().any(|row| matches!(row, RunEvent::NodeStarted { node_id, .. } if node_id == "l__out" || node_id == "tally")),
+                "the cut is before anything inside the loop fired");
+            let (drove, events, _) = walk(&project, serde_json::json!([1, 2]), run_id, whole[..=cut].to_vec()).await;
+            assert!(matches!(drove.outcome, RunOutcome::Completed), "{:?}", drove.outcome);
+            assert_eq!(completed_at(&events, "tally"), vec![vec![0], vec![1]], "each iteration's body once, across both workers");
+            assert_eq!(completed_at(&events, "l__out"), vec![vec![0], vec![1]], "each iteration's LoopOut once, across both workers");
+        }
+    }
+
+    weft_core::stress_test! {
+        name: a_loop_with_an_output_still_gathers_what_its_body_writes,
+        runs: 8,
+        worker_threads: 4,
+        async fn body() {
+            for parallel in [false, true] {
+                let project = walked_loop_project(parallel, true);
+                for (items, gathered) in [(serde_json::json!([]), serde_json::json!([])), (serde_json::json!([1, 2]), serde_json::json!([1, 2]))] {
+                    let run_id = uuid::Uuid::new_v4();
+                    let (drove, events, seen) = walk(&project, items.clone(), run_id, born(&project, run_id)).await;
+                    assert!(matches!(drove.outcome, RunOutcome::Completed), "parallel {parallel}, {items}: {:?}", drove.outcome);
+                    // The body records each item it ran on, the sink the one
+                    // list it was given: exactly those, nothing twice.
+                    let (lists, mut ran): (Vec<serde_json::Value>, Vec<serde_json::Value>) = seen.into_iter().partition(|value| value.is_array());
+                    ran.sort_by_key(|value| value.as_i64());
+                    assert_eq!(lists, vec![gathered], "parallel {parallel}, {items}: the sink got the gathered list once");
+                    assert_eq!(serde_json::Value::Array(ran), items, "parallel {parallel}, {items}: the body ran once per item");
+                    assert_eq!(completed_at(&events, "sink"), vec![Vec::<u32>::new()], "parallel {parallel}, {items}");
+                }
+            }
+        }
+    }
+
+    // A loop launches its iterations and does not own them: an iteration
+    // that keeps working after its `LoopOut` fired outlives the loop, and
+    // the run, and its memory of the iteration, wait for it.
+
+    /// A loop's body that outlives its loop: opens a bus on `bus`, which
+    /// is what its `LoopOut` gathers, then answers the first `ask` it gets
+    /// with the item it was handed, the ask, and who asked, and returns.
+    struct Server;
+    super::engine_test_rig::test_manifest!(Server, "Server");
+    #[async_trait]
+    impl weft_core::Node for Server {
+        async fn run(&self, ctx: weft_core::RunContext) -> weft_core::error::WeftResult<()> {
+            let item: serde_json::Value = ctx.inputs.get("value")?;
+            let mut state = ctx.keep(()).await?;
+            let bus = ctx.open_bus("bus", Default::default(), "server").await?;
+            let mut asks = bus.cursor()?;
+            let asked = asks.next_json("ask", &mut state).await?;
+            let Some((from, ask)) = asked else {
+                return Err(weft_core::error::WeftError::NodeFailed("the bus closed before anyone asked".into()));
+            };
+            bus.send("answer", serde_json::json!({ "item": item, "ask": ask, "from": from }))
+                .map_err(|e| weft_core::error::WeftError::NodeFailed(format!("send the answer: {e:?}")))
+        }
+    }
+
+    /// What the asker keeps: the bus it is on, whether it asked there, and
+    /// the answer it is reading.
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
+    struct Asking {
+        index: usize,
+        sent: bool,
+        answer: Option<weft_core::bus::BusEntry>,
+    }
+
+    /// After the loop: asks every gathered bus, in gather order, with its
+    /// index, and writes down `(index, who answered, the answer)`. Each
+    /// answer is read through the state: buses read directly in turn at one
+    /// line would be a new place each, after a direct read.
+    struct Asker {
+        answers: Arc<StdMutex<Vec<(usize, String, serde_json::Value)>>>,
+    }
+    super::engine_test_rig::test_manifest!(Asker, "Asker");
+    #[async_trait]
+    impl weft_core::Node for Asker {
+        async fn run(&self, ctx: weft_core::RunContext) -> weft_core::error::WeftResult<()> {
+            let failed = |what: &str, e: &dyn std::fmt::Debug| weft_core::error::WeftError::NodeFailed(format!("{what}: {e:?}"));
+            let buses: Vec<serde_json::Value> = ctx.inputs.get("buses")?;
+            let mut state = ctx.keep(Asking::default()).await?;
+            while let Some(marker) = buses.get(state.index) {
+                let mut bus = ctx.bus(marker)?;
+                bus.register("asker").map_err(|e| failed("register", &e))?;
+                let mut answers = bus.cursor()?.with_filter(|entry| entry.as_json().is_some_and(|(kind, _)| kind == "answer"));
+                if !state.sent {
+                    bus.send("ask", serde_json::json!(state.index)).map_err(|e| failed("send the ask", &e))?;
+                    state.sent = true;
+                }
+                let answered = state.read(|s| &mut s.answer, &mut answers).await?.ok_or_else(|| failed("the bus closed unanswered", &state.index))?;
+                let weft_core::bus::BusEntryKind::Message { from, .. } = &answered.kind else { unreachable!("the filter keeps messages") };
+                let (_, answer) = answered.as_json().expect("the filter keeps JSON answers");
+                self.answers.lock().unwrap().push((state.index, from.clone(), answer.clone()));
+                state.answer = None;
+                state.sent = false;
+                state.index += 1;
+            }
+            Ok(())
+        }
+    }
+
+    /// `lister.items -> l (parallel Loop over items)`, the body `server`
+    /// opening a bus the loop gathers into `buses`, which reach `asker`.
+    fn outliving_loop_project() -> ProjectDefinition {
+        let loop_config = serde_json::json!({ "parallel": true, "over": ["items"], "carry": [] });
+        serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4(),
+            "nodes": [
+                {
+                    "id": "lister", "nodeType": "Lister", "label": null, "config": null, "position": { "x": 0.0, "y": 0.0 },
+                    "inputs": [], "outputs": [{ "name": "items", "portType": "List[Number]", "required": false }],
+                    "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
+                },
+                {
+                    "id": "l__in", "nodeType": "LoopIn", "label": null,
+                    "config": { "parentId": "l", "parallel": true, "over": ["items"], "carry": [] },
+                    "position": { "x": 0.0, "y": 0.0 },
+                    "inputs": [{ "name": "items", "portType": "List[Number]", "required": true }],
+                    "outputs": [
+                        { "name": "items", "portType": "Number", "required": false },
+                        { "name": "index", "portType": "Number", "required": false }
+                    ],
+                    "features": {}, "scope": [], "requiresInfra": false, "images": [],
+                    "groupBoundary": { "groupId": "l", "role": "In" }
+                },
+                {
+                    "id": "server", "nodeType": "Server", "label": null, "config": null, "position": { "x": 0.0, "y": 0.0 },
+                    "inputs": [{ "name": "value", "portType": "Number", "required": true }],
+                    "outputs": [{ "name": "bus", "portType": "Bus", "required": false }],
+                    "features": {}, "scope": ["l"], "groupBoundary": null, "requiresInfra": false, "images": []
+                },
+                {
+                    "id": "l__out", "nodeType": "LoopOut", "label": null,
+                    "config": { "parentId": "l" }, "position": { "x": 0.0, "y": 0.0 },
+                    "inputs": [
+                        { "name": "buses", "portType": "Bus", "required": false, "optional": true },
+                        { "name": "done", "portType": "Boolean", "required": false, "optional": true }
+                    ],
+                    "outputs": [{ "name": "buses", "portType": "List[Bus | Null]", "required": true }],
+                    "features": {}, "scope": [], "requiresInfra": false, "images": [],
+                    "groupBoundary": { "groupId": "l", "role": "Out" }
+                },
+                {
+                    "id": "asker", "nodeType": "Asker", "label": null, "config": null, "position": { "x": 0.0, "y": 0.0 },
+                    "inputs": [{ "name": "buses", "portType": "List[Bus | Null]", "required": true }],
+                    "outputs": [],
+                    "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
+                }
+            ],
+            "edges": [
+                { "id": "e1", "source": "lister", "sourceHandle": "items", "target": "l__in", "targetHandle": "items" },
+                { "id": "e2", "source": "l__in", "sourceHandle": "items", "target": "server", "targetHandle": "value" },
+                { "id": "e3", "source": "server", "sourceHandle": "bus", "target": "l__out", "targetHandle": "buses" },
+                { "id": "e4", "source": "l__out", "sourceHandle": "buses", "target": "asker", "targetHandle": "buses" }
+            ],
+            "groups": [{ "id": "l", "kind": "loop", "nodeIds": ["server"], "loopConfig": loop_config }],
+            "createdAt": parse_dt(),
+            "updatedAt": parse_dt(),
+        }))
+        .expect("outliving loop project")
+    }
+
+    /// What a worker driving the run on `rows` (its record so far) has
+    /// forgotten, read the way it folds a record it carries a run on from.
+    fn forgetting_after(project: &ProjectDefinition, rows: &[RunEvent]) -> weft_core::run::forget::Forgetting {
+        let run_id = rows.first().expect("the record starts with its birth").run_id();
+        let mut live = weft_journal::LiveFold::from(weft_journal::Fold::new(run_id, Arc::new(project.clone())).driving(), Default::default());
+        live.apply(&super::engine_test_rig::record_rows(rows)).expect("journal folds");
+        let mut fold = live.into_fold().expect("the record starts with its birth");
+        fold.read_to_the_end();
+        fold.into_snapshot().forgetting.expect("a driving fold forgets")
+    }
+
+    weft_core::stress_test! {
+        name: a_parallel_loop_ends_while_its_iterations_still_serve_their_buses,
+        runs: 4,
+        worker_threads: 4,
+        async fn body() {
+            const ITEMS: u32 = 20;
+            let project = outliving_loop_project();
+            let run_id = uuid::Uuid::new_v4();
+            let answers = Arc::new(StdMutex::new(Vec::new()));
+            let cat = super::engine_test_rig::catalog(vec![
+                ("Lister", Box::new(Lister { items: serde_json::json!((0..ITEMS).map(|i| 100 + i).collect::<Vec<_>>()) })),
+                ("Server", Box::new(Server)),
+                ("Asker", Box::new(Asker { answers: answers.clone() })),
+            ]);
+            let driving = super::engine_test_rig::drive_journal_observed(project.clone(), cat, run_id, born(&project, run_id), CancellationFlag::new_arc());
+            let (drove, events) = tokio::time::timeout(std::time::Duration::from_secs(30), driving).await.expect("the run ends");
+            let drove = drove.expect("the run drives");
+            assert!(matches!(drove.outcome, RunOutcome::Completed), "{:?}", drove.outcome);
+            super::engine_test_rig::assert_fold_matches_live(&project, &events, Default::default(), &drove);
+
+            // Each gathered bus reaches the iteration that opened it, still
+            // there to answer.
+            let mut answers = answers.lock().unwrap().clone();
+            answers.sort_by_key(|(index, _, _)| *index);
+            let expected: Vec<(usize, String, serde_json::Value)> = (0..ITEMS as usize)
+                .map(|i| (i, "server".to_string(), serde_json::json!({ "item": 100 + i, "ask": i, "from": "asker" })))
+                .collect();
+            assert_eq!(answers, expected, "every gathered bus answered by its own iteration");
+
+            // The loop ended before any body returned, and the run after the
+            // last one did.
+            let position = |pick: &dyn Fn(&RunEvent) -> bool| -> Vec<usize> {
+                events.iter().enumerate().filter(|(_, row)| pick(row)).map(|(at, _)| at).collect()
+            };
+            let loop_ended = position(&|row| matches!(row, RunEvent::LoopTerminated { group_id, .. } if group_id == "l"));
+            assert_eq!(loop_ended.len(), 1, "the loop ends once");
+            let loop_ended = loop_ended[0];
+            assert_eq!(position(&|row| matches!(row, RunEvent::LoopOutFired { .. })).len(), ITEMS as usize);
+            assert!(position(&|row| matches!(row, RunEvent::LoopOutFired { .. })).iter().all(|at| *at < loop_ended));
+            let returned: Vec<(u32, usize)> = events.iter().enumerate().filter_map(|(at, row)| match row {
+                RunEvent::NodeCompleted { node_id, frames, .. } if node_id == "server" => Some((weft_core::frames::loop_indices(frames)[0], at)),
+                _ => None,
+            }).collect();
+            let mut returned_indices: Vec<u32> = returned.iter().map(|(index, _)| *index).collect();
+            returned_indices.sort();
+            assert_eq!(returned_indices, (0..ITEMS).collect::<Vec<_>>(), "every body returned once");
+            let first_return = returned.iter().map(|(_, at)| *at).min().unwrap();
+            let last_return = returned.iter().map(|(_, at)| *at).max().unwrap();
+            assert!(loop_ended < first_return, "the loop ended (row {loop_ended}) before any body returned (row {first_return})");
+            let asked_from = position(&|row| matches!(row, RunEvent::NodeStarted { node_id, .. } if node_id == "asker"));
+            assert!(asked_from.len() == 1 && asked_from[0] > loop_ended, "the asker starts once, after the loop ended: {asked_from:?}");
+            let run_completed = position(&|row| matches!(row, RunEvent::RunCompleted { .. }));
+            assert!(run_completed.len() == 1 && run_completed[0] > last_return, "the run completes once, after the last body returned (row {last_return}): {run_completed:?}");
+
+            // Each iteration is held until its body returns and forgotten
+            // once it did, the loop long ended either way.
+            let key = LoopInstanceKey { group_id: "l".into(), parent_frames: vec![], run_id };
+            for (index, at) in &returned {
+                let copy = weft_core::project::scopes::ScopeCopy::new("l", vec![Frame::Loop { index: *index }]);
+                let before = forgetting_after(&project, &events[..*at]);
+                assert!(before.holds_iteration(&copy) && !before.forgot_iteration(&key, *index), "iteration {index} is held while its body runs");
+                let after = forgetting_after(&project, &events[..=*at]);
+                assert!(!after.holds_iteration(&copy) && after.forgot_iteration(&key, *index), "iteration {index} is forgotten once its body returned");
+            }
+        }
+    }
+
+    /// `lister.items -> l (Loop over items)`: in the body, `a` reads the
+    /// item and `l` gathers it; `spread` passes the list it is handed into
+    /// the inner loop `l.m`, whose body `l.m.c` reads each item, and `after`
+    /// reads what `l.m` gathers. Two loops deep for a cut inside `l.m`'s
+    /// body.
+    fn nested_loop_project() -> ProjectDefinition {
+        let node = |id: &str, node_type: &str, scope: &[&str], inputs: serde_json::Value, outputs: serde_json::Value| serde_json::json!({
+            "id": id, "nodeType": node_type, "label": null, "config": null, "position": { "x": 0.0, "y": 0.0 },
+            "inputs": inputs, "outputs": outputs, "features": {}, "scope": scope, "groupBoundary": null, "requiresInfra": false, "images": []
+        });
+        let boundary = |group: &str, role: &str, scope: &[&str], inputs: serde_json::Value, outputs: serde_json::Value| {
+            let (suffix, node_type, config) = if role == "In" {
+                ("__in", "LoopIn", serde_json::json!({ "parentId": group, "parallel": false, "over": ["items"], "carry": [] }))
+            } else {
+                ("__out", "LoopOut", serde_json::json!({ "parentId": group }))
+            };
+            serde_json::json!({
+                "id": format!("{group}{suffix}"), "nodeType": node_type, "label": null, "config": config,
+                "position": { "x": 0.0, "y": 0.0 }, "inputs": inputs, "outputs": outputs, "features": {}, "scope": scope,
+                "requiresInfra": false, "images": [], "groupBoundary": { "groupId": group, "role": role }
+            })
+        };
+        let port = |name: &str, ty: &str| serde_json::json!({ "name": name, "portType": ty, "required": true });
+        let gather = |name: &str, ty: &str| serde_json::json!({ "name": name, "portType": ty, "required": false, "optional": true });
+        let done = gather("done", "Boolean");
+        let loop_in = |group: &str, scope: &[&str]| boundary(group, "In", scope,
+            serde_json::json!([port("items", "List[Number]")]),
+            serde_json::json!([{ "name": "items", "portType": "Number", "required": false }, { "name": "index", "portType": "Number", "required": false }]));
+        let loop_out = |group: &str, scope: &[&str]| boundary(group, "Out", scope,
+            serde_json::json!([gather("results", "Number"), done.clone()]),
+            serde_json::json!([port("results", "List[Number | Null]")]));
+        let wire = |id: &str, source: &str, source_port: &str, target: &str, target_port: &str| serde_json::json!({
+            "id": id, "source": source, "sourceHandle": source_port, "target": target, "targetHandle": target_port
+        });
+        let lists = serde_json::json!([{ "name": "items", "portType": "List[Number]", "required": false }]);
+        let tally = |ty: &str| (serde_json::json!([port("value", ty)]), serde_json::json!([{ "name": "value", "portType": ty, "required": false }]));
+        let (number_in, number_out) = tally("Number");
+        let (list_in, list_out) = tally("List[Number | Null]");
+        serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4(),
+            "nodes": [
+                node("lister", "Lister", &[], serde_json::json!([]), lists),
+                loop_in("l", &[]),
+                node("l.a", "Tally", &["l"], number_in.clone(), number_out.clone()),
+                node("l.spread", "Tally", &["l"], serde_json::json!([port("value", "List[Number]")]), serde_json::json!([{ "name": "value", "portType": "List[Number]", "required": false }])),
+                loop_in("l.m", &["l"]),
+                node("l.m.c", "Tally", &["l", "l.m"], number_in, number_out),
+                loop_out("l.m", &["l"]),
+                node("l.after", "Tally", &["l"], list_in.clone(), list_out.clone()),
+                loop_out("l", &[]),
+                node("sink", "Tally", &[], list_in, list_out),
+            ],
+            "edges": [
+                wire("e1", "lister", "items", "l__in", "items"),
+                wire("e2", "l__in", "items", "l.a", "value"),
+                wire("e3", "l.a", "value", "l__out", "results"),
+                wire("e4", "l__out", "results", "sink", "value"),
+                wire("e5", "l.spread", "value", "l.m__in", "items"),
+                wire("e6", "l.m__in", "items", "l.m.c", "value"),
+                wire("e7", "l.m.c", "value", "l.m__out", "results"),
+                wire("e8", "l.m__out", "results", "l.after", "value"),
+            ],
+            "groups": [
+                { "id": "l", "kind": "loop", "nodeIds": ["l.a", "l.spread", "l.after"], "loopConfig": { "parallel": false, "over": ["items"], "carry": [] } },
+                { "id": "l.m", "kind": "loop", "nodeIds": ["l.m.c"], "parentGroupId": "l", "loopConfig": { "parallel": false, "over": ["items"], "carry": [] } },
+            ],
+            "createdAt": parse_dt(),
+            "updatedAt": parse_dt(),
+        }))
+        .expect("nested loop project")
+    }
+
+    /// The run of the cut `bounds` of `whole`, handed `given` at its
+    /// starts: its birth (the cut it runs, what it is given, its kicks)
+    /// driven through, the fold checked against the worker's tables.
+    async fn run_cut(whole: &ProjectDefinition, bounds: weft_core::project::cut::SelectionBounds, handed: Vec<(&str, serde_json::Value)>) -> (Drove, Vec<RunEvent>, Vec<serde_json::Value>) {
+        let walked = weft_core::project::cut::walk(&weft_core::project::graph::ProjectGraph::new(whole), &bounds).expect("the cut walks");
+        let mut given = weft_core::project::Given {
+            inputs: handed.into_iter().map(|(at, value)| (weft_core::frames::Located::top(at), [("value".to_string(), value)].into())).collect(),
+            outputs: Default::default(),
+        };
+        let project = weft_core::project::cut::cut(whole, &walked, &mut given).expect("a cut");
+        let run_id = uuid::Uuid::new_v4();
+        let mut rows = vec![RunEvent::RunStarted { given: Box::new(given),
+            run_id, project_id: project.id, entry_node: "l".into(),
+            phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()), cut_from: Some("whole-hash".into()), binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
+            seed: None, instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            settings: Default::default(),
+        }];
+        rows.extend(weft_core::run_spec::KickPlan::for_program(&project, None, None).into_iter().map(|kick| RunEvent::NodeKicked {
+            run_id, node_id: kick.node, frames: kick.frames, firing: false, payload: None, port_snapshot: None, at_unix: 0,
+        }));
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let cat = super::engine_test_rig::catalog(vec![
+            ("Lister", Box::new(Lister { items: serde_json::json!([1, 2]) })),
+            ("Tally", Box::new(Tally { seen: seen.clone() })),
+        ]);
+        let (drove, events) = super::engine_test_rig::drive_journal_observed(project.clone(), cat, run_id, rows, CancellationFlag::new_arc()).await;
+        let drove = drove.expect("the cut's run drives");
+        super::engine_test_rig::assert_fold_matches_live(&project, &events, Default::default(), &drove);
+        let seen = seen.lock().unwrap().clone();
+        (drove, events, seen)
+    }
+
+    weft_core::stress_test! {
+        name: a_cut_inside_a_loop_body_runs_in_its_iteration_zero,
+        runs: 8,
+        worker_threads: 4,
+        async fn body() {
+            use weft_core::project::cut::SelectionBounds;
+            let whole = nested_loop_project();
+            let spelled = |names: &[&str]| names.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+
+            // A start handed its list, and a stretch holding the inner loop
+            // whole: everything in it runs once, inside `l`'s iteration 0,
+            // the inner loop launching its own iterations there; nothing of
+            // `l` itself runs, nor the rest of its body.
+            let bounds = SelectionBounds { from: spelled(&["l.spread"]), target: spelled(&["l.after"]), ..Default::default() };
+            let (drove, events, mut seen) = run_cut(&whole, bounds, vec![("l.spread", serde_json::json!([1, 2]))]).await;
+            assert!(matches!(drove.outcome, RunOutcome::Completed), "{:?}", drove.outcome);
+            assert_eq!(completed_at(&events, "l.spread"), vec![vec![0]]);
+            assert_eq!(completed_at(&events, "l.m.c"), vec![vec![0, 0], vec![0, 1]], "the inner loop ran its iterations inside iteration 0");
+            assert_eq!(completed_at(&events, "l.m__out"), vec![vec![0, 0], vec![0, 1]]);
+            assert_eq!(completed_at(&events, "l.after"), vec![vec![0]]);
+            for outside in ["lister", "l__in", "l.a", "l__out", "sink"] {
+                assert!(!events.iter().any(|row| matches!(row, RunEvent::NodeStarted { node_id, .. } | RunEvent::NodeKicked { node_id, .. } if node_id == outside)), "{outside} never runs");
+            }
+            assert!(!events.iter().any(|row| matches!(row, RunEvent::LoopInstantiated { group_id, .. } if group_id == "l")), "the loop around the cut is never launched");
+            seen.sort_by_key(|value| value.to_string());
+            assert_eq!(seen, vec![serde_json::json!(1), serde_json::json!(2), serde_json::json!([1, 2]), serde_json::json!([1, 2])]);
+
+            // Wholly inside the inner loop's body: one firing, inside
+            // iteration 0 of both loops.
+            let bounds = SelectionBounds { from: spelled(&["l.m.c"]), target: spelled(&["l.m.c"]), ..Default::default() };
+            let (drove, events, seen) = run_cut(&whole, bounds, vec![("l.m.c", serde_json::json!(5))]).await;
+            assert!(matches!(drove.outcome, RunOutcome::Completed), "{:?}", drove.outcome);
+            assert_eq!(completed_at(&events, "l.m.c"), vec![vec![0, 0]]);
+            assert_eq!(seen, vec![serde_json::json!(5)]);
+            assert!(!events.iter().any(|row| matches!(row, RunEvent::LoopInstantiated { .. })), "no loop is launched");
+        }
     }

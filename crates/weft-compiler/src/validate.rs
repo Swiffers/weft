@@ -6,7 +6,7 @@
 
 use weft_core::rules::{has_incoming_edge, literal_fills};
 use weft_core::node::{
-    Condition, MetadataCatalog, RuleDiagnostic, RuleSeverity, ValidationLevel, ValidationRule,
+    Condition, MetadataCatalog, RuleDiagnostic, RuleSeverity, ValidationLevel, ValidationRule, ValueChecks,
 };
 
 use weft_core::project::{NodeDefinition, Span};
@@ -38,6 +38,10 @@ pub fn validate(project: &ProjectDefinition, catalog: &dyn MetadataCatalog) -> V
     validate_with_mode(project, catalog, ValidationMode::Structural)
 }
 
+/// [`validate`] at `mode`. A node's rule asking which install the program
+/// is built for (`local_install`) is answered with the one it was
+/// compiled for (`ProjectDefinition::install`), and has no answer, so
+/// does not fire, in a program compiled for none.
 pub fn validate_with_mode(
     project: &ProjectDefinition,
     catalog: &dyn MetadataCatalog,
@@ -84,6 +88,7 @@ fn validate_scoped(
     check_named_type_conflicts(project, &mut d);
     check_route_claims(project, catalog, &mut d);
     check_per_instance(project, catalog, &mut d);
+    check_shared_trigger_runs(project, &mut d);
     check_instance_filled(project, &mut d);
     check_run_settings(project, &mut d);
     d
@@ -139,6 +144,65 @@ fn check_per_instance(project: &ProjectDefinition, catalog: &dyn MetadataCatalog
     }
 }
 
+/// shared-trigger-reaches-per-instance: a trigger every instance shares
+/// fires runs for no instance, so a run of it that reaches something per
+/// instance would be refused at every fire, with no instance anybody could
+/// pick (`run_spec::refuse_instanceless`). Refused here instead, naming
+/// what it reaches and why each is per instance. A trigger that holds its
+/// caller's connection (a route, a socket) is left alone: each call can
+/// name its instance (an instance token, or the `Weft-Instance` header on
+/// a gated route), and a call that names none hears the run-time refusal.
+fn check_shared_trigger_runs(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
+    let shared: Vec<(&NodeDefinition, weft_core::frames::Located)> = weft_core::project::trigger_places(project)
+        .into_iter()
+        .filter_map(|place| {
+            let node = project.nodes.iter().find(|n| n.id == place.id)?;
+            (node.features.live_connection.is_none() && !weft_core::project::is_per_instance(project, &place))
+                .then_some((node, place))
+        })
+        .collect();
+    if shared.is_empty() {
+        return;
+    }
+    let stand_ins = weft_core::run_spec::instanceless_stand_ins(project);
+    // Built only once a trigger is refused: the reasons are all it serves.
+    let rules = std::cell::OnceCell::new();
+    for (node, place) in shared {
+        let trigger = weft_core::project::address_of(project, &place.id, &place.path);
+        // A fire that cannot be cut is reported by what makes it so.
+        let Ok(reached) = weft_core::run_spec::instanceless_fire_reaches(project, &trigger, &stand_ins) else { continue };
+        if reached.is_empty() {
+            continue;
+        }
+        let rules = rules.get_or_init(|| weft_core::rules::RuleContext::new(project));
+        let spelled: Vec<String> =
+            reached.iter().map(|at| weft_core::project::address_of(project, &at.id, &at.path)).collect();
+        let why: Vec<String> = reached
+            .iter()
+            .zip(&spelled)
+            .filter_map(|(at, spelled)| {
+                let reasons = weft_core::rules::per_instance_reasons_at(at, rules);
+                (!reasons.is_empty()).then(|| format!("'{spelled}': {}", reasons.join(", and ")))
+            })
+            .collect();
+        let because = if why.is_empty() { String::new() } else { format!(" ({})", why.join("; ")) };
+        // This place's alone: the same trigger under another include of
+        // its file may be per instance there, or reach nothing per
+        // instance, and turns on.
+        push_at(d, &[node.part()], std::slice::from_ref(&place), node.source_file.as_deref(), node.header_span_or_default(), Severity::Error,
+            "shared-trigger-reaches-per-instance",
+            format!(
+                "Trigger '{trigger}' is shared by every instance, so its runs are for no instance, but they reach \
+                 {}, which {} once per instance{because}. Every fire would be refused, since no instance could be \
+                 picked. Make the trigger per instance too (wire it from what is per instance, or write one of its \
+                 fields `@instance_filled`), so each instance fires its own copy, or keep what is per instance out \
+                 of what it runs",
+                weft_core::comma_list::spell_list(&spelled),
+                if spelled.len() == 1 { "exists" } else { "exist" },
+            ));
+    }
+}
+
 /// The places an `@instance_filled` cannot stand, each refused where it is
 /// written:
 /// - instance-filled-wired: the field also has a wire into it, so two things
@@ -154,7 +218,7 @@ fn check_instance_filled(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         "'{name}.{field}' is the port of a group, a loop or an included file, so it passes a value \
          on rather than using one; write `@instance_filled` on the input of the node inside \
          that reads it");
-    for group in project.groups.iter().filter(|g| !matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
+    for group in &project.groups {
         for (field, value) in &group.port_literals {
             if weft_core::instance::as_instance_filled(value).is_none() { continue; }
             let (span, file) = group_literal_anchor(group, field);
@@ -1133,7 +1197,15 @@ fn check_declarative_rules(
     for node in &project.nodes {
         let Some(meta) = catalog.lookup(&node.node_type) else { continue };
         let custom = weft_core::rules::CustomPorts::of(node, meta);
-        for rule in &node_rules(meta, node) {
+        let node_rules = node_rules(meta, node);
+        // A list a rule reads off the node wired in, which that node does
+        // not declare, or whose regexes do not compile: the rule would
+        // refuse nothing, so the program is refused, at both nodes (a cut
+        // keeping either hits it).
+        for (lister, code, told) in weft_core::rules::wired_list_faults(&node_rules, node, &rules) {
+            push(out, &[node.part(), lister.part()], node.source_file.as_deref(), node.header_span_or_default(), Severity::Error, code, told);
+        }
+        for rule in &node_rules {
             // Skip runtime-only rules in structural mode (the build and
             // the Problems panel). Runtime mode runs them: the editor's
             // pre-flight gate before Run/Activate/Resync, and the
@@ -1147,6 +1219,36 @@ fn check_declarative_rules(
                 emit_rule_diagnostic(node, &rules, &custom, rule, out);
             }
         }
+    }
+}
+
+/// Record on each node the rules the compile could not decide
+/// (`NodeDefinition::recheck`): their answer leans on a value that
+/// arrives on a wire, so the runtime asks them again, with the same
+/// evaluator, on the values that arrived, before the node's body runs
+/// (`weft_core::rules::recheck`). Every rule a node answers to, at both
+/// levels: a run is a run. A node whose rules were all decided records
+/// nothing and pays nothing when it fires.
+///
+/// Folded with the install the program is compiled for
+/// (`ProjectDefinition::install`), so a rule the install settles is never
+/// recorded. The rechecks are hashed with the program, so a command whose
+/// compile is held to an install's (`weft status`) compiles for that
+/// install's kind too.
+pub(crate) fn record_rechecks(project: &mut ProjectDefinition, catalog: &dyn MetadataCatalog) {
+    let rechecks: Vec<Vec<weft_core::rules::Recheck>> = {
+        let rules = weft_core::rules::RuleContext::new(project);
+        project
+            .nodes
+            .iter()
+            .map(|node| match catalog.lookup(&node.node_type) {
+                Some(meta) => weft_core::rules::undecided(&node_rules(meta, node), node, &rules, &weft_core::rules::CustomPorts::of(node, meta)),
+                None => Vec::new(),
+            })
+            .collect()
+    };
+    for (node, recheck) in project.nodes.iter_mut().zip(rechecks) {
+        node.recheck = recheck;
     }
 }
 
@@ -1186,7 +1288,7 @@ fn implicit_connection_rule(
     }
     Some(ValidationRule {
         when: Condition::Not {
-            of: Box::new(Condition::ConfigNonempty { field: input.name.clone() }),
+            of: Box::new(Condition::Value { field: input.name.clone(), checks: Box::new(ValueChecks { nonempty: true, ..Default::default() }) }),
         },
         then: RuleDiagnostic {
             message: format!(
@@ -1211,7 +1313,8 @@ fn is_the_connection_rule(meta: &weft_core::node::NodeMetadata, rule: &Validatio
         && matches!(
             &rule.when,
             Condition::Not { of }
-                if matches!(of.as_ref(), Condition::ConfigNonempty { field } if field == &input.name)
+                if matches!(of.as_ref(), Condition::Value { field, checks }
+                    if field == &input.name && **checks == ValueChecks { nonempty: true, ..Default::default() })
         )
 }
 
@@ -1265,6 +1368,23 @@ fn push(
         }
     }
     d.push(Diagnostic::at(span, severity, code, message).in_file(file).about(subjects));
+}
+
+/// [`push`] for a finding that holds at some `places` of its parts only
+/// (`Diagnostic::places`): a cut keeping none of them still runs.
+#[allow(clippy::too_many_arguments)]
+fn push_at(
+    d: &mut Vec<Diagnostic>,
+    about: &[&str],
+    places: &[weft_core::frames::Located],
+    file: Option<&str>,
+    span: Span,
+    severity: Severity,
+    code: &str,
+    message: impl Into<String>,
+) {
+    push(d, about, file, span, severity, code, message);
+    d.last_mut().expect("just pushed").places = places.to_vec();
 }
 
 /// `NodeDefinition::part` for an id a wire names: a node's part, or the id
@@ -1385,8 +1505,8 @@ fn check_double_driven_ports(project: &ProjectDefinition, d: &mut Vec<Diagnostic
             _ => None,
         })
         .collect();
-    // A loop's literals sit on its `LoopIn` too, where the node rule reads them.
-    for group in project.groups.iter().filter(|g| !matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
+    // A loop holds none: its sit on its `LoopIn`, where the node rule reads them.
+    for group in &project.groups {
         for (name, value) in &group.port_literals {
             if value.is_null() { continue; }
             // A gate's wire lands on the group itself, no port of it.
@@ -1459,7 +1579,7 @@ fn check_two_gates(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
             );
         }
     }
-    for group in project.groups.iter().filter(|g| !matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
+    for group in &project.groups {
         let driven = |port: &str| {
             group.port_literals.get(port).is_some_and(|v| !v.is_null())
                 || project.edges.iter().any(|e| e.target == group.id && e.target_port() == port && !e.to_group_port())
@@ -2207,9 +2327,9 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 
     // config-type-mismatch on a group's own ports: the literal written on
     // an input (`g.x = 5`) is held to the type the group declares there.
-    // A loop's sit on its `LoopIn` too, where the node rule below reads
-    // them.
-    for group in project.groups.iter().filter(|g| !matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
+    // A loop holds none: its sit on its `LoopIn`, where the node rule
+    // below reads them.
+    for group in &project.groups {
         for (key, value) in &group.port_literals {
             if let Some(why) = refuse_written_secret(value, &weft_core::project::plain_id(&group.id), key) {
                 let (span, file) = group_literal_anchor(group, key);
@@ -2430,7 +2550,7 @@ fn check_container_inputs(project: &ProjectDefinition, root: Option<&str>, d: &m
 /// a Boolean, as on a node. A loop's sits on its `LoopIn`, where the node
 /// rule reads it.
 fn check_group_gates(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
-    for group in project.groups.iter().filter(|g| !matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
+    for group in &project.groups {
         for (key, value) in group.port_literals.iter().filter(|(key, _)| weft_core::run::skip::is_gate_port(key)) {
             if value.is_boolean() || value.is_null() { continue; }
             let (span, file) = group_literal_anchor(group, key);
@@ -3154,7 +3274,7 @@ fn check_config_derived_ports(
                 // filled in" (a form field's label falls back to its key).
                 // SYNC: null-is-absent <->
                 //       packages/weft-graph/src/webview/lib/utils/port-specs.ts (hasValue),
-                //       catalog/human/form_helpers.rs (build_form_fields)
+                //       crates/weft-core/src/signal/form/from_config.rs (ConfigForm::fields)
                 match obj.get(field.key.as_str()).filter(|v| !v.is_null()) {
                     Some(value) => {
                         // Where the list IS the choice set, an empty one
@@ -3585,6 +3705,29 @@ fn check_loop_config(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
                     format!(
                         "loop '{gid}': gather output '{}' must be declared as List[T | Null] (was {}); per-iteration body failures produce null slots",
                         port.name, port.port_type,
+                    ));
+            }
+        }
+
+        // loop-output-unwritten: an output (a gather or a carry) is what
+        // each iteration writes at the loop's `LoopOut`. One nothing inside
+        // writes, by a wire or a written value, would gather a list of
+        // nothing but nulls, or carry its first value unchanged through
+        // every iteration: almost certainly a port the body forgot to
+        // write. `done` is the language's own vote, never required.
+        for port in out_node.inputs.iter().filter(|p| p.name != "done" && !weft_core::run::skip::is_gate_port(&p.name)) {
+            let wired = project.edges.iter().any(|e| e.target == loop_out_id && e.target_handle.as_deref() == Some(port.name.as_str()));
+            if !wired && out_node.written_value(&port.name).is_none() {
+                let would = if carry_set.contains(&port.name) {
+                    "it would carry its first value unchanged through every iteration"
+                } else {
+                    "it would gather a list of nothing but nulls"
+                };
+                push(d, &[*gid], file, span, Severity::Error, "loop-output-unwritten",
+                    format!(
+                        "loop '{gid}' declares output '{}', but nothing inside it writes `self.{}`: {would}. \
+                         Write it inside the loop, or remove the port",
+                        port.name, port.name,
                     ));
             }
         }

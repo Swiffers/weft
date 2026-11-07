@@ -17,7 +17,8 @@ use axum::Router;
 
 use weft_broker_client::protocol::{
     RecordOfRequest, RecordOfResponse, RecordSecretRequest, RecordSecretResponse, RunAnswer, RunAnswerOf, RunAnswersRequest, RunAnswersResponse, RunCancel, RunClaimRequest,
-    RunClaimResponse, RunGiveUpRequest, RunGiveUpResponse, RunRecheckedRequest, RunRecheckedResponse, JOURNAL_RECORD_BODY_LIMIT,
+    RunClaimResponse, RunGiveUpRequest, RunGiveUpResponse, RunRecheckedRequest, RunRecheckedResponse,
+    JOURNAL_RECORD_BODY_LIMIT,
     BATCH_FATES, BATCH_FATES_HEADER, JOURNAL_RECORD_PATH,
 };
 use weft_journal::frame::BatchAnswer;
@@ -122,18 +123,12 @@ async fn write_batch(state: &BrokerState, caller: &CallerIdentity, body: &Bytes)
         .await
         .map_err(|e| unavailable_or_internal(e.context("write a batch of records")))?;
     drop(conn);
-    let accepted = |at: usize| recorded[at].fate == Fate::Accepted;
     state.notices.tell(
         recorded.iter().filter(|run| run.fate == Fate::Accepted).filter_map(|run| run.project_id.map(|project| (project, run.run_id))),
         recorded.iter().filter(|run| run.tell_end).map(|run| run.run_id),
         recorded.iter().filter_map(|run| run.keep_until),
         recorded.iter().any(|run| run.unwatched).then_some(replica),
     );
-    // A run that ended having stored files queued its sweep through the
-    // announcement outbox, which goes out once poked.
-    if batch.head.runs.iter().enumerate().any(|(at, run)| accepted(at) && run.wrote_files && run.written.ended.is_some()) {
-        weft_task_store::announce::committed(&state.pool);
-    }
     Ok(BatchAnswer { fates: recorded.into_iter().map(|run| run.fate).collect() })
 }
 

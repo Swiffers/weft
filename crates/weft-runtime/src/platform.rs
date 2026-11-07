@@ -32,15 +32,14 @@ pub struct Parts {
     /// The Google API client and its token cache, on GCP: one per process,
     /// shared by everything that calls Google (the object store too).
     pub google: Option<weft_platform_gcp::Google>,
-    /// Where the platform sends the requests of this process's own
-    /// service, among its revisions: on Cloud Run, the service Cloud Run
-    /// names in `K_SERVICE`; none where the process runs no such service
-    /// (a local install, the holders' worker pool).
-    pub revisions: Option<Arc<dyn weft_platform_traits::ServiceRevisions>>,
     /// Work the platform itself needs done for as long as the process
     /// lives (delivering local wakes, stopping idle local workers).
     pub background: Vec<(&'static str, futures::future::BoxFuture<'static, anyhow::Result<()>>)>,
 }
+
+/// How long a process unit's agent and process get to exit once asked to
+/// stop before they are killed: what Docker gives a container.
+const PROCESS_STOP_GRACE: Duration = Duration::from_secs(10);
 
 /// How often idle local workers are looked for.
 const IDLE_SWEEP: Duration = Duration::from_secs(30);
@@ -77,7 +76,8 @@ pub async fn build(config: &InstallConfig, pool: Option<&weft_task_store::db::Po
                 },
             )?);
             let gpu = weft_platform_local::LocalInfraHost::detect_gpu(docker.as_ref()).await?;
-            let host = Arc::new(weft_platform_local::LocalInfraHost::new(
+            let needs: Arc<dyn weft_platform_traits::MachineNeeds> = Arc::new(weft_platform_local::LocalNeeds);
+            let containers = Arc::new(weft_platform_local::LocalInfraHost::new(
                 docker.clone(),
                 weft_platform_local::LocalInfraHostConfig {
                     agent_image: local.runtime_image.clone(),
@@ -86,6 +86,10 @@ pub async fn build(config: &InstallConfig, pool: Option<&weft_task_store::db::Po
                     disks: weft_platform_local::DiskBacking::Volumes,
                     publish: weft_platform_local::Publish::Loopback,
                     install: config.install.clone(),
+                    // Every install on this machine shares its Docker.
+                    names: weft_platform_local::infra_names::Names::PerInstall {
+                        claims: weft_platform_local::MachineLayout::here().disk_claims(),
+                    },
                     // A unit's agent is a container, so it reaches the
                     // broker where containers do.
                     agent_broker: weft_platform_local::AgentBroker {
@@ -94,6 +98,21 @@ pub async fn build(config: &InstallConfig, pool: Option<&weft_task_store::db::Po
                     },
                 },
             ));
+            let processes = Arc::new(weft_platform_local::ProcessUnits::new(
+                Arc::new(weft_platform_local::MachineProcesses),
+                needs.clone(),
+                Arc::new(weft_platform_traits::SystemClock),
+                weft_platform_local::ProcessUnitsConfig {
+                    dir: weft_platform_local::InstallLayout::new(local.data_dir.clone()).process_units(),
+                    // A unit's agent is this very program.
+                    agent_program: std::env::current_exe().context("find this program, which every process unit's agent runs")?,
+                    machine_env: process_env()?,
+                    system: weft_core::needs::System::here(),
+                    stop_grace: PROCESS_STOP_GRACE,
+                    needs_root: weft_platform_local::MachineLayout::here().needs(),
+                },
+            ));
+            let host = Arc::new(weft_platform_local::MachineInfraHost::new(containers, processes));
             let alarm = Arc::new(weft_platform_local::LocalAlarm::new(pool.clone()));
             // A local install's one process delivers its wakes.
             let deliver: Arc<dyn weft_platform_local::Deliver> =
@@ -111,7 +130,7 @@ pub async fn build(config: &InstallConfig, pool: Option<&weft_task_store::db::Po
                     weft_platform_local::MachineLayout::here(),
                     weft_platform_local::lanes::lane_count()?,
                 )),
-                needs: Arc::new(weft_platform_local::LocalNeeds),
+                needs,
                 host,
                 alarm,
                 frontends: Arc::new(weft_platform_local::NoFrontendHosting),
@@ -120,7 +139,6 @@ pub async fn build(config: &InstallConfig, pool: Option<&weft_task_store::db::Po
                 identity: identity.clone(),
                 tokens: identity,
                 google: None,
-                revisions: None,
                 background: vec![
                     ("local_alarm", Box::pin(async move { wakes.run(deliver).await })),
                     (
@@ -173,12 +191,6 @@ pub async fn build(config: &InstallConfig, pool: Option<&weft_task_store::db::Po
                 frontends: Arc::new(weft_platform_gcp::CloudRunFrontends::new(google.clone(), gcp.clone())),
                 domains: Arc::new(weft_platform_gcp::LoadBalancerDomains::new(google.clone(), gcp.clone())),
                 holder_pool: Arc::new(weft_platform_gcp::WorkerPoolHolders::new(google.clone(), gcp.holder_pool.clone())),
-                revisions: std::env::var("K_SERVICE").ok().filter(|s| !s.is_empty()).map(|service| {
-                    Arc::new(weft_platform_gcp::CloudRunRevisions::new(
-                        google.clone(),
-                        format!("projects/{}/locations/{}/services/{service}", gcp.project, gcp.region),
-                    )) as Arc<dyn weft_platform_traits::ServiceRevisions>
-                }),
                 google: Some(google),
                 identity: Arc::new(weft_platform_gcp::GoogleIdentity::new(
                     gcp.project.clone(),
@@ -206,6 +218,20 @@ fn machine_env() -> anyhow::Result<std::collections::BTreeMap<String, String>> {
             Ok((name.to_string(), value))
         })
         .collect()
+}
+
+/// What a process unit's process gets of this process's environment: what
+/// a worker gets ([`machine_env`]), and each of the variables a program
+/// the person runs reads that the machine sets
+/// (`weft_platform_local::process_units::PASSED_ENV`, which says why each).
+fn process_env() -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let mut env = machine_env()?;
+    for name in weft_platform_local::process_units::PASSED_ENV {
+        if let Some(value) = std::env::var(name).ok().filter(|v| !v.is_empty()) {
+            env.insert(name.to_string(), value);
+        }
+    }
+    Ok(env)
 }
 
 /// Where this process writes the line weft logs when its own work is stuck

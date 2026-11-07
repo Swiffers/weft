@@ -366,7 +366,7 @@ answer with your own `Reply`.
 To answer some other way when a node failed, gate on it:
 `fallback._should_flow = ask._error`.
 
-A node that could act outside the run is never started again after a crash. If its worker goes away mid-run, a fast run ends cancelled and a durable one fails the node that was running (How a run is kept, below, has both); only a `pure` node that had sent nothing on and read no stream runs again. With `_error` wired, that failure goes there like any other, and the log says `the worker running '<node>' went away while it was running` (or `while it was reading a stream`). A run waiting on a timer or a form, with nothing else of it running, survives its worker dying either way, unless its caller is still on the line with `outlivesCaller` off or a bus between its nodes is open: then its wait holds the worker (up to the trigger's `holdSecs`), and it ends with it.
+A node that could act outside the run is never started again after a crash. If its worker goes away mid-run, a fast run ends cancelled and a durable one fails the node that was running (How a run is kept, below, has both); only a `pure` node that had sent nothing on and read no stream runs again, and, in a durable run, a node that saved its state (`ctx.keep`, the `weft-node-authoring` skill) runs again from its last save. With `_error` wired, that failure goes there like any other, and the log says `the worker running '<node>' went away while it was running` (or `while it was reading a stream`). A run waiting on a timer or a form, with nothing else of it running, survives its worker dying either way, unless a caller is still connected to it: then its wait holds the worker (up to the trigger's `holdSecs`), and it ends with it.
 
 ````weft
 ask = LlmInference { provider: prov.provider, prompt: job.text }
@@ -412,7 +412,7 @@ route's run takes the whole group along, and everything the group needs
 
 ````weft
 live = Route { path: "live/count", method: "GET" }
-work = Group(db: Access) {
+work = Group(db: Access[postgres]) {
   rows = PostgresExecuteQuery { account: self.db, query: "select count(*) from cards" }
   out = Reply { body: rows.rows }
 }
@@ -588,7 +588,7 @@ with instances takes; `weft-members` adds the shape for several people.
 | opaque | `JsonDict`, compatible with any `Dict[String, V]` both ways |
 | any JSON | `Json`: text, a number, a boolean, null, or a list or object of those at any depth, for a value whose shape the program cannot know (what a device answers to an arbitrary command). Every JSON-made type fits into it (`List[List[Number]]`, a record of JSON fields, `JsonDict`); a file, `Bus`, `Generator[..]`, `Access` or `Infra` never does |
 | type variables | `T`, `T2`, unified across a node's ports, pinned by what is wired to the port or by the type the program declares on it (`Cast`'s output is `T2`: `-> (value: Card)` pins it, and so does the port it feeds); one nothing pins is `unresolved-typevar` |
-| live handles | `Bus`, `Generator[T]`, `Access`; never literals |
+| live handles | `Bus`, `Generator[T]`, `Access[service]` (a connection to that service, `Access[slack]`; it fits a bare `Access`, which takes any service, never the other way); never literals |
 
 A record is usable inline in any signature (`p: { wpm: Number, delay: Number
 }`), and a type gets a name either in a node's metadata `types` (e.g.
@@ -919,10 +919,11 @@ pay = Route -> (body: JsonDict) {
 }
 ```
 
-With `durable` off you get a fast run: it waits for its record only where weft has to act on it (a pause, a call to weft that names the run), and if its worker dies the run ends cancelled and is not run again. With it on, everything a run did is on record before a node that could act outside it starts (a pure node does not wait), and an answer to a caller is on record before it leaves. If the worker dies, another worker picks the run up and keeps every finished node; a node that was running is failed rather than run twice, unless it belongs to a `pure` node, read no stream and had sent nothing on: that one simply runs again. If a caller started the run, that caller's connection died with the old worker, so a node that answers it then fails, saying no live caller is attached. A
-run with `recorded: false` cannot be tagged, and `durable` or `outlivesCaller` (on any trigger that answers a live caller) with `recorded: false` is the `run-settings` error.
-A run that cannot pause (`recorded: false`, a caller on the line with `outlivesCaller` off, a bus between its nodes open) holds a wait (a timer, a form) in its worker instead of pausing, and the answer carries it on there. Every trigger has `holdSecs` (default 60, `0` to never wait, at most 30 days): when nothing has moved in the run for that long, the waiting node fails saying it gave up, which it may handle itself or send to `_error`. If the run can pause again (its last bus closed), the wait pauses after all.
-A run you start by hand is always recorded. If it fires a trigger (`weft run --fire`), it is kept the way that trigger's `durable` and `keepRunsFor` say, and any other hand-started run is fast. `--durable`, `--fast`, `--keep-for` and `--hold-secs` override that for the one run. For polling routes and answering early, go and read the `weft-api` skill.
+With `durable` off you get a fast run: it waits for its record only where weft has to act on it (a pause, a call to weft that names the run), and if its worker dies the run ends cancelled and is not run again. With it on, everything a run did is on record before a node that could act outside it starts (a pure node does not wait), and an answer to a caller is on record before it leaves. If the worker dies, another worker picks the run up and keeps every finished node; a node that was running is failed rather than run twice, unless it belongs to a `pure` node, read no stream and had sent nothing on (that one simply runs again), or it saved a state (that one runs again from its last save). If a caller started the run, that caller's connection died with the old worker, so a node that answers it then fails, saying no live caller is attached.
+`durable` or `outlivesCaller` (on any trigger that answers a live caller) with `recorded: false` is the `run-settings` error.
+A run that cannot pause (`recorded: false`, or a caller still connected, whatever `outlivesCaller` says; open buses and streams do not stop a pause) holds a wait (a timer, a form) in its worker instead of pausing, and the answer carries it on there. Every trigger has `holdSecs` (default 60, at most 30 days). With a caller on the line, a wait holds for as long as the caller stays; once no caller is connected and nothing has moved in the run for that long, the waiting node fails saying it gave up, which it may handle itself or send to `_error`. `0` refuses every such wait at once, caller or not. If the run can pause again (its caller left), it pauses by the rule below.
+A run that can pause does so in one way: once every node it runs waits (a timer, a form, a message, a bus read) and at least one of those waits needs an answer from outside (if every node waits only on buses or streams, the run is stuck, not paused), it stays on its worker for the trigger's `pauseAfterSecs` (default 10, `0` to pause at once, at most an hour), each wait still open in its node, and an answer in that time goes straight into the waiting call, with no pause and no restart of the body; when the time runs out, every node saves and pauses together. So a run fed by frequent messages is not paused and picked up again for each one. A worker that is stopping pauses it at once.
+A run you start by hand is always recorded. If it fires a trigger (`weft run --fire`), it is kept the way that trigger's `durable` and `keepRunsFor` say, and any other hand-started run is fast. `--durable`, `--fast`, `--keep-for`, `--hold-secs` and `--pause-after-secs` override that for the one run. For polling routes and answering early, go and read the `weft-api` skill.
 
 ## Stopping other runs
 
@@ -1251,14 +1252,16 @@ Inside a loop, `self` is the loop's own boundary, never the group around it.
 A loop nested in a group cannot read the group's `self.db` (that is
 `unknown-source-port`, naming both scopes and the two lines to write); the
 value comes in as a broadcast input of the loop, declared in its signature
-and wired from the group (`run = Loop(db: Access, ...) { ... }` then
+and wired from the group (`run = Loop(db: Access[postgres], ...) { ... }` then
 `run.db = self.db` at the group level).
 
 `parallel` defaults `false`. Five shapes: parallel map (true, over, no
 carry), sequential map, fold (carry), while (no over, stop vote or
 `maxIters`), side effect (no over, no carry). Refused: parallel with carry;
 parallel with empty over; parallel with any `self.done` write; a port in both
-`over` and `carry`; a sequential loop with nothing that can end it.
+`over` and `carry`; a sequential loop with nothing that can end it; an output
+nothing inside the loop writes (`loop-output-unwritten`: it could only gather
+nulls, or carry its first value unchanged).
 
 When something inside an iteration fails: a carried value the failure left
 unwritten stops the loop and fails it: `loop '<loop>' stopped at iteration
@@ -1333,9 +1336,10 @@ conversation, plus the reason the last try failed, which the carried
 A `Generator[T]` port in `over` pulls the stream (must be the only over
 port).
 
-What the language promises about timing is this: the next iteration starts
-once every value of this one has reached the loop's edge (its outputs: a
-carry, a gather, `self.done`). Nothing else holds it back. A loop is a
+What the language promises about timing is this: with `parallel: false`,
+the next iteration starts once every value of this one has reached the
+loop's edge (its outputs: a carry, a gather, `self.done`). Nothing else
+holds it back, so a loop with no outputs starts its iterations back to back. A loop is a
 launcher, not an owner: work started inside an iteration that is not wired
 to the edge keeps running after the loop moves on, and even after the loop
 exits. That is on purpose: a loop can start twenty agents and return their
@@ -1343,6 +1347,19 @@ buses, and the nodes after the loop coordinate them. So if the next
 iteration has to wait for some work (a database write the next iteration
 reads), wire that work's result to the edge, into a carry, a gather or
 `self.done`.
+
+A bus ends once nobody is on it and no node can still join it (its marker is
+on no wire to a node yet to start, in no loop still running, in no node that
+has not used it yet): finished, or failed if its last member failed. A node
+can also end it on purpose: finished while anybody is on it, as its last
+member left when nobody is. If a node holds a bus open for
+a whole loop of senders (an agent node's `stream`, which each turn's
+`AskAgent` sends on), put a `CloseBus` after the loop, its `_should_flow`
+wired to an output that arrives only once the loop is over, as the shipped
+`nodes/base_catalog/agents/conversation.weft` does:
+`close = CloseBus { bus: self.stream, _should_flow: messages.message }`.
+Without it, the run fails with `the bus ended failed: the run was stuck` once
+the last turn is done.
 
 ## Files and reuse
 
@@ -1372,25 +1389,33 @@ with `photo["public"]` False when the open internet cannot open that link,
 so the script sends that service the bytes instead), and its description
 says how.
 
-A stored file lives as long as its scope says: a run's files are swept when
-the run ends, a project's stay. The storage nodes `TextToFile`,
-`FetchToStorage` and `KeepFile` all take `scope` (`run` or `project`)
-and `ttlDays`, and emit `file`, `filename`, `mimeType` and `sizeBytes` like
-every node that makes a file. `ttlDays` works in both scopes: the file
-expires that many days after anybody last touched it, since every read,
-download or link resets the clock, and `0` keeps it for ever. Any other node
-that makes a file (an S3, Slack or Drive download, a generated picture)
-stores it for its run only: if you want it longer, or in a later run, wire
-it through `KeepFile`. Every write makes a new file, except where a node
-keeps a growing value: it edits the file it was handed, in place, and its
-description says so.
+Any run in your account can read any stored file for as long as the file
+exists; its scope says only how long that is. A `run` file is deleted with its
+run, when the run's record goes (its keep time runs out, `weft clean`,
+`weft rm`), and a `project` file with the project (`weft rm`). The storage
+nodes `TextToFile`, `FetchToStorage` and `KeepFile` all take `scope` (`run` or
+`project`) and `ttlDays`, and emit `file`, `filename`, `mimeType` and
+`sizeBytes` like every node that makes a file. `ttlDays` is a deadline in
+either scope: the file is deleted once nobody has touched it for that many
+days (every read, download or link resets the clock), or with its run or
+project if that comes first, and empty or `0` means no deadline. Any other
+node that makes a file (an S3, Slack or Drive download, a generated picture)
+stores it with its run, with no deadline, unless its description says it keeps the file in the
+project's files. If a later run needs the file (its
+reference kept in a table row or an instance's values), wire it through
+`KeepFile`: `scope: project`, the default, copies it into the project's files
+and emits the new reference, while `scope: run` only sets its deadline, so the
+file still goes with its run. When a read finds a file gone, the error says
+what can have deleted it and how to make one last. Every write makes a new
+file, except where a node keeps a growing value: it edits the file it was
+handed, in place, and its description says so.
 
 A link made to a stored file lives 15 minutes. If people need it longer (a
 video somebody watches for an hour), pass the file through `LinkOptions {
 file: clip.file, minutes: 120 }` (seven days at most): every link made from
 its output lives that long.
 
-If you want a stored file gone before its scope ends, `DeleteFile { file:
+If you want a stored file gone before it expires, `DeleteFile { file:
 old.file }` deletes it now. A file that lives at a URL is refused.
 
 `@file` is bidirectional (the editor writes edits back into the file), so
@@ -1443,6 +1468,11 @@ validate` and the editor's pre-flight gate on Run, Turn on and Resync report
 it; the Problems panel is structural only and never shows it; `weft build`
 skips it, so a half-wired program still compiles, and a run, an activate or
 a resync is refused before it starts while one is open, naming the `weft
-connect` that picks it. [the build tier] is `weft build`:
+connect` that picks it. One kind of rule only a build for an install
+answers: a node's rule asking whether the install is a local one (an agent
+node with nothing on `computer` refuses a cloud install that way). `weft
+validate` and the editor build for no install and never report it; `weft
+run` and `weft status` build for the install they talk to and do, and a run
+that needs the node is refused with the rule's message. [the build tier] is `weft build`:
 structural errors plus the cargo and image build. The slug names the rule,
 the message names the fix.

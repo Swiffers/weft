@@ -7,7 +7,10 @@
 
 mod caller_auth;
 mod door_let_go;
+mod endpoint_within;
 mod held_signals;
+mod held_stop;
+mod install_cli;
 mod lifecycle_writes;
 mod old_shapes;
 mod program_tokens;

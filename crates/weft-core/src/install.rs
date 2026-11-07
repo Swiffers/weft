@@ -76,6 +76,18 @@ pub struct InstallInfo {
     pub source: Option<WeftSource>,
 }
 
+impl InstallInfo {
+    /// Which kind of install this is: a cloud one when it runs on a cloud,
+    /// a local one otherwise. What a command compiles a program for when
+    /// its compile is held to this install's (`weft status`).
+    pub fn kind(&self) -> InstallKind {
+        match self.cloud {
+            Some(_) => InstallKind::Cloud,
+            None => InstallKind::Local,
+        }
+    }
+}
+
 /// A commit of a weft repository (upstream, or the fork the install
 /// workflow ran in).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +102,19 @@ pub struct WeftSource {
 #[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CloudInstall {
     Gcp(GcpInstall),
+}
+
+/// Where an install runs what it runs: on the machine weft itself runs on
+/// (a laptop or a server), or on a cloud. What the install's version build
+/// compiles a program for, which a node's rules may ask about
+/// (`crate::node::Condition::LocalInstall`). Kept on the program it was
+/// compiled for (`crate::project::ProjectDefinition::install`), as
+/// `"local"` or `"cloud"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallKind {
+    Local,
+    Cloud,
 }
 
 /// What a project's CI needs to deploy a frontend beside a GCP install.
@@ -347,9 +372,53 @@ crate::wire_enum! {
     }
 }
 
+/// The weft CLI the install workflow stored for one source tree, as the
+/// install answers it (`GET /install/cli/{tree}`): where to download it,
+/// a link the store signs, and the sha256 of its bytes, in hex, which the
+/// caller checks what it downloaded against.
+// SYNC: InstallCli <-> scripts/release-cli.sh (from_install), crates/weft-dispatcher/src/api/install_cli.rs (the route)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallCli {
+    pub url: String,
+    pub sha256: String,
+}
+
+/// Whether `tree` is a git tree id: 40 hex digits (SHA-1) or 64 (SHA-256),
+/// lowercase, as git prints one. What names a stored CLI, so nothing else
+/// reaches the store's keys through it.
+pub fn is_tree_id(tree: &str) -> bool {
+    matches!(tree.len(), 40 | 64) && tree.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Where in the install's file store the CLI built from `tree` lives, and
+/// the file beside it holding its sha256, which is written last, so its
+/// being there is what says the CLI is whole.
+// SYNC: install_cli_keys <-> .github/workflows/install-gcp.yml (store the weft CLI in the install)
+pub fn install_cli_keys(tree: &str) -> (String, String) {
+    (format!("install/cli/{tree}/weft"), format!("install/cli/{tree}/sha256"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tree_id_is_40_or_64_lowercase_hex_digits() {
+        assert!(is_tree_id(&"a".repeat(40)));
+        assert!(is_tree_id(&"0123456789abcdef".repeat(4)));
+        assert!(!is_tree_id(&"A".repeat(40)), "uppercase");
+        assert!(!is_tree_id(&"a".repeat(41)));
+        assert!(!is_tree_id(&format!("{}/", "a".repeat(39))), "a path");
+        assert!(!is_tree_id(""));
+    }
+
+    /// The answer the deploy's lookup reads (`.url`, `.sha256`).
+    #[test]
+    fn a_stored_cli_answers_the_fields_the_lookup_reads() {
+        let answer = serde_json::to_value(InstallCli { url: "https://u".into(), sha256: "s".into() }).unwrap();
+        assert_eq!(answer, serde_json::json!({ "url": "https://u", "sha256": "s" }));
+        assert_eq!(serde_json::from_value::<InstallCli>(answer).unwrap(), InstallCli { url: "https://u".into(), sha256: "s".into() });
+    }
 
     crate::wire_enum_roundtrip_tests!(DatabaseHolder);
 

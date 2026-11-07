@@ -185,6 +185,12 @@ pub fn event_line(row: &serde_json::Value, full: bool) -> String {
         // this is usually reading it because a value never arrived.
         line.push_str("  output=(nothing emitted)");
     }
+    if paused_with_its_run(row) {
+        // A suspension with no token is dropped by the tail below like
+        // every other empty field, which left the line naming nothing the
+        // node waits on: there is nothing, its run paused with it inside.
+        line.push_str("  (paused with its run, carries on when the run does)");
+    }
     if let Some((dropped, why)) = undelivered(row) {
         line.push_str(&format!("  dropped={dropped} ({why})"));
     }
@@ -208,6 +214,12 @@ fn silent_completion(row: &serde_json::Value) -> bool {
         Some(serde_json::Value::Object(map)) => map.is_empty(),
         _ => false,
     }
+}
+
+/// A firing suspended with no wait of its own (`token` null): its whole
+/// run paused while it was inside it (a bus read, a stream pull).
+fn paused_with_its_run(row: &serde_json::Value) -> bool {
+    row.get("kind").and_then(|v| v.as_str()) == Some("node_suspended") && row.get("token").is_none_or(serde_json::Value::is_null)
 }
 
 /// The rows that can name the program's messages the caller never
@@ -395,7 +407,8 @@ pub async fn clean(
             return Ok(());
         }
         let deleted: weft_core::program::DeletedRun =
-            serde_json::from_value(client.delete_json(&format!("/runs/{c}")).await?)
+            // A run that stored many files takes as long as removing them.
+            serde_json::from_value(client.waiting_on_its_work().delete_json(&format!("/runs/{c}")).await?)
                 .context("read what the delete removed")?;
         println!("deleted {c}");
         // The sweep of whatever version this run left bare happens on the
@@ -459,7 +472,8 @@ pub async fn clean(
         filter,
         running: if narrow.cancel_running { weft_core::program::StillGoing::Cancel } else { weft_core::program::StillGoing::Leave },
     };
-    let answer: weft_core::program::CleanOutcome = serde_json::from_value(client.post_json("/runs/clean", &serde_json::to_value(&body)?).await?)
+    // It answers once every matching run and its files are gone.
+    let answer: weft_core::program::CleanOutcome = serde_json::from_value(client.waiting_on_its_work().post_json("/runs/clean", &serde_json::to_value(&body)?).await?)
         .map_err(|e| anyhow::anyhow!("unexpected /runs/clean answer: {e}"))?;
     if ctx.json_out(&serde_json::to_value(&answer)?)? {
         return Ok(());
@@ -571,7 +585,7 @@ async fn registry_prune(ctx: &Ctx, scope: &Scope) -> anyhow::Result<()> {
         },
     };
     let body = serde_json::to_value(&request).context("encode the prune request")?;
-    let report: weft_core::images::PruneReport = serde_json::from_value(ctx.client()?.post_json("/images/prune", &body).await?)
+    let report: weft_core::images::PruneReport = serde_json::from_value(ctx.client()?.waiting_on_its_work().post_json("/images/prune", &body).await?)
         .context("read the install's prune report")?;
     for image in &report.removed {
         println!("  removed {image}");
@@ -1101,6 +1115,9 @@ mod tests {
         // The fields the old hand-picked key list dropped.
         let suspended = json!({"kind": "node_suspended", "node": "ask", "token": "a44e5cad", "atUnix": 5u64});
         assert!(event_line(&suspended, false).contains("token=a44e5cad"));
+        assert!(!event_line(&suspended, false).contains("paused"));
+        let paused = json!({"kind": "node_suspended", "node": "read", "token": null, "atUnix": 5u64});
+        assert!(event_line(&paused, false).ends_with(" read  (paused with its run, carries on when the run does)"), "{}", event_line(&paused, false));
         let iteration = json!({"kind": "loop_iteration_launched", "node": "run__in", "index": 7, "atUnix": 5u64});
         assert!(event_line(&iteration, false).contains("index=7"));
     }

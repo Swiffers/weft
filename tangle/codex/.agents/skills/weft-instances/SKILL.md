@@ -61,6 +61,18 @@ model = OpenRouterModel {
 digest = Cron { cron: @instance_filled("0 0 8 * * *") }
 ```
 
+A trigger that is not per instance is shared by every instance and starts
+runs for no instance. If what it runs reaches something per instance, every
+fire would be refused, so the compiler refuses the trigger
+(`shared-trigger-reaches-per-instance`, naming what the trigger reaches and
+why each is per instance): it cannot be turned on or fired until it is fixed,
+and the rest of the program still runs. Make the trigger per instance too
+(wire it from what is per instance, or write one of its fields
+`@instance_filled`), or keep what is per instance out of what it runs. A
+route or a socket is not refused: each call can name its instance (see
+"Routes stay shared" below), and a call naming none is refused when it
+arrives.
+
 On the `account` field of an access node, what you write decides whose key
 pays for an instance's calls, so ask the user which they want before writing
 it:
@@ -94,7 +106,7 @@ never be per instance: one that reads a per-instance container or value, even
 several nodes upstream, is a compile error naming what made it per instance.
 Keep every route shared and pick the instance per call:
 
-- a route gated by a credential (`ApiKeyAuth` on its `auth`), called by the
+- a route gated by a credential (`auth: "api_keys"`), called by the
   user's own backend with `Weft-Instance: <id>`; an open route refuses the
   header;
 - or an instance token in `Weft-Instance-Token`, for a caller that acts
@@ -136,6 +148,13 @@ It is compiled once, so the two includes share one body, and each answers
 its own route. Each route still picks its instance one of the two ways
 above.
 
+If a shared path and the per-instance part need the same helper, include one
+file in both places: each include decides on its own whether the file's nodes
+run per instance. Say `carry.weft` is included inside a group that receives a
+per-instance value and again for a shared route: its nodes run per instance
+under the group's include, where the instance's values reach them, and stay
+shared under the route's, so the route's runs need no instance.
+
 When one per-instance node serves several routes, the shape that compiles
 is the node and its routes side by side at the same level, in a group that
 receives no per-instance value. Only the groups and includes doing the work
@@ -145,15 +164,15 @@ session drives its own Blender container looks like this (`BlenderWorkstation`
 and `BlenderPreview` are that project's own nodes, not catalog ones):
 
 ```weft
-live = Group(keys: Access) {
+live = Group() {
   # One session's Blender and the routes that drive it
   blender = BlenderWorkstation {
     @per_instance
   }
 
-  say = Route -> (body: { text: String }) { path: "sessions/{id}/messages", method: "POST", auth: self.keys }
-  look = Route -> (view: String) { path: "sessions/{id}/preview/{view}", method: "GET", auth: self.keys }
-  shoot = Route -> (id: String) { path: "sessions/{id}/render", method: "POST", auth: self.keys }
+  say = Route -> (body: { text: String }) { path: "sessions/{id}/messages", method: "POST", auth: "api_keys" }
+  look = Route -> (view: String) { path: "sessions/{id}/preview/{view}", method: "GET", auth: "api_keys" }
+  shoot = Route -> (id: String) { path: "sessions/{id}/render", method: "POST", auth: "api_keys" }
 
   agent = @include("live/agent.weft")
   agent.workstation = blender.workstation
@@ -279,7 +298,9 @@ The same cron can also clean up what weft itself can see: containers in
 `WipeInstance` removes the instance's triggers, the containers you name (with
 every disk, the ones kept through a terminate too), its values, connections,
 tokens, files and runs. `weft rm` of the project takes every instance's
-values, connections, tokens and files with it.
+values, connections, tokens and files with it. Short of that, an
+instance's files go only when somebody deletes them or a deadline they were
+given arrives.
 
 ## Tokens and costs
 
@@ -288,9 +309,10 @@ runs (the `Weft-Instance-Token` header on a live route), answers its waits,
 shows its displays and connects its accounts. It always expires.
 `MintInstanceToken` mints one for any instance id at any time, not only when
 the instance is created, so a page can drive an instance started elsewhere
-(by a cron, by another route). weft keeps only a hash of it, so a replayed run
-cannot hand back the value it minted: it mints a new value for the same
-token, and the old value stops working. Its `token` comes out as a
+(by a cron, by another route). weft keeps only a hash of it, so a node that mints
+again after running from the top (its state did not record the mint) cannot
+get the value back: it mints a new value for the same token, and the old
+value stops working. Its `token` comes out as a
 `Secret[String]`, so the run's record holds only its marker: wired straight
 into a `Reply`'s `body` it goes to the browser revealed, and inside an object
 it does too once that object's type says which field is the secret
@@ -346,7 +368,7 @@ something they do not cover calls the ctx directly in a node of its own:
 | Call | What it does |
 |---|---|
 | `ctx.instance()` | Which instance this run is for (the `CurrentInstance` node fires `instance` or `nobody`) |
-| `ctx.infra("bridge").instance(id).start()` / `.request_start()` / `.stop(take_down, stop_self)` / `.terminate(take_down, stop_self)` / `.wipe(take_down, stop_self)` / `.upgrade(take_down, stop_self)` / `.status()` | One instance's container; `terminate` keeps the disks listed in `keepOnTerminate`, `wipe` deletes them too. `take_down` and `stop_self` are explained beside the same calls in the `weft-node-authoring` skill |
+| `ctx.infra("bridge").instance(id).start(&mut state)` / `.request_start(&mut state)` / `.stop(take_down, stop_self)` / `.terminate(take_down, stop_self)` / `.wipe(take_down, stop_self)` / `.upgrade(take_down, stop_self)` / `.status()` | One instance's container; `terminate` keeps the disks listed in `keepOnTerminate`, `wipe` deletes them too. `take_down` and `stop_self` are explained beside the same calls in the `weft-node-authoring` skill |
 | `ctx.infra("bridge").copies()` | Every copy of the node: the shared one and each instance's (the `ListInstanceInfra` node) |
 | `ctx.triggers().instance(id).activate(held)` / `.deactivate(take_down, stop_self)` | An instance's triggers (`.only([..])` narrows, `.all_instances()` takes every instance's); `held`, `take_down` and `stop_self` are explained beside the same calls in the `weft-node-authoring` skill |
 | `ctx.values().instance(id).get()` / `.set(node, field, value)` / `.clear(node, field)` / `.apply()` / `.forget()` | What was given for an instance's `@instance_filled` fields: read (the `GetInstanceValues` node), change in one go (the `SetInstanceValues` node; `apply()` returns the triggers it set up again), or forget all |
@@ -363,12 +385,13 @@ project's code and one run's calls (`ctx.code()`, `ctx.run_by_id(run)`), and
 the three things a program cannot do on its own project, go and read the
 `weft-node-authoring` skill.
 
-`start()` returns once the container is running, however long that takes
-(the run parks between looks and holds no worker), so you can activate the
+`start(&mut state)` returns once the container is running, however long
+that takes (the run parks between looks and holds no worker; the state is
+the node's `ctx.keep`, the `weft-node-authoring` skill's "Pausing"), so you can activate the
 instance's triggers right after it. If the container never comes up,
-`start()` fails with the reason, and so it does if somebody stops the
+`start` fails with the reason, and so it does if somebody stops the
 container while it waits (it never starts it again behind a pause).
-`request_start()` returns as soon as weft accepts the start, without waiting
+`request_start(&mut state)` returns as soon as weft accepts the start, without waiting
 for the container (`StartInfra` with `waitUntilRunning` off); a start
 refused for a passing reason, such as a build in progress, is asked again
 until it is accepted. Every
@@ -391,7 +414,7 @@ mounting it, go and read the `weft-frontend` skill. It draws each field with
 its own control, and a list field (its spreadsheets, its models) is read
 through the instance's own connection. An instance is never offered the
 shared key. To try an instance's path yourself before any website exists:
-`weft connect --instance <id> --node <node>` connects an account for that
+`weft connect <node> --instance <id>` connects an account for that
 instance (`--door own --set-env key=ENV_VAR`) or picks one it has (`--grant
 <id>`), and `weft instance-values --instance <id>` lists its fields, with
 `--set <node>.<field>=<value>` / `--clear <node>.<field>` changing them. Each command

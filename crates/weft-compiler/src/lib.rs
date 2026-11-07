@@ -30,12 +30,15 @@
 //!    ports and `@require_one_of`, loops, trigger and infra placement,
 //!    each node's declarative rules). `Structural` gates the build;
 //!    `Runtime` adds the rules a sketch may leave open (a provider with
-//!    no model named yet).
-//! 5. The dispatcher resolves file-typed `@asset` markers into stored
-//!    files, then `build_plan::plan_build_from` computes the three hashes
+//!    no model named yet). Once everything has read them, the build's
+//!    compile names each `@file`'s text by its content
+//!    (`file_ref::name_contents`, `weft_core::content`).
+//! 5. The dispatcher resolves `@asset` markers (a file kind into a
+//!    stored file, a text kind into its named content), then `build_plan::plan_build_from` computes the three hashes
 //!    (binary and infra in `hash`; the definition hash is weft-core's
 //!    `compute_definition_hash`, re-exported there) and stages what it
-//!    needs: `build::build_project` validates the resolved definition,
+//!    needs: `build::build_project` validates the resolved definition
+//!    with every named content's value put back (`unsettled`),
 //!    `codegen::emit` writes the worker cargo crate (one crate per
 //!    referenced node package, plus the registry and `main.rs`; the
 //!    definition itself is never baked in, a worker fetches it from the
@@ -60,6 +63,7 @@ pub mod edit;
 pub mod file_reader;
 pub mod file_ref;
 pub mod enrich;
+mod connection_field;
 pub mod validate;
 // Project source / drift hashing. `compute_definition_hash` (weft-core's,
 // re-exported here) is pure (no filesystem) and always available
@@ -209,6 +213,8 @@ fn parse_only_inner(
     // graph-shape problems (graph-cycle, scope-reachability, duplicate
     // ids, etc.) directly from /parse. Runtime-only rules
     // still only fire from the dedicated /validate endpoint.
+    // The editor builds for no install: a rule asking which one is left
+    // unanswered.
     diagnostics.extend(validate::validate_with_mode(
         &project,
         catalog,
@@ -296,6 +302,8 @@ pub fn compile_strict(
             .into_iter()
             .map(|e| e.diagnostic())
             .collect();
+        // For no install (`weft validate`, the editor): a rule asking
+        // which one is left unanswered.
         diagnostics.extend(validate::validate_with_mode(&project, catalog, mode));
         (project, diagnostics)
     })
@@ -315,31 +323,82 @@ pub fn compile_strict(
 /// `Err` holds every diagnostic when one is about the program as a whole
 /// (the entry file does not parse, a check no cut can avoid): nothing can
 /// be cut from a program that does not stand.
+///
+/// Compiled for no install, as a command compiles on its own: a node's
+/// rule asking which install it is (`local_install`) is left unanswered.
 pub fn compile_program(
     source: &str,
     project_id: Uuid,
     fs: CompileFs,
     catalog: &dyn MetadataCatalog,
 ) -> Result<ProjectDefinition, Vec<Diagnostic>> {
+    compile_program_with_contents(source, project_id, fs, catalog, None).map(|compiled| compiled.definition)
+}
+
+/// A program as a build compiled it ([`compile_program_with_contents`]):
+/// the definition, and the value of each file content it names. The
+/// stages after the compile read both from here (the gate, [`unsettled`],
+/// and through it `build::build_project` and `build_plan::plan_build_from`).
+/// The install it was compiled for is on the definition
+/// (`ProjectDefinition::install`), where every check after it reads it and
+/// the run answers a node's rule asking it (`local_install`): what is
+/// broken depends on the install, so a kind handed in separately could
+/// differ from the one that decided the broken parts.
+#[derive(Debug, Clone)]
+pub struct Compiled {
+    pub definition: ProjectDefinition,
+    /// The value of each file content `definition` names
+    /// (`weft_core::content`), which the gate reads.
+    pub contents: weft_core::content::ContentValues,
+}
+
+/// [`compile_program`], with the value of each file content the program
+/// names (`weft_core::content`) and the install it is compiled for, all
+/// three in the [`Compiled`] a build hands its own gate ([`unsettled`]),
+/// which checks the program as it runs. `install` is the install the
+/// program is built for, when the caller builds it for one (the
+/// install's version build), so a rule asking which one it is
+/// (`local_install`) is answered.
+pub fn compile_program_with_contents(
+    source: &str,
+    project_id: Uuid,
+    fs: CompileFs,
+    catalog: &dyn MetadataCatalog,
+    install: Option<weft_core::install::InstallKind>,
+) -> Result<Compiled, Vec<Diagnostic>> {
     // A broken part names its file from the project root: the install
     // compiles in a directory of its own, whose path means nothing to
     // whoever reads the refusal.
     let root = root_identity(&fs)?;
     catalog.type_registry().scoped(|| {
-        let (mut project, parse_errors) =
-            weft_compiler::compile_lenient(source, project_id, fs, weft_compiler::IncludeMode::Full, None);
+        let mut reads = Vec::new();
+        let (mut project, parse_errors) = weft_compiler::compile_lenient_reading(
+            source,
+            project_id,
+            fs,
+            weft_compiler::IncludeMode::Full,
+            None,
+            Some(&mut reads),
+        );
         let mut diagnostics: Vec<Diagnostic> = parse_errors.iter().map(|e| e.diagnostic("parse")).collect();
         // An entry file that does not parse leaves a partial program, and
         // the later stages would only add findings about the gap.
         if diagnostics.iter().any(is_whole_program_error) {
             return Err(diagnostics);
         }
+        project.install = install;
         for e in enrich::enrich_collecting(&mut project, catalog, enrich::EnrichPolicy::Strict) {
             diagnostics.push(e.diagnostic());
         }
         diagnostics.extend(validate::validate_with_mode(&project, catalog, validate::ValidationMode::Structural));
         settle(&mut project, catalog, diagnostics, root.as_deref())?;
-        Ok(project)
+        // Read while the `@file` contents are still in, as every check
+        // above read them.
+        validate::record_rechecks(&mut project, catalog);
+        // Every check has read the `@file` contents; the program the
+        // build keeps names each by its content.
+        let contents = file_ref::name_contents(&mut project, reads);
+        Ok(Compiled { definition: project, contents })
     })
 }
 
@@ -354,18 +413,30 @@ fn root_identity(fs: &CompileFs) -> Result<Option<std::path::PathBuf>, Vec<Diagn
         .map_err(|why| vec![Diagnostic::at(Default::default(), Severity::Error, "project-root", why)])
 }
 
-/// The errors `project` has that it does not already carry as broken
-/// parts: none for a program [`compile_program`] settled, as long as
-/// nothing changed it in a way that breaks something new. The build's own
-/// gate, so a definition changed after its check can never build with an
-/// error nobody recorded. `fs` is the view of the project it was compiled
-/// through ([`compile_program`]'s), whose root the files of broken parts
-/// are spelled from, however this caller spells that root.
-pub fn unsettled(project: &ProjectDefinition, catalog: &dyn MetadataCatalog, fs: CompileFs) -> Vec<Diagnostic> {
+/// The errors `compiled`'s definition has that it does not already carry
+/// as broken parts: none for a program [`compile_program_with_contents`]
+/// settled, as long as nothing changed it in a way that breaks something
+/// new. The build's own gate, so a definition changed after its check can
+/// never build with an error nobody recorded. `fs` is the view of the
+/// project it was compiled through ([`compile_program`]'s), whose root
+/// the files of broken parts are spelled from, however this caller spells
+/// that root.
+///
+/// The checks read the program with the value of each file content it
+/// names put back (`compiled.contents`, the compile's and the build's
+/// text `@asset`s), as the compile checked it and as a worker runs it,
+/// never a marker, and for the install it was compiled for
+/// (`ProjectDefinition::install`).
+pub fn unsettled(compiled: &Compiled, catalog: &dyn MetadataCatalog, fs: CompileFs) -> Vec<Diagnostic> {
     let root = match root_identity(&fs) {
         Ok(root) => root,
         Err(diagnostics) => return diagnostics,
     };
+    let mut project = compiled.definition.clone();
+    if let Err(why) = weft_core::content::resolve_program(&mut project, &compiled.contents) {
+        return vec![Diagnostic::at(Default::default(), Severity::Error, "content-not-read", why)];
+    }
+    let project = &project;
     let hiding = hiding_nodes(project, catalog);
     validate::validate_with_mode(project, catalog, validate::ValidationMode::Structural)
         .into_iter()
@@ -472,6 +543,7 @@ fn broken_part(
     };
     Ok(weft_core::project::Broken {
         parts: d.subjects.clone(),
+        places: d.places.clone(),
         why: format!("{file}:{}:{} {}", d.line, d.column, d.message),
         hides: d.subjects.iter().any(|part| hiding.contains(part)),
     })
@@ -507,6 +579,7 @@ pub fn render_diagnostic(d: &Diagnostic) -> String {
 /// Turn an `Error`-severity diagnostic set into a single loud
 /// [`error::BuildError::Validate`]; `Ok(())` when only warnings (or
 /// nothing) remain. The build's gate (`build::build_project`) aborts on it.
+#[cfg(feature = "build")]
 pub(crate) fn bail_on_errors(diagnostics: Vec<Diagnostic>) -> error::BuildResult<()> {
     if diagnostics.iter().any(|d| matches!(d.severity, Severity::Error)) {
         Err(error::BuildError::Validate(render_diagnostics(&diagnostics)))
@@ -526,6 +599,7 @@ fn empty_project(project_id: Uuid) -> ProjectDefinition {
         defaults: Default::default(),
         given: Default::default(),
         broken: Vec::new(),
+        install: None,
         metadata_wires: Vec::new(),
     }
 }

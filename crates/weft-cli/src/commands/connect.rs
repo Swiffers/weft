@@ -20,7 +20,7 @@ use uuid::Uuid;
 use weft_core::picks::{ChangePicks, PickInput};
 use weft_core::run_spec::InstanceFieldRef;
 use weft_core::access::spec::{
-    percent_encode, AccessSpec, AppRegistration, CredentialField, Door, GrantCoexistence,
+    percent_encode, AccessSpec, AppRegistration, CredentialField, Door, GrantCoexistence, LoginWay,
 };
 use weft_core::access::wire::{
     BeginOAuth, CompletedConnect, ConnectDirect, DoorsAnswer, DoorsRequest, DoorsStatus,
@@ -33,10 +33,10 @@ use crate::prompt::{confirm, is_interactive, prompt_line};
 
 #[derive(clap::Args, Debug)]
 pub struct ConnectOpts {
-    /// The access node to manage: its id, or `path/to/file.weft:id`
-    /// when the same id exists in more than one included file. Optional
-    /// when the project has exactly one access node.
-    #[arg(long)]
+    /// The node to manage (an access node, or a Route or Socket checking
+    /// its callers): its id, or `path/to/file.weft:id` when the same id
+    /// exists in more than one included file. Optional when the project
+    /// has exactly one node that takes a connection.
     pub node: Option<String>,
     /// Only list the node's stored connections, change nothing.
     #[arg(long, group = "action")]
@@ -87,6 +87,11 @@ pub struct ConnectOpts {
     /// token, no app) instead of the app + sign-in path.
     #[arg(long, conflicts_with_all = ["list", "grant", "disconnect", "forget", "upgrade", "mint"])]
     pub paste: bool,
+    /// Which way to sign in to use on the own door (its id), for a
+    /// service that offers several (`subscription`, `apiKey`). Asked for
+    /// when left out on a terminal.
+    #[arg(long, conflicts_with_all = ["list", "grant", "disconnect", "forget", "upgrade", "mint", "paste"])]
+    pub way: Option<String>,
     /// Mint the provider app automatically (services that support it)
     /// and connect through the fresh credentials.
     #[arg(long, conflicts_with_all = ["list", "grant", "disconnect", "forget", "upgrade"])]
@@ -122,6 +127,7 @@ impl ConnectOpts {
             || !self.set.is_empty()
             || !self.set_env.is_empty()
             || self.paste
+            || self.way.is_some()
             || self.mint
             || self.label.is_some()
             || self.permissions.is_some()
@@ -136,7 +142,7 @@ impl ConnectOpts {
 /// it is named by ([`AccessTarget::spelling`]).
 pub(crate) struct AccessTarget {
     /// The file the node is written in, relative to the project root, the
-    /// name `--node file:id` qualification and every message use.
+    /// name a `file:id` qualification and every message use.
     rel_file: String,
     /// The node's id, as the compiler keys it: for a node inside an
     /// included file that carries the file's path (`@src:sweep.key`).
@@ -163,7 +169,9 @@ async fn move_picks(ctx: &Ctx, client: &DispatcherClient, from: &str, to: &str, 
     super::ensure::ensure_project_known(ctx).await?;
     let project_id = ctx.project()?.id();
     let body = weft_core::picks::MovePicks { from: from.to_string(), to: to.to_string() };
-    let answer = client.post_json(&format!("/projects/{project_id}/picks/move"), &serde_json::to_value(&body)?).await?;
+    // It answers once the triggers that read the moved picks are set up
+    // again, however long their setup takes.
+    let answer = client.waiting_on_its_work().post_json(&format!("/projects/{project_id}/picks/move"), &serde_json::to_value(&body)?).await?;
     let moved: weft_core::picks::PicksMoved = crate::client::read_answer(answer, "the install's answer to the move")?;
     if json {
         println!("{}", serde_json::to_value(&moved)?);
@@ -303,12 +311,12 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
             return print_all_grants(&client, json).await;
         }
         bail!(
-            "this project has no access node (no node whose type declares a service \
-             recipe), so there is nothing to connect"
+            "this project has no node that takes a connection (an access node, or a Route or \
+             Socket whose `auth` checks its callers), so there is nothing to connect"
         );
     }
-    // `--list` never prompts: with several access nodes and no
-    // `--node`, every node's connections are listed in turn.
+    // `--list` never prompts: with several access nodes and no node
+    // named, every node's connections are listed in turn.
     if opts.list && opts.node.is_none() && targets.len() > 1 {
         let mut all: Vec<serde_json::Value> = Vec::new();
         for (i, target) in targets.iter().enumerate() {
@@ -379,16 +387,18 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
     if opts.list {
         if json {
             // One JSON OBJECT per line, per the global --json contract.
-            // It names the node it listed for: a caller that passed
-            // `--node` still has to see which one answered, spelled the
+            // It names the node it listed for: a caller that named one
+            // still has to see which one answered, spelled the
             // way the program spells it, and every other name the node
-            // has (a file included twice gives it two).
+            // has (a file included twice gives it two), and which
+            // connection this install has picked for it, if any.
             println!(
                 "{}",
                 serde_json::json!({
                     "node": target.spelling(),
                     "spellings": target.spellings(),
                     "file": target.rel_file,
+                    "picked": target.picked.handle().map(|h| h.id),
                     "connections": grants,
                 })
             );
@@ -609,7 +619,7 @@ impl Place<'_> {
     /// `weft connect` for `target`, here, followed by `rest`.
     fn connect(&self, target: &AccessTarget, rest: &str) -> String {
         let instance = self.instance.map(|i| format!("--instance {i} ")).unwrap_or_default();
-        super::weft_on(self.on, &format!("connect {instance}--node {} {rest}", target.spelling()))
+        super::weft_on(self.on, &format!("connect {} {instance}{rest}", target.spelling()))
     }
 }
 
@@ -746,7 +756,7 @@ pub(crate) fn written_in_source(target: &AccessTarget) -> String {
     format!(
         "'{node}.{field}' holds a connection written in the source ({file}). That was the old way of \
          connecting a node: a connection lives in one install, so its id means nothing on any other. \
-         Erase that line, then run `weft connect --node {node}` again; the pick is kept by the \
+         Erase that line, then run `weft connect {node}` again; the pick is kept by the \
          install. See {doc}",
         node = target.spelling(),
         field = target.input,
@@ -763,6 +773,8 @@ pub(crate) fn written_in_source(target: &AccessTarget) -> String {
 struct OtherNode {
     node: String,
     node_type: String,
+    /// A node that would check its callers but whose `auth` is "none".
+    checks_no_caller: bool,
 }
 
 /// Walk main.weft and every `@include`d file (recursively) and pair
@@ -877,28 +889,23 @@ fn collect_targets(
             continue;
         }
         let spellings = spellings_of(program, &node.id)?;
-        let mut note_other = || {
-            others.push(OtherNode { node: node.id.clone(), node_type: node.node_type.clone() })
+        let mut note_other = |checks_no_caller: bool| {
+            others.push(OtherNode { node: node.id.clone(), node_type: node.node_type.clone(), checks_no_caller })
         };
         let Some(meta) = weft_core::node::MetadataCatalog::lookup(catalog, &node.node_type) else {
-            note_other();
+            note_other(false);
             continue;
         };
-        let Some(spec) = meta.service.clone() else {
-            note_other();
+        // The one answer to which field takes a connection and to which
+        // recipe: an access node's own, or the scheme a Route's `auth`
+        // names.
+        let auth = node.written_value(weft_core::access::callers::AUTH_FIELD);
+        let field = weft_core::access::callers::connection_field(meta, auth)
+            .map_err(|why| anyhow::anyhow!("'{}': {why}", weft_core::project::plain_id(&node.id)))?;
+        let Some(weft_core::access::callers::ConnectionField { input, spec }) = field else {
+            note_other(meta.features.checks_callers);
             continue;
         };
-        let input = meta
-            .access_input()
-            .map(|i| i.name.clone())
-            .with_context(|| {
-                format!(
-                    "node type '{}' declares the '{}' service but no input carries the \
-                     access widget; metadata load is supposed to refuse that, so the \
-                     installed catalog is broken",
-                    node.node_type, spec.service
-                )
-            })?;
         // Through `written_value`, never `config`: a constant written for
         // an INPUT PORT has two homes in source and enrich moves it from
         // one to the other (`normalize_port_literals`).
@@ -1017,7 +1024,7 @@ fn describe_target(t: &AccessTarget) -> String {
 }
 
 /// Any node of the project, found by the name a person types, the same
-/// way `weft connect --node` finds an access node.
+/// way `weft connect <node>` finds an access node.
 pub(crate) struct ResolvedNode {
     /// The compiled id, the key into `program`.
     pub(crate) node: String,
@@ -1066,6 +1073,13 @@ fn choose_target(
         // as "you typed it wrong" when the real answer is "that one
         // needs nothing from you".
         if let Some(other) = others.iter().find(|o| o.node == id) {
+            if other.checks_no_caller {
+                bail!(
+                    "'{name}' checks no caller (its `auth` is \"none\"), so it takes no connection; set \
+                     its `auth` to the scheme its callers use ({}) first",
+                    weft_core::access::callers::auth_options()[1..].join(", ")
+                );
+            }
             bail!(
                 "'{name}' is a {} and takes no connection: nothing about it is yours to \
                  pick, so there is nothing to connect here. `weft connect --list` shows the \
@@ -1099,7 +1113,7 @@ fn choose_target(
         };
         eprintln!("  [{}] {} - {}", i + 1, describe_target(t), status);
     }
-    let choice = prompt_line("Which node? ", "--node <id>")?;
+    let choice = prompt_line("Which node? ", "weft connect <node>")?;
     let idx: usize = choice
         .trim()
         .parse()
@@ -1128,7 +1142,9 @@ pub(crate) async fn list_grants(
         // (`weft connect --list`) rely on, so it works from anywhere.
         None => doorway.route(Route::Grants).to_string(),
     };
-    let rows = client.get_json(&path).await?;
+    // The listing asks the broker which shared keys it holds, which the
+    // install waits on for as long as the broker's database turns it away.
+    let rows = client.waiting_on_its_work().get_json(&path).await?;
     serde_json::from_value(rows).context("parse the connection list")
 }
 
@@ -1180,9 +1196,15 @@ fn grant_by_number<'a>(grants: &'a [GrantSummary], raw: &str) -> Result<&'a Gran
 /// node published it) goes by `service_label`.
 fn grant_title(g: &GrantSummary, service_label: &str) -> String {
     let name = g.label.as_deref().unwrap_or(service_label);
-    match &g.identity {
+    let title = match &g.identity {
         Some(who) => format!("{who} (named \"{name}\")"),
         None => format!("\"{name}\""),
+    };
+    // Which way to sign in it was made with, when the service offers a
+    // choice (a service with one way names it the default one).
+    match g.way.as_deref().filter(|way| *way != weft_core::access::spec::DEFAULT_WAY) {
+        Some(way) => format!("{title}, signed in with {way}"),
+        None => title,
     }
 }
 
@@ -1323,7 +1345,9 @@ impl Connecting<'_> {
                 ("/instance/values".to_string(), serde_json::to_value(body)?)
             }
         };
-        let answer = self.client.put_json(&path, &body).await?;
+        // It answers once the triggers that read the change are set up
+        // again, however long their setup takes.
+        let answer = self.client.waiting_on_its_work().put_json(&path, &body).await?;
         Ok(crate::client::read_answer::<weft_core::instance_door::ValuesChanged>(answer, "the install's answer to the change")?.rearmed)
     }
 
@@ -1381,6 +1405,7 @@ impl Connecting<'_> {
         let spec = &self.target.spec;
         let doors: DoorsStatus = serde_json::from_value(
             client
+                .waiting_on_its_work()
                 .post_json(
                     self.doorway.route(Route::Doors),
                     &serde_json::to_value(DoorsRequest { spec: spec.clone() })?,
@@ -1451,8 +1476,8 @@ impl Connecting<'_> {
             // The own-door flags would be silently dropped on this path;
             // dropping a pasted credential on the floor is the worst way
             // to ignore a flag.
-            if !opts.set.is_empty() || !opts.set_env.is_empty() || opts.paste || opts.mint {
-                bail!("--set/--set-env/--paste/--mint fill your own credential; they do nothing with --door shared");
+            if !opts.set.is_empty() || !opts.set_env.is_empty() || opts.paste || opts.mint || opts.way.is_some() {
+                bail!("--set/--set-env/--paste/--mint/--way fill your own credential; they do nothing with --door shared");
             }
             if opts.label.is_some() {
                 bail!("--label names a connection you create yourself; the shared door names it after its app, or after the service");
@@ -1507,6 +1532,7 @@ impl Connecting<'_> {
                     permissions: Vec::new(),
                     registration: None,
                     paste: false,
+                    way: None,
                     project_id: None,
                     instance: None,
                 },
@@ -1679,6 +1705,7 @@ impl Connecting<'_> {
                     permissions: ticked,
                     registration: None,
                     paste: true,
+                    way: None,
                     project_id: None,
                     instance: None,
                 },
@@ -1687,10 +1714,22 @@ impl Connecting<'_> {
             .await;
         }
 
+        // A pasted-credential service's way to sign in, which decides the
+        // guide and the fields below: only one this install offers.
+        let way = match spec.ways() {
+            [] => {
+                if opts.way.is_some() {
+                    bail!("--way picks one of a pasted credential's ways to sign in; {label} signs in another way");
+                }
+                None
+            }
+            _ => Some(chosen_way(spec, &doors.offered_ways, opts.way.as_deref(), label)?),
+        };
+
         // The generated how-to guide, permissions interpolated, exactly as
         // the own page renders it. Terminal-only: in a pipe it is noise a
         // script would have to skip.
-        let steps = spec.guide_steps(&ticked);
+        let steps = spec.guide_steps(way, &ticked);
         if interactive
             && !steps.is_empty()
             && opts.set.is_empty()
@@ -1698,7 +1737,7 @@ impl Connecting<'_> {
             && !opts.mint
         {
             println!("How to create your own {label} credential:");
-            if let Some(link) = spec.guide_link(&ticked) {
+            if let Some(link) = spec.guide_link(way, &ticked) {
                 println!("  {link}");
             }
             for (i, s) in steps.iter().enumerate() {
@@ -1733,6 +1772,7 @@ impl Connecting<'_> {
             };
             let answer: MintAppResponse = serde_json::from_value(
                 client
+                    .waiting_on_its_work()
                     .post_json("/access/mint-app", &serde_json::to_value(&req)?)
                     .await?,
             )
@@ -1741,7 +1781,7 @@ impl Connecting<'_> {
             minted = answer.values;
         }
 
-        let fields = spec.own_fields();
+        let fields = spec.own_fields(way);
         for f in &fields {
             if let Some(v) = minted.remove(&f.name) {
                 set.entry(f.name.clone()).or_insert(v);
@@ -1847,6 +1887,7 @@ impl Connecting<'_> {
                     permissions: ticked,
                     registration,
                     paste: false,
+                    way: None,
                     project_id: None,
                     instance: None,
                 },
@@ -1871,12 +1912,49 @@ impl Connecting<'_> {
                 permissions: ticked,
                 registration: None,
                 paste: false,
+                way: way.map(|w| w.id.clone()),
                 project_id: None,
                 instance: None,
             },
             None,
         )
         .await
+    }
+}
+
+/// The way to sign in to a pasted-credential service a connect fills: the
+/// one `--way` names, else the only one this install offers (`offered`,
+/// the doors probe's), else the one the person picks. A way this install
+/// does not offer is refused, naming the ones that work here.
+fn chosen_way<'s>(spec: &'s AccessSpec, offered: &[String], flag: Option<&str>, label: &str) -> Result<&'s LoginWay> {
+    let ways = spec.ways();
+    if let Some(id) = flag {
+        let way = spec.chosen_way(Some(id)).map_err(anyhow::Error::msg)?;
+        if !offered.contains(&way.id) {
+            bail!("{}", spec.cloud_refusal(way));
+        }
+        return Ok(way);
+    }
+    let here: Vec<&LoginWay> = ways.iter().filter(|w| offered.contains(&w.id)).collect();
+    match here.as_slice() {
+        [] => bail!("{}", spec.cloud_refusal(&ways[0])),
+        [only] => Ok(only),
+        several => {
+            let menu: String =
+                several.iter().enumerate().map(|(i, w)| format!("\n  [{}] {}", i + 1, w.display_label())).collect();
+            let ids: Vec<&str> = several.iter().map(|w| w.id.as_str()).collect();
+            let choice = prompt_line(
+                &format!("How do you sign in to {label}?{menu}\nWay [1-{}]: ", several.len()),
+                &format!("--way {}", ids.join("|")),
+            )?;
+            choice
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| n.checked_sub(1))
+                .and_then(|i| several.get(i).copied())
+                .with_context(|| format!("'{}' is not one of the ways; answer 1 to {} (or pass --way)", choice.trim(), several.len()))
+        }
     }
 }
 
@@ -1918,7 +1996,7 @@ pub(crate) async fn connect_direct(
         shared_app,
         inner: req,
     })?;
-    let done = client.post_json(doorway.route(Route::Direct), &body).await?;
+    let done = client.waiting_on_its_work().post_json(doorway.route(Route::Direct), &body).await?;
     grant_of(done)
 }
 
@@ -1972,7 +2050,7 @@ impl Connecting<'_> {
             inner: req,
         })?;
         let started: StartedOAuth =
-            serde_json::from_value(client.post_json(self.doorway.route(Route::Begin), &body).await?)
+            serde_json::from_value(client.waiting_on_its_work().post_json(self.doorway.route(Route::Begin), &body).await?)
                 .context("parse the sign-in start")?;
         println!(
             "Finish the sign-in in your browser:\n  {}",
@@ -2005,6 +2083,7 @@ impl Connecting<'_> {
                 );
             }
             let outcome = client
+                .waiting_on_its_work()
                 .get_json(&format!(
                     "{}?state={}",
                     self.doorway.route(Route::Status),
@@ -2040,7 +2119,7 @@ impl Connecting<'_> {
 #[derive(serde::Deserialize)]
 #[serde(untagged)]
 enum ConnectOutcome {
-    Done(CompletedConnect),
+    Done(Box<CompletedConnect>),
     Failed { error: String },
 }
 
@@ -2112,8 +2191,18 @@ pub(crate) fn collect_field_values(
             None if !interactive && optional => continue,
             None if !interactive => bail!(
                 "'{label}' has no value; pass {flag_hint} (for '{}') to fill it \
-                 non-interactively",
-                f.name
+                 non-interactively. The fields this connection asks for: {}",
+                f.name,
+                fields
+                    .iter()
+                    .map(|f| match (&f.label, f.optional) {
+                        (Some(label), false) => format!("{} ({label})", f.name),
+                        (Some(label), true) => format!("{} ({label}, optional)", f.name),
+                        (None, false) => f.name.clone(),
+                        (None, true) => format!("{} (optional)", f.name),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             None => {
                 let suffix = if optional {
@@ -2199,6 +2288,7 @@ mod tests {
             instance: None,
             identity: identity.map(str::to_string),
             label: label.map(str::to_string),
+            way: None,
             scopes: vec![],
             permissions_verified: false,
             owner: weft_core::CredentialOwner::own(None),
@@ -2242,6 +2332,7 @@ mod tests {
             instance: None,
             identity: Some("ada@example.com".into()),
             label: Some("Fake".into()),
+            way: None,
             scopes: vec![],
             permissions_verified: false,
             value_names: vec![],
@@ -2257,7 +2348,7 @@ mod tests {
         assert!(listing.contains("Instance 'ada''s Fake connections:"), "{listing}");
         assert!(listing.contains("ada@example.com (named \"Fake\")"), "{listing}");
         let empty = grants_listing(&target, &Pick::None, place, "Fake", &[]);
-        assert!(empty.contains("`weft connect --instance ada --node mail --door own`"), "{empty}");
+        assert!(empty.contains("`weft connect mail --instance ada --door own`"), "{empty}");
     }
 
     #[test]
@@ -2300,6 +2391,7 @@ mod tests {
             instance: None,
             identity: None,
             label: None,
+            way: None,
             scopes: vec![],
             permissions_verified: false,
             value_names: vec![],
@@ -2333,10 +2425,11 @@ mod tests {
 
     #[test]
     fn required_field_with_no_terminal_names_the_flag() {
-        let fields = vec![field("key", false, true)];
+        let fields = vec![field("key", false, true), field("region", true, false)];
         let mut set = BTreeMap::new();
         let err = collect_field_values(&fields, &mut set, "--set", false, false).unwrap_err();
         assert!(err.to_string().contains("--set (for 'key')"), "{err}");
+        assert!(err.to_string().ends_with("The fields this connection asks for: key, region (optional)"), "{err}");
     }
 
     #[test]
@@ -2462,6 +2555,84 @@ mod tests {
         assert_eq!(spellings_of(&p, "db").unwrap(), vec!["db".to_string()]);
     }
 
+    /// `weft connect <node>` over a real project whose access node lives
+    /// in a file included at two sites: each site's name picks it and is
+    /// the name it answers in, the compiler's own key and the bare name
+    /// are refused with both names that work, and a pick written for one
+    /// site (keyed the way `write_pick` keys it) reads back as connected
+    /// at that site only.
+    #[test]
+    fn an_included_access_node_is_named_by_its_site_and_its_pick_reads_back_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = weft_compiler::project::Project::init(dir.path(), "sites").unwrap();
+        let catalog = weft_compiler::build::build_project_catalog(&project.root).unwrap();
+        std::fs::create_dir_all(project.src_dir().join("lib")).unwrap();
+        std::fs::write(
+            project.src_dir().join("lib/part.weft"),
+            "Group(text: String) -> (access: Access) {\n  key = PostgresAccess\n  self.access = key.access\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.main_weft(),
+            "src = Text { value: \"hello\" }\none = @include(\"lib/part.weft\")\none.text = src.value\n\
+             two = @include(\"lib/part.weft\")\ntwo.text = src.value\n",
+        )
+        .unwrap();
+        let choose = |name: &str| {
+            let mut others = Vec::new();
+            let (targets, program) = discover(&project, &catalog, &mut others).unwrap();
+            choose_target(&project, &program, targets, &others, Some(name), true)
+        };
+        for place in ["one.key", "two.key"] {
+            let target = choose(place).unwrap();
+            assert_eq!(target.spelling(), place, "it answers in the name it was asked by");
+            assert!(target.spellings().iter().all(|s| !s.contains('@')), "{:?}", target.spellings());
+        }
+        for nobodys in ["key", "@src:lib:part.key"] {
+            let why = format!("{:#}", choose(nobodys).err().expect("refused"));
+            assert!(why.contains("one.key") && why.contains("two.key"), "{nobodys}: {why}");
+        }
+
+        let id = Uuid::from_u128(9);
+        let mut one = choose("one.key").unwrap();
+        let mut two = choose("two.key").unwrap();
+        let stored: weft_core::picks::Picks =
+            serde_json::from_value(serde_json::json!({ "one.key": { one.input(): { "id": id.to_string() } } })).unwrap();
+        with_install_picks(std::slice::from_mut(&mut one), &stored).unwrap();
+        with_install_picks(std::slice::from_mut(&mut two), &stored).unwrap();
+        let place = Place { on: None, instance: None };
+        let listed = grants_listing(&one, &one.picked, place, "Key", &[]);
+        assert!(listed.contains(&format!("'one.key' is connected as {id}")), "{listed}");
+        let listed = grants_listing(&two, &two.picked, place, "Key", &[]);
+        assert!(listed.contains("'two.key' has no connection picked"), "{listed}");
+    }
+
+    /// A Route checking its callers is a node to connect, to the recipe
+    /// of the scheme its `auth` names; one checking nobody is refused,
+    /// saying to set its `auth` first.
+    #[test]
+    fn a_route_checking_its_callers_connects_to_its_schemes_recipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = weft_compiler::project::Project::init(dir.path(), "gated").unwrap();
+        let catalog = weft_compiler::build::build_project_catalog(&project.root).unwrap();
+        std::fs::write(
+            project.main_weft(),
+            "secure = Route { path: \"secure\", auth: \"api_keys\" }\nsigned = Route { path: \"signed\", auth: \"hmac_sha256\" }\n\
+             open = Route { path: \"open\" }\n",
+        )
+        .unwrap();
+        let choose = |name: &str| {
+            let mut others = Vec::new();
+            let (targets, program) = discover(&project, &catalog, &mut others).unwrap();
+            choose_target(&project, &program, targets, &others, Some(name), true)
+        };
+        let secure = choose("secure").unwrap();
+        assert_eq!((secure.input(), secure.spec.service.as_str()), ("connection", "api_key_auth"));
+        assert_eq!(choose("signed").unwrap().spec.service, "hmac_auth");
+        let why = format!("{:#}", choose("open").err().expect("refused"));
+        assert!(why.contains("checks no caller") && why.contains("api_keys"), "{why}");
+    }
+
     /// A node at no place in the program is refused, never given a
     /// name no other command would take.
     #[test]
@@ -2469,5 +2640,45 @@ mod tests {
         let p = program_including_sweep(&[]);
         let err = spellings_of(&p, "@src:sweep.key").unwrap_err().to_string();
         assert!(err.contains("'sweep.key' is at no place"), "{err}");
+    }
+
+    /// The way a connect fills: the one `--way` names, if this install
+    /// offers it, else the only one it offers; one it does not offer, or
+    /// none at all, is refused naming what works here.
+    #[test]
+    fn the_way_to_sign_in_is_named_or_the_only_one_offered() {
+        let spec: AccessSpec = serde_json::from_value(serde_json::json!({
+            "service": "agent", "label": "Agent",
+            "acquisition": { "kind": "static", "ways": [
+                { "id": "subscription", "label": "Subscription", "localOnly": true, "fields": [{ "name": "token" }] },
+                { "id": "apiKey", "label": "API key", "fields": [{ "name": "key" }] }
+            ] }
+        }))
+        .unwrap();
+        let offered = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let both = offered(&["subscription", "apiKey"]);
+        assert_eq!(chosen_way(&spec, &both, Some("subscription"), "Agent").unwrap().id, "subscription");
+        let cloud = offered(&["apiKey"]);
+        assert_eq!(chosen_way(&spec, &cloud, None, "Agent").unwrap().id, "apiKey", "the only one offered");
+        let why = chosen_way(&spec, &cloud, Some("subscription"), "Agent").unwrap_err().to_string();
+        assert!(why.contains("works only on a local install") && why.ends_with("connect it with 'API key' instead"), "{why}");
+        let why = chosen_way(&spec, &cloud, Some("oauth"), "Agent").unwrap_err().to_string();
+        assert!(why.contains("no way to sign in named 'oauth'"), "{why}");
+        let why = chosen_way(&spec, &[], None, "Agent").unwrap_err().to_string();
+        assert!(why.contains("works only on a local install"), "{why}");
+    }
+
+    /// A connection made with one of several ways says which, in the list.
+    #[test]
+    fn a_connection_lists_the_way_it_was_made_with() {
+        let mut g: GrantSummary = serde_json::from_value(serde_json::json!({
+            "id": Uuid::nil(), "service": "agent", "projectId": null, "identity": null, "label": "mine",
+            "way": "subscription", "scopes": [], "permissionsVerified": false, "owner": "author", "door": "own",
+            "expiresAt": null
+        }))
+        .unwrap();
+        assert_eq!(grant_title(&g, "Agent"), "\"mine\", signed in with subscription");
+        g.way = Some(weft_core::access::spec::DEFAULT_WAY.into());
+        assert_eq!(grant_title(&g, "Agent"), "\"mine\"", "a service with one way names no way");
     }
 }

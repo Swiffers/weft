@@ -35,8 +35,9 @@
 //! (`weft_core::infra::VALUES_URL_ENV`), which writes it into the
 //! connection this node published: no run of this node is involved.
 //!
-//! Nothing here is memoized with `ctx.run`, and it does not need to
-//! be: the body never waits, so it is never replayed, and every call
+//! Nothing here is kept in a saved state (`state.once`), and it does not
+//! need to be: the body never waits, so it never runs again after a
+//! pause, and every call
 //! it makes is safe to repeat when somebody runs the node again. Reading the password is a
 //! read; publishing REPLACES one row keyed by this node; retiring is
 //! the same request with the same password, which the credential
@@ -55,7 +56,7 @@ use weft::{
     WeftResult,
 };
 
-use super::postgres::{mistake, IDLE_CLOSE};
+use super::postgres::IDLE_CLOSE;
 
 /// The port clients connect to: the pooler's. Postgres's own default, so
 /// a connection string reads like any other Postgres one.
@@ -170,11 +171,11 @@ fn secret_mount() -> Mount {
 /// paths, the ports and the names are declared once, here, and the
 /// container cannot drift from them. The pooler's name for the database
 /// and the program's user are what its card shows beside the password:
-/// the three a client signs in with. The extensions are the ones it makes
-/// on every start, as JSON, since a container's settings hold no line
-/// break.
+/// the three a client signs in with. The extensions and the roles are the
+/// ones it makes on every start, as JSON, since a container's settings hold
+/// no line break.
 // SYNC: credential_env <-> catalog/postgres/database/images/credential/bootstrap.py (the container's settings)
-fn credential_env(database: &str, extensions: &[String], version: &PostgresVersion) -> Vec<EnvEntry> {
+fn credential_env(database: &str, extensions: &[String], roles: &[Role], version: &PostgresVersion) -> Vec<EnvEntry> {
     vec![
         EnvEntry::new("WEFT_POSTGRES_MAJOR", version.major.to_string()),
         EnvEntry::new("WEFT_CLOSES_IDLE_SESSIONS_FROM", PostgresVersion::CLOSES_IDLE_SESSIONS.to_string()),
@@ -185,6 +186,7 @@ fn credential_env(database: &str, extensions: &[String], version: &PostgresVersi
         EnvEntry::new("WEFT_POOLER_DATABASE", pooler_database(database)),
         EnvEntry::new("WEFT_WATCH_DATABASE", watch_database(database)),
         EnvEntry::new("WEFT_EXTENSIONS", serde_json::to_string(extensions).expect("a list of names serializes")),
+        EnvEntry::new("WEFT_ROLES", serde_json::to_string(roles).expect("a list of roles serializes")),
         EnvEntry::new("WEFT_SECRET_DIR", SECRET_PATH),
         EnvEntry::new("WEFT_PASSWORD_FILE", password_file()),
         EnvEntry::new("WEFT_CREDENTIAL_PORT", CREDENTIAL_PORT.to_string()),
@@ -219,11 +221,11 @@ fn pooler_env(tuning: &Tuning) -> Vec<EnvEntry> {
 /// one line each: `--config` and the lines of [`pooler_config`], then
 /// `--hba` and the lines of [`pooler_hba`]. Arguments rather than
 /// environment, which cannot carry a line break.
-pub fn pooler_args(database: &str, tuning: &Tuning) -> Vec<String> {
+pub fn pooler_args(database: &str, tuning: &Tuning, roles: &[Role]) -> Vec<String> {
     std::iter::once("--config".to_string())
         .chain(pooler_config(database, tuning))
         .chain(std::iter::once("--hba".to_string()))
-        .chain(pooler_hba(database))
+        .chain(pooler_hba(database, roles))
         .collect()
 }
 
@@ -246,6 +248,15 @@ pub fn watch_database(database: &str) -> String {
 /// database the way it waits for anything else, and stops when the run
 /// does.
 ///
+/// PgBouncer keeps a pool per user of a door, each up to `pool_size`, so
+/// with a login role of the node's own ([`Role::login`]) beside `app`
+/// the pools of a door together could open more than its share;
+/// `max_db_connections` holds them all to that share, whoever signs in.
+/// A client of one role never waits on another role's idle connections:
+/// with the share full, PgBouncer (1.25, measured) closes an idle
+/// connection of another pool to serve it (its log says `evicted`), so
+/// only connections clients are holding make a client wait.
+///
 /// No password is in it: who may sign in is the file the credential
 /// container writes from the database itself.
 pub fn pooler_config(database: &str, tuning: &Tuning) -> Vec<String> {
@@ -253,10 +264,11 @@ pub fn pooler_config(database: &str, tuning: &Tuning) -> Vec<String> {
     // The database's own name, quoted the way PgBouncer reads a value
     // (a quote doubled), so any name Postgres has reaches it.
     let backend = format!("host=127.0.0.1 port={POSTGRES_PORT} dbname='{}'", database.replace('\'', "''"));
+    let share = |pool: u64| format!("pool_size={pool} max_db_connections={pool}");
     [
         "[databases]".to_string(),
-        format!("{door} = {backend} pool_size={}", tuning.query_pool),
-        format!("{watch} = {backend} pool_size={}", tuning.watch_pool),
+        format!("{door} = {backend} {}", share(tuning.query_pool)),
+        format!("{watch} = {backend} {}", share(tuning.watch_pool)),
         String::new(),
         "[pgbouncer]".to_string(),
         "listen_addr = *".to_string(),
@@ -290,20 +302,21 @@ pub fn pooler_config(database: &str, tuning: &Tuning) -> Vec<String> {
     .into()
 }
 
-/// Who may sign in to the pooler, and how. The program's role, with its
-/// password, to the program's database and its watching door, from
-/// anywhere the endpoint lets in; the superuser only to the pooler's
-/// admin console, only over the pooler's unix socket, which only the
-/// credential container mounts. Nobody reaches the superuser through
-/// the pooler.
-pub fn pooler_hba(database: &str) -> Vec<String> {
+/// Who may sign in to the pooler, and how. The program's role and each
+/// login role the node lists, each with its own password, to the
+/// program's database and its watching door, from anywhere the endpoint
+/// lets in; the superuser only to the pooler's admin console, only over
+/// the pooler's unix socket, which only the credential container mounts.
+/// Nobody reaches the superuser through the pooler, and a role taken off
+/// the list loses its lines here, so the pooler lets it in no more.
+pub fn pooler_hba(database: &str, roles: &[Role]) -> Vec<String> {
     let (door, watch) = (pooler_database(database), watch_database(database));
-    [
-        format!("local pgbouncer {ADMIN_USER} trust"),
-        format!("host {door},{watch} {APP_USER} 0.0.0.0/0 scram-sha-256"),
-        format!("host {door},{watch} {APP_USER} ::/0 scram-sha-256"),
-    ]
-    .into()
+    let signs_in = std::iter::once(APP_USER).chain(roles.iter().filter(|role| role.login).map(|role| role.name.as_str()));
+    std::iter::once(format!("local pgbouncer {ADMIN_USER} trust"))
+        .chain(signs_in.flat_map(|user| {
+            ["0.0.0.0/0", "::/0"].map(|from| format!("host {door},{watch} {user} {from} scram-sha-256"))
+        }))
+        .collect()
 }
 
 /// The file of who may sign in to the pooler, written by the credential
@@ -406,7 +419,7 @@ impl Tuning {
         let Split { share, shared_buffers_mib, maintenance_work_mem_mib, connections_mib, max_connections, query_pool, watch_pool } =
             split(memory_mib(memory)?);
         if query_pool == 0 || watch_pool == 0 {
-            mistake!(
+            weft::input_bail!(
                 "memory {memory} leaves Postgres room for {max_connections} connections, too few to keep \
                  {SUPERUSER_RESERVED} for the superuser and still give queries and watchers one each; raise \
                  `memory` to {LEAST_MEMORY_MIB}Mi or more"
@@ -478,8 +491,7 @@ const fn split(machine_mib: u64) -> Split {
 /// The least `memory` the node takes, in MiB: the smallest machine whose
 /// share gives the pooler a connection for queries and one for
 /// watchers. Read off [`split`], so it moves with the formula; the
-/// `memory` input's description states it too, and a test holds the two
-/// together.
+/// node's description states it too, and a test holds the two together.
 pub const LEAST_MEMORY_MIB: u64 = {
     let mut mib = BESIDE_POSTGRES_MIB;
     while split(mib).query_pool == 0 || split(mib).watch_pool == 0 {
@@ -487,22 +499,6 @@ pub const LEAST_MEMORY_MIB: u64 = {
     }
     mib
 };
-
-/// The `database` input as Postgres has the database: exactly as
-/// written, whatever it holds, because a database made under a name is
-/// found only under that name again, and a node pointing at another
-/// name points at a new, empty database. Refused only when nothing
-/// could carry it: empty, or with a line break or another control
-/// character, which no container's settings can hold.
-pub fn database_name(raw: &str) -> WeftResult<String> {
-    if raw.is_empty() {
-        mistake!("the `database` input is empty; name the database (app)");
-    }
-    if raw.chars().any(char::is_control) {
-        mistake!("database {raw:?} has a line break or another control character in it; name it without (app)");
-    }
-    Ok(raw.to_string())
-}
 
 /// The longest name the pooler can let clients in by as written: its
 /// watching door ([`watch_database`]) adds `_watch`, and Postgres and
@@ -556,7 +552,84 @@ fn name_hash(name: &str) -> u64 {
 pub fn extension_names(raw: Vec<String>) -> WeftResult<Vec<String>> {
     for name in &raw {
         if name.is_empty() || name.chars().any(char::is_control) {
-            mistake!("extension {name:?} in `extensions` is not a name; write each as Postgres names it (pg_trgm)");
+            weft::input_bail!("extension {name:?} in `extensions` is not a name; write each as Postgres names it (pg_trgm)");
+        }
+    }
+    Ok(raw)
+}
+
+/// One entry of the `roles` input: a Postgres role the program's database
+/// needs beside `app`, made by the superuser on every start
+/// (`bootstrap.py`, `converge`), never a superuser and never one that
+/// makes roles, and granted to `app` so the program can `set role` to it.
+// SYNC: Role <-> catalog/postgres/database/images/credential/bootstrap.py (WEFT_ROLES), catalog/postgres/database/metadata.json (the `roles` input)
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Role {
+    pub name: String,
+    /// Signs in by itself, through the pooler, with a password of its own
+    /// the card shows: how a client outside the program (a site) signs in
+    /// as a role other than `app`.
+    #[serde(default)]
+    pub login: bool,
+    /// Reads and writes past every row-level security policy, `FORCE`
+    /// ones included.
+    #[serde(default)]
+    pub bypass_row_level_security: bool,
+}
+
+/// The longest role name Postgres keeps whole.
+const MOST_ROLE_CHARS: usize = 63;
+
+/// The words Postgres reserves (`pg_get_keywords()`, category `R`, as of
+/// Postgres 17): written unquoted, `set role user` or `create policy ... to
+/// select` is a syntax error, so a role named one of them is one no program
+/// can name the way the node tells it to.
+const RESERVED_WORDS: [&str; 78] = [
+    "all", "analyse", "analyze", "and", "any", "array", "as", "asc", "asymmetric", "both", "case", "cast", "check",
+    "collate", "column", "constraint", "create", "current_catalog", "current_date", "current_role", "current_time",
+    "current_timestamp", "current_user", "default", "deferrable", "desc", "distinct", "do", "else", "end", "except",
+    "false", "fetch", "for", "foreign", "from", "grant", "group", "having", "in", "initially", "intersect", "into",
+    "lateral", "leading", "limit", "localtime", "localtimestamp", "not", "null", "offset", "on", "only", "or",
+    "order", "placing", "primary", "references", "returning", "select", "session_user", "some", "symmetric",
+    "system_user", "table", "then", "to", "trailing", "true", "union", "unique", "user", "using", "variadic", "when",
+    "where", "window", "with",
+];
+
+/// The `roles` input, each role checked. A name is what a program writes
+/// unquoted in `set role` and a policy (lowercase letters, digits and `_`,
+/// not starting with a digit, at most 63 characters, not a word Postgres
+/// reserves), so the name it writes is the role it gets; the pooler's
+/// sign-in rules take it as written too. Refused: `app` and `weft` (the
+/// program's role and the superuser, which this node makes itself), the
+/// names Postgres keeps (`public`, `none`, `pg_`, and its reserved words,
+/// among them `all`, every user to the pooler, and the ones that mean the
+/// current user). A name listed twice is the metadata's `unique` rule.
+pub fn role_list(raw: Vec<Role>) -> WeftResult<Vec<Role>> {
+    const KEPT: [&str; 4] = [APP_USER, ADMIN_USER, "public", "none"];
+    for role in &raw {
+        let name = role.name.as_str();
+        let plain = name.chars().next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+            && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            && name.len() <= MOST_ROLE_CHARS;
+        if !plain {
+            weft::input_bail!(
+                "role {name:?} in `roles` is not a name a program can write as it is; use lowercase letters, digits \
+                 and `_`, not starting with a digit, at most {MOST_ROLE_CHARS} characters (tenant_app)"
+            );
+        }
+        if KEPT.contains(&name) || name.starts_with("pg_") {
+            weft::input_bail!(
+                "role {name:?} in `roles` is a name this node or Postgres keeps for itself (`{APP_USER}` is the \
+                 program's own role, `{ADMIN_USER}` the superuser, `pg_` names and `public` and `none` are \
+                 Postgres's); name it something else"
+            );
+        }
+        if RESERVED_WORDS.contains(&name) {
+            weft::input_bail!(
+                "role {name:?} in `roles` is a word Postgres reserves, so `set role {name}` written as it is would be \
+                 a syntax error; name it something else (tenant_{name})"
+            );
         }
     }
     Ok(raw)
@@ -568,11 +641,10 @@ pub fn extension_names(raw: Vec<String>) -> WeftResult<Vec<String>> {
 // SYNC: MOVE_TO_14 <-> catalog/postgres/database/metadata.json (the old `version` rule's message)
 const MOVE_TO_14: &str = "Postgres cannot open an older version's data, so the data moves by dump and restore while \
      the old database still runs. Dump it: `weft infra press <node> reset_password`, then `weft infra env <node> \
-     --into old.env --set PGUSER=User --set PGDATABASE=Database --as PGPASSWORD`, and with those exported, `pg_dump \
+     --into old.env --set PGUSER=User --set PGDATABASE=Database --set PGPASSWORD=Password`, and with those exported, `pg_dump \
      -Fc -h <host> -p <port> -f data.dump` at the address `weft infra list-doors` prints for it (turn `reachable` on \
-     first if it is off). Restore it: add a PostgresDatabase on 17 with `reachable` on, start it, write its env the \
-     same way, `pg_restore --no-owner -h <host> -p <port> -d \"$PGDATABASE\" data.dump`, and wire the new node where \
-     the old one was";
+     first if it is off). Restore it: add a PostgresDatabase on 17 with `reachable` on, wire it where the old one was, \
+     start it (its setup takes the password), then press its reset_password and write its env the same way, and `pg_restore --no-owner -h <host> -p <port> -d \"$PGDATABASE\" data.dump`";
 
 /// The Postgres a `version` input names: the image tag, as written, and
 /// its major version.
@@ -613,11 +685,11 @@ pub fn postgres_version(raw: &str) -> WeftResult<PostgresVersion> {
     let number = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()) && (part == "0" || !part.starts_with('0'));
     let (major, minor) = raw.split_once('.').map_or((raw, None), |(major, minor)| (major, Some(minor)));
     if !number(major) || major == "0" || major.len() > 4 || minor.is_some_and(|minor| !number(minor)) {
-        mistake!("version '{raw}' is not a Postgres version; write its major version (17)");
+        weft::input_bail!("version '{raw}' is not a Postgres version; write its major version (17)");
     }
     match major.parse::<u32>() {
         Ok(major) => Ok(PostgresVersion { tag: raw.to_string(), major }),
-        Err(_) => mistake!("version '{raw}' is not a Postgres version; write its major version (17)"),
+        Err(_) => weft::input_bail!("version '{raw}' is not a Postgres version; write its major version (17)"),
     }
 }
 
@@ -627,7 +699,7 @@ pub fn postgres_version(raw: &str) -> WeftResult<PostgresVersion> {
 pub fn memory_mib(raw: &str) -> WeftResult<u64> {
     match weft::infra::memory_mib(raw) {
         Some(mib) => Ok(mib.floor() as u64),
-        None => mistake!("memory '{}' is not a size this node reads; write a number followed by Gi, Mi, G or M (1Gi)", raw.trim()),
+        None => weft::input_bail!("memory '{}' is not a size this node reads; write a number followed by Gi, Mi, G or M (1Gi)", raw.trim()),
     }
 }
 
@@ -643,7 +715,7 @@ impl Node for PostgresDatabaseNode {
         _ctx: InfraProvisionContext,
         input: ValueBag,
     ) -> WeftResult<InfraSpec> {
-        let database = database_name(&input.get::<String>("database")?)?;
+        let database = input.get::<String>("database")?;
         let storage: String = input.get("storage")?;
         let version = postgres_version(&input.get::<String>("version")?)?;
         // Whether anything outside this program may connect. The
@@ -653,10 +725,11 @@ impl Node for PostgresDatabaseNode {
         let reachable: bool = input.get("reachable")?;
         // The machine, as the node's settings size it; the cloud picks
         // its cheapest that holds it.
+        let machine = MachineShape::from_inputs(&input)?;
         let memory: String = input.get("memory")?;
-        let machine = MachineShape { cpu: input.opt("cpu")?, memory: Some(memory.clone()), kind: input.opt::<String>("machineType")?.filter(|t| !t.trim().is_empty()), gpu: None };
         let tuning = Tuning::for_machine(&memory)?;
         let extensions = extension_names(input.opt::<Vec<String>>("extensions")?.unwrap_or_default())?;
+        let roles = role_list(input.opt::<Vec<Role>>("roles")?.unwrap_or_default())?;
 
         let credential = Image::Local { name: "credential".into() };
         Ok(InfraSpec {
@@ -667,7 +740,7 @@ impl Node for PostgresDatabaseNode {
                 name: "db".into(),
                 init_containers: vec![Container::new("mint", credential.clone())
                     .with_args(vec!["mint".into()])
-                    .with_env(credential_env(&database, &extensions, &version))
+                    .with_env(credential_env(&database, &extensions, &roles, &version))
                     .with_mounts(vec![store_mount()])],
                 containers: vec![
                     Container::new("postgres", Image::Upstream {
@@ -728,7 +801,7 @@ impl Node for PostgresDatabaseNode {
                     // on this one, which knows why (`/health`).
                     Container::new("credential", credential)
                         .with_args(vec!["serve".into()])
-                        .with_env(credential_env(&database, &extensions, &version))
+                        .with_env(credential_env(&database, &extensions, &roles, &version))
                         .with_ports(vec![ContainerPort {
                             name: "http".into(),
                             port: CREDENTIAL_PORT,
@@ -740,7 +813,7 @@ impl Node for PostgresDatabaseNode {
                             Probe::http(HEALTH_PATH, CREDENTIAL_PORT).with_initial_delay(2),
                         ),
                     Container::new("pooler", Image::Local { name: "pooler".into() })
-                        .with_args(pooler_args(&database, &tuning))
+                        .with_args(pooler_args(&database, &tuning, &roles))
                         .with_env(pooler_env(&tuning))
                         .with_ports(vec![ContainerPort {
                             name: "sql".into(),
@@ -802,7 +875,7 @@ impl Node for PostgresDatabaseNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        let database = database_name(&ctx.inputs.get::<String>("database")?)?;
+        let database = ctx.inputs.get::<String>("database")?;
         // Three asks that need nothing from each other, so they go out
         // together.
         let (sql, credential, published) =

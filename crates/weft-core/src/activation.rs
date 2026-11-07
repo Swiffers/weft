@@ -111,7 +111,7 @@ impl ActivationScope {
             .map(|place| {
                 (
                     crate::project::address_of(project, &place.id, &place.path),
-                    crate::project::is_per_instance(project, &place.id),
+                    crate::project::is_per_instance(project, place),
                 )
             })
             .collect();
@@ -186,7 +186,7 @@ impl ActivationScope {
         }
         let mut left: Vec<String> = crate::project::trigger_places(project)
             .iter()
-            .filter(|place| crate::project::is_per_instance(project, &place.id))
+            .filter(|place| crate::project::is_per_instance(project, place))
             .map(|place| crate::project::address_of(project, &place.id, &place.path))
             .collect();
         left.sort();
@@ -255,6 +255,11 @@ pub struct ActivateResponse {
     /// on already: nothing to turn on, which is no error.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub turned_on: Vec<OwnerTriggers>,
+    /// The triggers on that it leaves behind the build it turned these on
+    /// with, by owner: they fire an older build or an older cut of the
+    /// program until `weft resync` brings them up to it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub behind: Vec<OwnerTriggers>,
     /// What those triggers held while they were down, and whether it is
     /// released (paced) or dropped.
     #[serde(default, skip_serializing_if = "Option::is_none")]

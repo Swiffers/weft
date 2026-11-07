@@ -27,9 +27,9 @@
 //! no new node and, once the nodes it runs have ended, is handed back
 //! whole for another worker to carry on from its record (a node still
 //! running `HAND_BACK_GRACE` later is stopped where it is, and the next
-//! worker fails it as cut short); one that cannot (unrecorded, tied to
-//! the caller on the line, or with a bus open) carries on as if nothing
-//! was asked, getting as far as it can before the platform stops the
+//! worker runs it again from its saved state, or fails it as cut short
+//! when it keeps none); one that cannot (unrecorded, or with its caller
+//! on the line) carries on as if nothing was asked, getting as far as it can before the platform stops the
 //! process, which ends it the way a crash would. The worker writes what
 //! is left of their records as each one ends. On a
 //! platform that stops a worker no call holds open, a run that outlives
@@ -46,6 +46,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use weft_core::cancellation::CancellationFlag;
+use weft_core::content_cache::LoadFailed;
 use weft_core::door_fire::RunAnswer;
 use weft_core::caller::{InboundMessage, OutboundChunk};
 use weft_core::{RunId, NodeCatalog};
@@ -153,7 +154,8 @@ struct Worker {
     /// drives has to leave (see the module doc), and no run is born here.
     stopping: tokio_util::sync::CancellationToken,
     /// Fired [`HAND_BACK_GRACE`] after [`Self::stopping`]: the nodes still
-    /// running are stopped where they are and their runs handed back.
+    /// running are stopped where they are and their runs handed back. Each
+    /// run's own overdue token is a child of it ([`Self::hand_back`]).
     stopping_overdue: tokio_util::sync::CancellationToken,
     run_cap: Option<std::time::Duration>,
     /// See [`WorkerConfig::resume_when_caller_leaves`].
@@ -306,13 +308,21 @@ impl Worker {
         CutLook::Stopped
     }
 
-    /// Claim queued run `run_id` and carry it on to its end, on a
-    /// task of its own so whoever handed it here can go away without
-    /// stopping it (a run stops itself before the platform's cap, see
-    /// `RUN_CAP_MARGIN`). `None` once this worker is stopping: a run
-    /// claimed then would only be handed back, and weft hands it to another
-    /// worker instead.
-    async fn carry_on_run(&self, run_id: RunId) -> Result<Option<RunAnswer>> {
+    /// Claim queued run `run_id`, which runs the program `definition_hash`
+    /// names, and carry it on to its end, on a task of its own so whoever
+    /// handed it here can go away without stopping it (a run stops itself
+    /// before the platform's cap, see `RUN_CAP_MARGIN`). `None` once this
+    /// worker is stopping: a run claimed then would only be handed back,
+    /// and weft hands it to another worker instead.
+    ///
+    /// The program, and every file it names, is read before the claim: a
+    /// read that failed (the store or the broker did not answer) claims
+    /// nothing and answers [`RunAnswer::NotNow`], as does a claim the
+    /// broker could not be asked for, and weft hands the run out again
+    /// later. A program or file that is gone for good
+    /// (`crate::contents::Gone`) is claimed and ended with it, since no
+    /// later read gets past it.
+    async fn carry_on_run(&self, run_id: RunId, definition_hash: &str) -> Result<Option<RunAnswer>> {
         // Registered before the claim: a cancel announced once the claim
         // committed finds the run here.
         let registered = tokio::select! {
@@ -325,46 +335,77 @@ impl Worker {
         if self.stopping.is_cancelled() {
             return Ok(None);
         }
+        let program = match self.program_of(definition_hash).await {
+            Err(e) if e.downcast_ref::<crate::contents::Gone>().is_none() => {
+                tracing::warn!(target: "weft_engine::worker", %run_id, error = %e, "could not read what the run runs; it stays queued");
+                return Ok(Some(RunAnswer::NotNow { error: e.to_string() }));
+            }
+            read => read.map_err(anyhow::Error::new),
+        };
         // The claim makes the run this worker's on record, which its lease
         // keeps: the registration woke the door's tick, and the claim does
         // not wait for it.
-        let Some(claimed) = self.clients.runs.claim(run_id).await.context("claim the run")? else {
-            return Ok(Some(RunAnswer::NothingToRun));
+        let claimed = match self.clients.runs.claim(run_id).await {
+            Ok(Some(claimed)) => claimed,
+            Ok(None) => return Ok(Some(RunAnswer::NothingToRun)),
+            Err(e) if weft_broker_client::client::broker_unavailable(&e) => {
+                return Ok(Some(RunAnswer::NotNow { error: format!("the broker could not be asked to claim the run: {e:#}") }));
+            }
+            Err(e) => return Err(e.context("claim the run")),
         };
         if let Some(cause) = claimed.cancel_requested.clone() {
             registered.flag.cancel_because(cause);
         }
         let worker = self.clone();
         let token = self.background.token();
+        let program = program.and_then(|program| match claimed.definition_hash == definition_hash {
+            true => Ok(program),
+            false => Err(anyhow::anyhow!(
+                "run {run_id} was handed here to run program {definition_hash}, but its claim says it runs {}",
+                claimed.definition_hash
+            )),
+        });
         let drive = tokio::spawn(async move {
             let _token = token;
-            answer_of(worker.carry_on(run_id, claimed, registered).await)
+            answer_of(worker.carry_on(run_id, claimed, program, registered).await)
         });
         drive.await.map(Some).context("the drive panicked outside its guard")
     }
 
-    /// Carry on a run this worker just claimed, from its record, read a
+    /// The program whose definition hash is `definition_hash`, as a run
+    /// runs it: fetched unless kept, with every file it names put back
+    /// (`crate::plan::Plans::program`).
+    async fn program_of(&self, definition_hash: &str) -> Result<Arc<ProgramTables>, LoadFailed> {
+        let project = self.plans.project(&self.clients, definition_hash).await?;
+        self.plans.program(&self.clients, &project, definition_hash).await
+    }
+
+    /// Carry on a run this worker just claimed, which runs `program` (read
+    /// before the claim, [`Self::carry_on_run`]), from its record, read a
     /// page at a time.
     async fn carry_on(
         &self,
         run_id: RunId,
         claimed: weft_journal::record::Claimed,
+        program: Result<Arc<ProgramTables>>,
         registered: Registered,
     ) -> Result<()> {
         let record = &**self.clients.writer.record();
-        let project = self.plans.project(&self.clients, &claimed.definition_hash).await;
-        // A record this worker cannot read, a program it cannot fetch, or a
-        // stand-in it cannot serve still ends the run: it is this worker's
-        // now.
-        let keep_for = project.as_ref().map_or(weft_core::run_settings::KeepFor::WEFT_DEFAULT, |project| project.defaults.keep_for());
-        // A program that cannot be fetched is why the record cannot be read.
-        let read = match project {
-            Ok(project) => {
-                let program = self.plans.program(&project, &claimed.definition_hash);
-                crate::run_driver::ClaimedRecord::read(|run, after| weft_journal::decoded_page(record, run, after), &*self.clients.project, run_id, program.project.clone())
-                    .await
-                    .map(|read| (program, read))
-            }
+        // A record this worker cannot read, a program or a file it names
+        // that is gone, or a stand-in it cannot serve still ends the run:
+        // it is this worker's now.
+        let keep_for = program.as_ref().map_or(weft_core::run_settings::KeepFor::WEFT_DEFAULT, |program| program.project.defaults.keep_for());
+        // A program that is gone is why the record cannot be read.
+        let read = match program {
+            Ok(program) => crate::run_driver::ClaimedRecord::read(
+                |run, after| weft_journal::decoded_page(record, run, after),
+                &*self.clients.project,
+                run_id,
+                program.project.clone(),
+                claimed.lost_full,
+            )
+            .await
+            .map(|read| (program, read)),
             Err(e) => Err(e),
         };
         let (settings, next_seq, read) = match read {
@@ -435,7 +476,7 @@ impl Worker {
         // by the next worker, and carries on here if it cannot, until the
         // process goes (the driver decides both). The ask ends with the
         // drive.
-        let hand_back = crate::run_driver::HandBack { asked: self.stopping.child_token(), overdue: self.stopping_overdue.clone() };
+        let hand_back = self.hand_back();
         let _asked_ends = hand_back.asked.clone().drop_guard();
         // On a platform that stops a worker no call holds open, a run has to
         // leave this worker once its caller is gone (hung up, or answered):
@@ -465,7 +506,7 @@ impl Worker {
             &self.replica,
             &self.tenant_id,
         );
-        let outcome = self.while_driving(run, run_id, &cancellation, caller.is_some(), leaves_with, &hand_back).await;
+        let outcome = self.while_driving(run, run_id, &cancellation, caller, leaves_with, &hand_back).await;
         // The run's own work is over: its place at the door (its entry's
         // runs at once, its run permit) is free once the slot goes, and a
         // failure is counted for `weft status`.
@@ -490,6 +531,14 @@ impl Worker {
             }
         }
         outcome.map(|_| ())
+    }
+
+    /// One run's hand-back: asked when the worker is told to stop and
+    /// overdue when the worker's stop is, either also on its own when the
+    /// run alone has to leave (its caller left, or the platform's cap on
+    /// its connection came, see [`Self::while_driving`]).
+    fn hand_back(&self) -> crate::run_driver::HandBack {
+        crate::run_driver::HandBack { asked: self.stopping.child_token(), overdue: self.stopping_overdue.child_token() }
     }
 
     /// Let go of a run whose record is written (whole, or for a durable
@@ -575,12 +624,29 @@ impl Worker {
     /// leaving (`leaves_with`), which asks the run to let go of this
     /// worker. The cap's timer is only set once the run outlives the poll
     /// that started it, and never on a platform without a cap.
+    ///
+    /// A run whose caller (`live`) is still on the line when the cap comes
+    /// and whose route outlives its caller keeps going without it, with
+    /// the window a worker being stopped gives: its hand-back is asked
+    /// (it starts no new node, and the ones running go on to their end),
+    /// and the caller stops keeping it on this worker
+    /// (`LiveCallerConnection::letting_go`), so it can hand itself back.
+    /// It is overdue [`HAND_BACK_GRACE`] later if it has not
+    /// ([`overdue_after_grace`]): the nodes still running stop where they
+    /// are, and a fresh worker runs each of them again from its saved
+    /// state. The caller's connection stays open through the window (it is
+    /// the request keeping this worker up) and is let go, told to
+    /// reconnect, when the window ends or the run hands itself back,
+    /// whichever comes first. A run that ends within the window ends its
+    /// exchange the way any run does. Such a run is always recorded (the
+    /// compiler refuses `outlivesCaller` without it), so it can always be
+    /// handed back. Every other run ends at the cap.
     async fn while_driving(
         &self,
         run: impl std::future::Future<Output = Result<RunOutcome>>,
         run_id: RunId,
         cancellation: &CancellationFlag,
-        live: bool,
+        live: Option<Arc<crate::caller_conn::LiveCallerConnection>>,
         leaves_with: Option<Arc<crate::caller_conn::LiveCallerConnection>>,
         hand_back: &crate::run_driver::HandBack,
     ) -> Result<RunOutcome> {
@@ -601,13 +667,51 @@ impl Worker {
         };
         tokio::pin!(caller_left);
         let (mut cap_fired, mut left) = (false, false);
+        // The window a caller being let go at the cap keeps the line open
+        // through (its clock starts on its first poll, once the cap came),
+        // and that caller.
+        let window = overdue_after_grace(&hand_back.overdue);
+        tokio::pin!(window);
+        let mut window_open = false;
+        let mut leaving: Option<&Arc<crate::caller_conn::LiveCallerConnection>> = None;
         loop {
             tokio::select! {
                 biased;
+                // A run that hands itself back (or pauses) within the window
+                // lets its caller go as it ends its exchange
+                // (`LiveCallerConnection::run_carries_on`).
                 outcome = &mut run => return outcome,
+                () = &mut window, if window_open => {
+                    window_open = false;
+                    if let Some(conn) = leaving {
+                        conn.let_go().await;
+                    }
+                }
                 () = &mut capped, if !cap_fired => {
                     cap_fired = true;
-                    Limit::RunCap { cap: cap.expect("armed only with a cap"), live }.end(cancellation, run_id);
+                    let cap = cap.expect("armed only with a cap");
+                    match live.as_ref().filter(|conn| weft_core::caller::CallerConnection::config(conn.as_ref()).outlives_caller) {
+                        Some(conn) => {
+                            tracing::info!(target: "weft_engine::worker", %run_id, ?cap, "the caller reached the platform's limit on one connection; the run outlives it, so its running nodes get the hand-back's window to end before it carries on in a fresh worker");
+                            let why = format!(
+                                "this connection ended {} before the {} minute limit this platform puts on one connection; \
+                                 run {run_id} goes on without it (its route outlives its caller), so reconnect to talk to the \
+                                 program again",
+                                seconds(RUN_CAP_MARGIN),
+                                cap.as_secs() / 60,
+                            );
+                            // A caller that already hung up is told nothing:
+                            // nobody is left to tell. The run still gets the
+                            // window to hand itself back.
+                            if weft_core::caller::CallerConnection::is_connected(conn.as_ref()) {
+                                conn.letting_go(why);
+                                leaving = Some(conn);
+                            }
+                            hand_back.asked.cancel();
+                            window_open = true;
+                        }
+                        None => Limit::RunCap { cap, live: live.is_some() }.end(cancellation, run_id),
+                    }
                 }
                 () = &mut caller_left, if !left => {
                     left = true;
@@ -1011,8 +1115,8 @@ impl Limit {
                 "run {run_id} stopped {} before the {} minute limit this platform puts on the line \
                  between its worker and weft, counted from when that line opened, not from the run's start: every \
                  run on the worker only waited, and a worker whose runs only wait opens no new line, which would \
-                 wake the database. A run that can pause (recorded, not tied to its caller, no bus open) lets go of \
-                 its worker while it waits, and may wait as long as it needs",
+                 wake the database. A run that can pause (recorded, its caller gone) lets go of its worker while \
+                 it waits, and may wait as long as it needs",
                 seconds(left),
                 cut.as_secs() / 60,
             ),
@@ -1080,7 +1184,7 @@ fn new_worker(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config: &Wo
         replica: config.replica.clone(),
         tenant_id: config.tenant_id.clone(),
         cancels,
-        plans: Arc::new(crate::plan::Plans::new(config.project_id, left_out)),
+        plans: Arc::new(crate::plan::Plans::new(config.project_id, config.tenant_id.clone(), left_out)),
         background: weft_core::in_flight::InFlight::new("worker run"),
         stopping,
         stopping_overdue: tokio_util::sync::CancellationToken::new(),
@@ -1135,14 +1239,19 @@ async fn healthz(State(state): State<ServerState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({ "driving": state.worker.cancels.count() }))
 }
 
-async fn run_handler(State(state): State<ServerState>, headers: HeaderMap, Path(run_id): Path<String>) -> Response {
+// SYNC: the run call <-> weft_core::door_fire::RunDelivery, crates/weft-dispatcher/src/delivery.rs (run_on_worker)
+async fn run_handler(State(state): State<ServerState>, headers: HeaderMap, Path(run_id): Path<String>, body: axum::body::Bytes) -> Response {
     if !state.weft_credential.admits_headers(&headers) {
         return (StatusCode::UNAUTHORIZED, "this worker answers the install only").into_response();
     }
     let Ok(run_id) = run_id.parse::<RunId>() else {
         return (StatusCode::BAD_REQUEST, "not a run id").into_response();
     };
-    match state.worker.carry_on_run(run_id).await {
+    let delivery: weft_core::door_fire::RunDelivery = match serde_json::from_slice(&body) {
+        Ok(delivery) => delivery,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("not a run delivery: {e}")).into_response(),
+    };
+    match state.worker.carry_on_run(run_id, &delivery.definition_hash).await {
         Ok(Some(answer)) => Json(answer).into_response(),
         Ok(None) => (StatusCode::SERVICE_UNAVAILABLE, "this worker is stopping").into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
@@ -1161,6 +1270,7 @@ pub async fn serve(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config
     let listener = crate::listen::bind(config.port).await?;
     let budget = crate::busy::Budget::of_cgroup();
     tracing::info!(target: "weft_engine::worker", ?budget, "this worker's memory budget");
+    let memory = Arc::new(crate::busy::MemoryGuard::default());
     let door = crate::door::Door::new(
         config.project_id,
         config.tenant_id.clone(),
@@ -1169,6 +1279,7 @@ pub async fn serve(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config
         config.edge,
         config.secret.clone(),
         crate::door::RunPermits::from_env(budget)?,
+        memory.clone(),
     );
     // The line is held open while runs are driven (the line watch) and
     // while records wait to be written (the writer's own calls); idle, it
@@ -1200,7 +1311,13 @@ pub async fn serve(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config
         canceller: Arc::new(RegistryCanceller { cancels: worker.cancels.clone() }),
         starter: Arc::new(LiveStarter { worker: worker.clone() }),
     }));
-    let app = app.layer(axum::middleware::from_fn_with_state(crate::busy::MemoryGuard::start(budget), crate::busy::refuse_when_busy));
+    // Each crossing of the line, either way, tells the broker the worker's
+    // memory note at once; every door tick carries it too.
+    let told = crate::busy::MemoryTold::new(worker.clients.door_broker.clone(), worker.clients.io.clone(), &memory);
+    memory.start(budget, move |_| {
+        told.tell();
+    });
+    let app = app.layer(axum::middleware::from_fn_with_state(memory, crate::busy::refuse_when_busy));
     // Told to stop, or nearing the cut of its line while its runs only
     // wait, the worker hands its recorded runs back and takes no new call,
     // while the calls it holds go on to their end. While it works, its line
@@ -1269,13 +1386,14 @@ enum CutLook {
     RecordsPending,
 }
 
-/// Once [`Worker::stopping`] fired, which takes no new run and hands back
-/// every run that can be suspended once its running nodes end: fire
-/// [`Worker::stopping_overdue`] [`HAND_BACK_GRACE`] later, which stops
-/// the nodes still running.
-async fn overdue_after_grace(worker: &Worker) {
+/// Once a hand-back was asked (a run starts no new node, and is handed
+/// back once its running nodes end): fire `overdue` [`HAND_BACK_GRACE`]
+/// later, which stops the nodes still running. For the worker's stop,
+/// [`Worker::stopping_overdue`] (every run's); at the platform's limit on
+/// one connection, that run's own ([`Worker::while_driving`]).
+async fn overdue_after_grace(overdue: &tokio_util::sync::CancellationToken) {
     tokio::time::sleep(HAND_BACK_GRACE).await;
-    worker.stopping_overdue.cancel();
+    overdue.cancel();
 }
 
 /// Stop the worker once the platform says to. A run that cannot be
@@ -1286,7 +1404,7 @@ fn stop_on_signal(worker: &Worker) {
         shutdown_signal().await;
         tracing::info!(target: "weft_engine::worker", "told to stop: every run that can be suspended is handed back once its running nodes end; the others carry on until the process goes");
         worker.stopping.cancel();
-        overdue_after_grace(&worker).await;
+        overdue_after_grace(&worker.stopping_overdue).await;
     });
 }
 
@@ -1351,7 +1469,7 @@ fn keep_ahead_of_line_cut(worker: &Worker) {
                 let looked = margin_reached.then(|| worker.stopped_for_cut(told));
                 if looked == Some(CutLook::Stopped) {
                     tracing::info!(target: "weft_engine::worker", line_cut_secs = told.max_age.as_secs(), "every run only waits and weft cuts this worker's line soon, on which they hear their answers: the ones that can pause are handed back, the others end, and the next request starts a fresh worker");
-                    overdue_after_grace(&worker).await;
+                    overdue_after_grace(&worker.stopping_overdue).await;
                     return;
                 }
                 // `written` answers at once if the records went out since
@@ -1545,8 +1663,12 @@ impl Worker {
             }
             // The program cannot run this way (a run it would start needs
             // an instance the call did not name): a refusal of the run, the
-            // same status the install's own run refusals answer with.
-            Turned::Unready(Unready::Refused(why)) => failed(StatusCode::UNPROCESSABLE_ENTITY, why),
+            // same status the install's own run refusals answer with,
+            // counted as dropped where `weft status` reads it, like a fire.
+            Turned::Unready(Unready::Refused(why)) => {
+                self.door.dropped(&admitted.trigger.token, &why);
+                failed(StatusCode::UNPROCESSABLE_ENTITY, why)
+            }
             Turned::Unready(Unready::Waits(RunGate::InfraDown(missing))) => {
                 // The fix is the operator's (logged); the caller is told
                 // what is true for them.
@@ -1565,14 +1687,29 @@ impl Worker {
     }
 
     /// A trigger's event at this worker's door ([`weft_core::door_fire::DoorFire`]):
-    /// its front (the trigger as held, its holder, its program, its
-    /// standing, its limits), then [`Self::admit`], and the drive of the run
-    /// it started. A fire that cannot become a run now is put in its
-    /// trigger's queue for later, which this answers rather than holding
-    /// the fire. A refusal read off the held triggers is confirmed against
-    /// the broker's answer now: a trigger armed or taken over a moment ago
-    /// may not have been heard yet.
+    /// [`Self::take_event`], and a fire it dropped counted at the door
+    /// with its reason. A drop is acknowledged (nothing tries a refusal
+    /// again), so the count is what `weft status` shows of it.
     async fn admit_event(
+        &self,
+        fire: weft_core::door_fire::DoorFire,
+    ) -> Result<(weft_core::door_fire::Fired, Option<tokio::task::JoinHandle<RunAnswer>>), Response> {
+        let token = fire.token.clone();
+        let taken = self.take_event(fire).await;
+        if let Ok((weft_core::door_fire::Fired::Dropped { reason }, _)) = &taken {
+            self.door.dropped(&token, reason);
+        }
+        taken
+    }
+
+    /// A trigger's event: its front (the trigger as held, its holder, its
+    /// program, its standing, its limits), then [`Self::admit`], and the
+    /// drive of the run it started. A fire that cannot become a run now is
+    /// put in its trigger's queue for later, which this answers rather
+    /// than holding the fire. A refusal read off the held triggers is
+    /// confirmed against the broker's answer now: a trigger armed or taken
+    /// over a moment ago may not have been heard yet.
+    async fn take_event(
         &self,
         fire: weft_core::door_fire::DoorFire,
     ) -> Result<(weft_core::door_fire::Fired, Option<tokio::task::JoinHandle<RunAnswer>>), Response> {
@@ -1845,7 +1982,16 @@ mod tests {
     }
 
     fn worker_with(clients: EngineClients) -> Worker {
-        let config = config();
+        worker_running(Arc::new(NoCatalog), clients)
+    }
+
+    /// A worker running `catalog`'s nodes over `clients`.
+    fn worker_running(catalog: Arc<dyn NodeCatalog>, clients: EngineClients) -> Worker {
+        worker_configured(catalog, clients, &config())
+    }
+
+    /// A worker as `config` says, running `catalog`'s nodes over `clients`.
+    fn worker_configured(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config: &WorkerConfig) -> Worker {
         let door = crate::door::Door::new(
             config.project_id,
             config.tenant_id.clone(),
@@ -1854,8 +2000,9 @@ mod tests {
             crate::door::Edge::default(),
             config.secret.clone(),
             crate::door::RunPermits::new(64, std::time::Duration::from_secs(30)),
+            Arc::default(),
         );
-        new_worker(Arc::new(NoCatalog), clients, &config, door)
+        new_worker(catalog, clients, config, door)
     }
 
     fn worker_over(runs: Arc<Runs>, line: Arc<crate::context::TestLine>) -> Worker {
@@ -1927,6 +2074,24 @@ mod tests {
         assert!(matches!(fired(&worker, a_fire("t1")).await, weft_core::door_fire::Fired::Dropped { .. }));
         assert!(matches!(fired(&worker, a_fire("gone")).await, weft_core::door_fire::Fired::Dropped { .. }));
         assert!(broker.parked.lock().unwrap().is_empty());
+    }
+
+    /// A dropped fire is acknowledged, and counted at the door with its
+    /// reason: the next tick states it, where `weft status` reads it.
+    #[tokio::test]
+    async fn a_dropped_fire_is_counted_with_its_reason_on_the_next_tick() {
+        let (worker, broker) = worker_firing(|_, trigger| {
+            entry(trigger).standing.status = weft_core::projects::ProjectStatus::Inactive;
+            entry(trigger).standing.accepting_fires = false;
+        });
+        let weft_core::door_fire::Fired::Dropped { reason } = fired(&worker, a_fire("t1")).await else { panic!("dropped") };
+        worker.door.tick(None, false).await.unwrap();
+        let ticks = broker.ticks.lock().unwrap();
+        let counts = &ticks.last().expect("a tick").counts;
+        let dropped: Vec<_> = counts.iter().filter(|count| count.key == "dropped:t1").collect();
+        assert_eq!(dropped.len(), 1, "{counts:?}");
+        assert_eq!((dropped[0].hits, dropped[0].reason.as_deref()), (1, Some(reason.as_str())));
+        assert!(counts.iter().filter(|count| count.key != "dropped:t1").all(|count| count.reason.is_none()), "{counts:?}");
     }
 
     /// A fire for a trigger armed on another version of the program waits
@@ -2405,9 +2570,463 @@ mod tests {
 
     #[tokio::test]
     async fn a_call_for_a_run_that_is_not_queued_says_so() {
-        let worker = worker_over(Arc::new(Runs::default()), crate::context::TestLine::new());
+        let (worker, _storage) = worker_carrying(Arc::new(Runs::default()), [("def-1", (*crate::plan::tests::chain()).clone())]);
         let run_id = weft_core::new_run_id();
-        assert_eq!(worker.carry_on_run(run_id).await.unwrap(), Some(RunAnswer::NothingToRun));
+        assert_eq!(worker.carry_on_run(run_id, "def-1").await.unwrap(), Some(RunAnswer::NothingToRun));
         assert!(!worker.cancels.contains(run_id), "nothing claimed, nothing registered");
+    }
+
+    /// The broker's side of queued runs this worker carries on: every claim
+    /// counted and given, for the program the call named, unless the
+    /// broker answers the status in `refused`.
+    #[derive(Default)]
+    struct Claims {
+        claimed: std::sync::Mutex<Vec<RunId>>,
+        definition_hash: std::sync::Mutex<String>,
+        refused: std::sync::Mutex<Option<reqwest::StatusCode>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::context::RunClient for Claims {
+        async fn claim(&self, run_id: RunId) -> anyhow::Result<Option<weft_journal::record::Claimed>> {
+            if let Some(status) = *self.refused.lock().unwrap() {
+                return Err(weft_broker_client::BrokerRefused { path: "/v1/run/claim".into(), status, body: String::new() }.into());
+            }
+            self.claimed.lock().unwrap().push(run_id);
+            Ok(Some(weft_journal::record::Claimed {
+                epoch: 2,
+                attempts: 1,
+                definition_hash: self.definition_hash.lock().unwrap().clone(),
+                cancel_requested: None,
+                lost_full: None,
+            }))
+        }
+        async fn let_go(&self, _run_id: RunId, _why: weft_broker_client::protocol::LetGo) -> anyhow::Result<()> {
+            unreachable!("no run here is let go of")
+        }
+        async fn answers(&self, _run_id: RunId, _taken: &[String]) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>> {
+            Ok(Vec::new())
+        }
+        async fn rechecked(&self) -> anyhow::Result<weft_broker_client::protocol::RunRecheckedResponse> {
+            Ok(weft_broker_client::protocol::RunRecheckedResponse { cancels: Vec::new(), answers: Vec::new() })
+        }
+    }
+
+    /// The project's history of programs, by definition hash.
+    struct Programs(std::collections::HashMap<String, weft_core::ProjectDefinition>);
+
+    #[async_trait::async_trait]
+    impl crate::context::ProjectClient for Programs {
+        async fn fetch_definition(&self, _project_id: uuid::Uuid, expected_hash: &str) -> anyhow::Result<Option<weft_core::ProjectDefinition>> {
+            Ok(self.0.get(expected_hash).cloned())
+        }
+    }
+
+    /// A worker of tenant `t1` (whose contents the fake storage it reads
+    /// through holds) claiming through `runs`, its project's history
+    /// holding `programs`.
+    fn worker_carrying<const N: usize>(
+        runs: Arc<dyn crate::context::RunClient>,
+        programs: [(&str, weft_core::ProjectDefinition); N],
+    ) -> (Worker, Arc<crate::storage::FakeWorkerStorage>) {
+        let storage = crate::storage::FakeWorkerStorage::new();
+        let mut clients = clients(Arc::new(MemJournal::default()));
+        clients.runs = runs;
+        clients.storage = storage.clone();
+        clients.project = Arc::new(Programs(programs.into_iter().map(|(hash, program)| (hash.to_string(), program)).collect()));
+        let config = WorkerConfig { tenant_id: "t1".into(), ..config() };
+        (worker_configured(Arc::new(NoCatalog), clients, &config), storage)
+    }
+
+    /// The chain program, its second node reading the file `path` holding
+    /// `text`.
+    fn reading_file(path: &str, text: &str) -> weft_core::ProjectDefinition {
+        let string = weft_core::weft_type::WeftType::Primitive(weft_core::WeftPrimitive::String);
+        let (file, _) = weft_core::content::ContentRef::of_text(text, &string, path).unwrap();
+        let mut program = (*crate::plan::tests::chain()).clone();
+        program.nodes[1].port_literals.insert("query".into(), file.to_value());
+        program
+    }
+
+    /// A run handed here whose program names a file the store cannot be
+    /// asked for now is not claimed: the worker answers that it could not
+    /// read it, and the run stays queued for weft to hand out again. Once
+    /// the store answers, the next hand-off claims it.
+    #[tokio::test]
+    async fn a_run_whose_program_cannot_be_read_now_stays_queued() {
+        let claims = Arc::new(Claims::default());
+        *claims.definition_hash.lock().unwrap() = "def-1".into();
+        let (worker, storage) = worker_carrying(claims.clone(), [("def-1", reading_file("sql/q.sql", "SELECT 1;"))]);
+        storage.hold_content(b"SELECT 1;");
+        storage.contents_down(true);
+        let run_id = weft_core::new_run_id();
+        let Some(RunAnswer::NotNow { error }) = worker.carry_on_run(run_id, "def-1").await.unwrap() else {
+            panic!("a store that does not answer leaves the run queued")
+        };
+        assert!(error.contains("reads 'sql/q.sql' (String)") && !error.contains("weft resync"), "{error}");
+        assert!(claims.claimed.lock().unwrap().is_empty(), "nothing claimed");
+        assert!(!worker.cancels.contains(run_id), "nothing registered");
+
+        storage.contents_down(false);
+        let answer = worker.carry_on_run(run_id, "def-1").await.unwrap();
+        assert_eq!(*claims.claimed.lock().unwrap(), [run_id], "the store answers again: claimed, {answer:?}");
+    }
+
+    /// A claim the broker could not answer now (its 503) leaves the run
+    /// queued for a later try, like a read that failed; any other refusal
+    /// of the claim is the worker's answer.
+    #[tokio::test]
+    async fn a_claim_the_broker_cannot_answer_now_leaves_the_run_queued() {
+        let claims = Arc::new(Claims::default());
+        let (worker, _storage) = worker_carrying(claims.clone(), [("def-1", (*crate::plan::tests::chain()).clone())]);
+        let run_id = weft_core::new_run_id();
+        *claims.refused.lock().unwrap() = Some(reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let Some(RunAnswer::NotNow { error }) = worker.carry_on_run(run_id, "def-1").await.unwrap() else {
+            panic!("a broker that cannot answer now leaves the run queued")
+        };
+        assert!(error.contains("could not be asked to claim the run"), "{error}");
+        *claims.refused.lock().unwrap() = Some(reqwest::StatusCode::BAD_REQUEST);
+        assert!(worker.carry_on_run(run_id, "def-1").await.is_err(), "a refusal is the worker's answer");
+    }
+
+    /// A run whose program names a file the store no longer holds, or
+    /// whose program the install never recorded, is claimed and ends
+    /// failed with why: no later read gets past it.
+    #[tokio::test]
+    async fn a_run_whose_program_is_gone_is_claimed_and_ends() {
+        let claims = Arc::new(Claims::default());
+        let (worker, _storage) = worker_carrying(claims.clone(), [("def-1", reading_file("sql/gone.sql", "SELECT 2;"))]);
+        for (hash, says) in [("def-1", "weft resync"), ("def-2", "never recorded")] {
+            *claims.definition_hash.lock().unwrap() = hash.into();
+            let run_id = weft_core::new_run_id();
+            let Some(RunAnswer::Failed { error }) = worker.carry_on_run(run_id, hash).await.unwrap() else {
+                panic!("a program that is gone ends the run")
+            };
+            assert!(error.contains(says), "{error}");
+            assert_eq!(claims.claimed.lock().unwrap().last(), Some(&run_id));
+        }
+    }
+
+    /// The metadata of a node written here, which has no metadata.json.
+    fn bare_metadata(node_type: &str) -> weft_core::node::NodeMetadata {
+        serde_json::from_value(serde_json::json!({ "type": node_type, "label": node_type, "description": "" })).expect("metadata")
+    }
+
+    /// Panics as it runs.
+    struct Boom;
+    impl weft_core::NodeManifest for Boom {
+        fn manifest(&self) -> &'static weft_core::node::NodeMetadata {
+            static M: std::sync::OnceLock<weft_core::node::NodeMetadata> = std::sync::OnceLock::new();
+            M.get_or_init(|| bare_metadata("Boom"))
+        }
+    }
+    #[async_trait::async_trait]
+    impl weft_core::Node for Boom {
+        async fn run(&self, _ctx: weft_core::RunContext) -> weft_core::error::WeftResult<()> {
+            panic!("the node broke");
+        }
+    }
+
+    /// Sends `value` on, writing down that it ran under the name it was
+    /// given.
+    struct Sends {
+        name: &'static str,
+        ran: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+    impl weft_core::NodeManifest for Sends {
+        fn manifest(&self) -> &'static weft_core::node::NodeMetadata {
+            static M: std::sync::OnceLock<weft_core::node::NodeMetadata> = std::sync::OnceLock::new();
+            M.get_or_init(|| bare_metadata("Sends"))
+        }
+    }
+    #[async_trait::async_trait]
+    impl weft_core::Node for Sends {
+        async fn run(&self, ctx: weft_core::RunContext) -> weft_core::error::WeftResult<()> {
+            self.ran.lock().unwrap().push(self.name);
+            ctx.pulse_downstream(weft_core::node::NodeOutput::new().set("value", serde_json::json!("ok"))).await
+        }
+    }
+
+    /// `first -> after`, `first` of `first_type`.
+    fn two_steps(first_type: &str) -> weft_core::ProjectDefinition {
+        let node = |id: &str, node_type: &str, input: bool| serde_json::json!({
+            "id": id, "nodeType": node_type, "position": { "x": 0, "y": 0 },
+            "inputs": if input { serde_json::json!([{ "name": "value", "portType": "String", "required": true }]) } else { serde_json::json!([]) },
+            "outputs": [{ "name": "value", "portType": "String", "required": false }]
+        });
+        serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4(),
+            "nodes": [node("first", first_type, false), node("after", "After", true)],
+            "edges": [{ "id": "e", "source": "first", "sourceHandle": "value", "target": "after", "targetHandle": "value" }]
+        }))
+        .expect("two steps")
+    }
+
+    /// Drive one run of `project` on `worker`, born now with `settings`
+    /// and holding `slot`, the way the worker drives a run its door bore.
+    /// Answers its id once its record is written.
+    async fn drive_here(
+        worker: &Worker,
+        project: weft_core::ProjectDefinition,
+        settings: weft_core::run_settings::RunSettings,
+        slot: Option<crate::door::Slot>,
+    ) -> RunId {
+        use crate::run_driver::engine_test_rig::{claimed, handle};
+        let run_id = weft_core::new_run_id();
+        let birth = vec![
+            RunEvent::RunStarted { given: Default::default(),
+                run_id, project_id: project.id, entry_node: "first".into(),
+                phase: weft_core::context::Phase::Fire,
+                definition_hash: Some(weft_core::project::hash::compute_definition_hash(&project).unwrap()),
+                cut_from: None, binary_hash: None, source_version: None, run_kind: weft_core::run::RunKind::Project,
+                seed: None, instance: None, fired_trigger: None, stand_in: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+                settings,
+            },
+            RunEvent::NodeKicked { run_id, node_id: "first".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0 },
+        ];
+        // Born the way the worker's door bears a run: its birth handed
+        // under this worker's own name.
+        let journal = handle(&worker.clients, run_id, &birth, 0, Vec::new());
+        weft_journal::JournalClient::record_events(journal.as_ref(), &birth, Some(&worker.replica)).await.expect("a birth is handed");
+        let project = Arc::new(project);
+        let read = claimed(&worker.clients, run_id, &project, &birth).await;
+        let registered = worker.cancels.claim(run_id).expect("a fresh run");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            worker.drive(RunStart {
+                run_id,
+                journal,
+                program: Arc::new(ProgramTables::new(project)),
+                starts_from: StartsFrom::Record(Box::new(read)),
+                exchange: None,
+                registered,
+                slot,
+            }),
+        )
+        .await
+        .expect("the drive ends")
+        .expect("the drive runs");
+        worker.clients.writer.written().await;
+        run_id
+    }
+
+    /// A node that panics fails its run and leaves nothing of the run on
+    /// its worker: no cancel registered, no hold, no record waiting to
+    /// be written, so the worker has nothing under way and may retire.
+    /// The same worker then takes the next run and carries it through.
+    #[tokio::test]
+    async fn a_panicking_node_fails_its_run_and_leaves_the_worker_free() {
+        let ran = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let catalog = crate::run_driver::engine_test_rig::catalog(vec![
+            ("Boom", Box::new(Boom)),
+            ("Sends", Box::new(Sends { name: "first", ran: ran.clone() })),
+            ("After", Box::new(Sends { name: "after", ran: ran.clone() })),
+        ]);
+        let journal = Arc::new(MemJournal::default());
+        let worker = worker_running(catalog, clients(journal.clone()));
+
+        let broke = drive_here(&worker, two_steps("Boom"), Default::default(), None).await;
+        let record = journal.events_of(broke);
+        assert!(
+            record.iter().any(|e| matches!(e, RunEvent::RunFailed { error, .. } if error.contains("panicked"))),
+            "the run fails on the panic: {record:?}"
+        );
+        assert!(ran.lock().unwrap().is_empty(), "nothing behind the panicking node ran: {:?}", ran.lock().unwrap());
+        assert_eq!(worker.cancels.count(), 0, "the panicking run's cancel is gone");
+        assert!(worker.holds.held_still().is_empty(), "nothing of it is held");
+        assert_eq!(worker.under_way(60), crate::door::UnderWay::Nothing, "the worker has nothing under way, so it may retire");
+
+        let fine = drive_here(&worker, two_steps("Sends"), Default::default(), None).await;
+        assert!(journal.events_of(fine).iter().any(|e| matches!(e, RunEvent::RunCompleted { .. })), "{:?}", journal.events_of(fine));
+        assert_eq!(*ran.lock().unwrap(), vec!["first", "after"], "the same worker carried the next run through");
+        assert_eq!(worker.under_way(60), crate::door::UnderWay::Nothing);
+    }
+
+    /// A run its entry lets one of at a time holds the entry's room while
+    /// it runs and gives it back as it ends, an unrecorded run included:
+    /// a caller arriving meanwhile is turned away, one arriving after it
+    /// ended is let in.
+    #[tokio::test]
+    async fn an_unrecorded_run_gives_its_entrys_room_back_as_it_ends() {
+        let mut one_at_a_time = crate::door::fake::route("t1", "route", "status");
+        crate::door::fake::armed(&mut one_at_a_time).spec.limits = weft_core::signal::EntryLimits { at_once: Some(1), ..Default::default() };
+        let mut clients = clients(Arc::new(MemJournal::default()));
+        clients.door_broker = crate::door::fake::FakeDoorBroker::new(vec![one_at_a_time]);
+        let ran = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let catalog = crate::run_driver::engine_test_rig::catalog(vec![
+            ("Sends", Box::new(Sends { name: "first", ran: ran.clone() })),
+            ("After", Box::new(Sends { name: "after", ran })),
+        ]);
+        let worker = worker_running(catalog, clients);
+        let headers = {
+            let mut headers = HeaderMap::new();
+            headers.insert("host", "127.0.0.1:9000".parse().unwrap());
+            headers
+        };
+        let call = || crate::door::Call {
+            method: "GET", raw_path: "/status", raw_query: "", headers: &headers,
+            peer: "10.0.0.1".parse().unwrap(), relayed: false, route_prefix: "",
+        };
+        let crate::door::Arrived::Run(admitted, _) = worker.door.arrive(call(), axum::body::Body::empty()).await else { panic!("the first caller is let in") };
+        assert!(
+            matches!(worker.door.arrive(call(), axum::body::Body::empty()).await, crate::door::Arrived::Answer(_)),
+            "while its run goes, the entry has no room"
+        );
+
+        let unrecorded = weft_core::run_settings::RunSettings::new(weft_core::run_settings::Keeping::Fast, false).unwrap();
+        drive_here(&worker, two_steps("Sends"), unrecorded, Some(admitted.slot)).await;
+        assert!(
+            matches!(worker.door.arrive(call(), axum::body::Body::empty()).await, crate::door::Arrived::Run(..)),
+            "the run ended, so its room is free again"
+        );
+    }
+
+    /// A live caller for the cap tests, its route outliving it or not.
+    fn capped_caller(outlives_caller: bool) -> Arc<crate::caller_conn::LiveCallerConnection> {
+        let config = weft_core::caller::CallerRuntimeConfig {
+            protocol: weft_core::signal::Protocol::Websocket,
+            data_type: weft_core::signal::DataType::Json,
+            backpressure: weft_core::signal::Backpressure::Block,
+            error_mode: weft_core::signal::ErrorMode::Surface,
+            max_inbound_bytes: 1024,
+            caller_silence_secs: weft_core::signal::DEFAULT_CALLER_SILENCE_SECS,
+            max_session_secs: 0,
+            outlives_caller,
+            inbound_window: 4,
+            journal: weft_core::stream_journal::JournalPolicy::default(),
+        };
+        let unkept = Arc::new(crate::run_driver::engine_test_rig::Unkept);
+        crate::caller_conn::new_connection(config, RunId::nil(), Arc::default(), None, unkept).0
+    }
+
+    /// A worker whose platform caps one stretch of a run just past its
+    /// margin, so the cap comes a second in.
+    fn capped_worker() -> Worker {
+        let config = WorkerConfig { run_cap: Some(RUN_CAP_MARGIN + std::time::Duration::from_secs(1)), ..config() };
+        worker_configured(Arc::new(NoCatalog), clients(Arc::new(MemJournal::default())), &config)
+    }
+
+    /// What a capped run saw once its hand-back was asked: whether its
+    /// caller was still on the line, still kept it on this worker, and
+    /// whether the hand-back was overdue yet.
+    #[derive(Debug, PartialEq)]
+    struct AtTheAsk {
+        caller_on_the_line: bool,
+        caller_holds_it: bool,
+        overdue: bool,
+        /// Whether the caller was still on the line when the hand-back
+        /// went overdue (`None`: it never did).
+        on_the_line_when_overdue: Option<bool>,
+    }
+
+    /// A run that, once its hand-back is asked, notes what it saw, then
+    /// hands itself back after `finishing` (its running node ending), ending
+    /// its caller's exchange as the drive does, or, when its hand-back goes
+    /// overdue first, notes whether the window already let the caller go
+    /// and leaves the exchange alone.
+    fn capped_run(
+        hand_back: &crate::run_driver::HandBack,
+        caller: &Arc<crate::caller_conn::LiveCallerConnection>,
+        finishing: Option<std::time::Duration>,
+    ) -> (impl std::future::Future<Output = Result<RunOutcome>>, Arc<std::sync::Mutex<Option<AtTheAsk>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let (watched, caller, noted) = (hand_back.clone(), caller.clone(), seen.clone());
+        let run = async move {
+            watched.asked.cancelled().await;
+            let mut at_the_ask = AtTheAsk {
+                caller_on_the_line: weft_core::caller::CallerConnection::is_connected(caller.as_ref()),
+                caller_holds_it: weft_core::caller::CallerConnection::holds_the_run(caller.as_ref()),
+                overdue: watched.overdue.is_cancelled(),
+                on_the_line_when_overdue: None,
+            };
+            let finished = async {
+                match finishing {
+                    Some(after) => tokio::time::sleep(after).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                // How the drive ends the exchange of a run it hands back.
+                () = finished => caller.run_carries_on(crate::caller_conn::HANDED_BACK).await,
+                () = watched.overdue.cancelled() => {
+                    at_the_ask.on_the_line_when_overdue = Some(weft_core::caller::CallerConnection::is_connected(caller.as_ref()));
+                }
+            }
+            *noted.lock().unwrap() = Some(at_the_ask);
+            Ok(RunOutcome::HandedBack)
+        };
+        (run, seen)
+    }
+
+    /// At the cap, a run whose route outlives its caller gets the window a
+    /// stopping worker gives: its hand-back is asked while the caller stays
+    /// on the line (no longer keeping it here), and goes overdue
+    /// [`HAND_BACK_GRACE`] later when its node is still running. Only then
+    /// is the caller let go, told why, so it reconnects. The run is not
+    /// ended, and another run on the same worker stays where it is.
+    #[tokio::test(start_paused = true)]
+    async fn at_the_cap_a_run_outliving_its_caller_lets_the_caller_go_and_is_handed_back() {
+        let worker = capped_worker();
+        let caller = capped_caller(true);
+        let flag = CancellationFlag::new_arc();
+        let hand_back = worker.hand_back();
+        let beside = worker.hand_back();
+        let (run, seen) = capped_run(&hand_back, &caller, None);
+        let asked_at = tokio::time::Instant::now();
+        let outcome = worker.while_driving(run, RunId::nil(), &flag, Some(caller.clone()), None, &hand_back).await.expect("drove");
+        assert!(matches!(outcome, RunOutcome::HandedBack), "the run was handed back: {outcome:?}");
+        assert_eq!(
+            seen.lock().unwrap().take(),
+            Some(AtTheAsk { caller_on_the_line: true, caller_holds_it: false, overdue: false, on_the_line_when_overdue: Some(false) }),
+            "asked first with the caller still on the line, which the window's end let go"
+        );
+        assert!(hand_back.overdue.is_cancelled(), "a node still running is stopped once the window ends");
+        assert!(asked_at.elapsed() >= std::time::Duration::from_secs(1) + HAND_BACK_GRACE, "the window was given in full");
+        assert!(!flag.is_cancelled(), "the cap did not end the run: {:?}", flag.cause());
+        assert!(!weft_core::caller::CallerConnection::is_connected(caller.as_ref()), "the caller was let go");
+        assert!(
+            !beside.asked.is_cancelled() && !beside.overdue.is_cancelled() && !worker.stopping_overdue.is_cancelled(),
+            "only the capped run leaves the worker"
+        );
+        worker.stopping_overdue.cancel();
+        assert!(beside.overdue.is_cancelled(), "the worker's own stop still reaches every run");
+    }
+
+    /// At the cap, a run whose node ends within the window hands itself
+    /// back whole: its hand-back never goes overdue, so nothing is stopped
+    /// where it is, and its caller is let go then, before the window ends.
+    #[tokio::test(start_paused = true)]
+    async fn at_the_cap_a_node_ending_within_the_window_is_not_stopped() {
+        let worker = capped_worker();
+        let caller = capped_caller(true);
+        let flag = CancellationFlag::new_arc();
+        let hand_back = worker.hand_back();
+        let (run, seen) = capped_run(&hand_back, &caller, Some(HAND_BACK_GRACE / 2));
+        let outcome = worker.while_driving(run, RunId::nil(), &flag, Some(caller.clone()), None, &hand_back).await.expect("drove");
+        assert!(matches!(outcome, RunOutcome::HandedBack), "the run handed itself back: {outcome:?}");
+        assert!(seen.lock().unwrap().is_some(), "its hand-back was asked");
+        assert!(!hand_back.overdue.is_cancelled(), "its node ended in time, so nothing was stopped");
+        assert!(!weft_core::caller::CallerConnection::is_connected(caller.as_ref()), "the caller was let go once the run handed itself back");
+    }
+
+    /// At the cap, a run whose caller cannot be left behind is ended as a
+    /// time limit telling the caller to reconnect.
+    #[tokio::test(start_paused = true)]
+    async fn at_the_cap_a_run_tied_to_its_caller_is_ended() {
+        let worker = capped_worker();
+        let caller = capped_caller(false);
+        let flag = CancellationFlag::new_arc();
+        let watched = flag.clone();
+        let run = async move {
+            watched.cancelled().await;
+            Ok(RunOutcome::Cancelled { cause: watched.cause().expect("a cause") })
+        };
+        let hand_back = worker.hand_back();
+        let outcome = worker.while_driving(run, RunId::nil(), &flag, Some(caller), None, &hand_back).await.expect("drove");
+        assert!(
+            matches!(&outcome, RunOutcome::Cancelled { cause: weft_core::run::CancelCause::Limit { detail } } if detail.contains("reconnect")),
+            "{outcome:?}"
+        );
+        assert!(!hand_back.asked.is_cancelled() && !hand_back.overdue.is_cancelled(), "an ended run is not handed back");
     }
 }

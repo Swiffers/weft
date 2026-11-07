@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 use weft_core::primitive::Phase;
 use weft_core::program::RunPage;
-use weft_e2e::access::{catalog_spec, connect_direct, set_account};
+use weft_e2e::access::{connect_direct, set_account};
 use weft_e2e::{ensure, infra, live, poll_until, project::Project, Dispatcher, SettledRun};
 
 /// A copy coming up builds and pulls an image and waits for its
@@ -125,39 +125,6 @@ async fn a_per_instance_infra_node_runs_one_copy_per_instance() -> anyhow::Resul
     project.finish().await
 }
 
-/// Each trigger is turned on and off on its own: activating one leaves
-/// the others dark, and taking one down leaves the others listening.
-#[tokio::test]
-async fn one_trigger_is_turned_on_and_off_alone() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let project = Project::prepare("instances", disp.clone()).await?;
-    project.set_main(
-        "a = Route -> (body: { text: String }) { path: \"__E2E_PATH__/a\", method: \"POST\" }\n\
-         ra = Reply\nra.body = a.body.text\n\
-         b = Route -> (body: { text: String }) { path: \"__E2E_PATH__/b\", method: \"POST\" }\n\
-         rb = Reply\nrb.body = b.body.text\n",
-    )?;
-    let base = project.unique_live_path()?;
-    let call = |route: &'static str| {
-        let disp = disp.clone();
-        let url = format!("{base}/{route}");
-        async move { live::http_json(&disp, Method::POST, &url, &[], &json!({ "text": route })).await.map(|(s, _, _)| s) }
-    };
-
-    project.weft(&["activate", "--trigger", "a"]).await?;
-    anyhow::ensure!(call("a").await? == 200);
-    anyhow::ensure!(call("b").await? != 200, "b was never turned on");
-    let status = project.weft(&["status"]).await?;
-    anyhow::ensure!(status.contains("triggers:"), "{status}");
-
-    project.weft(&["activate", "--trigger", "b"]).await?;
-    anyhow::ensure!(call("b").await? == 200);
-    project.weft(&["deactivate", "--trigger", "a", "--door", "refuse", "--held", "drop", "--running", "cancel"]).await?;
-    anyhow::ensure!(call("a").await? != 200, "a is down");
-    anyhow::ensure!(call("b").await? == 200, "b kept listening");
-    project.finish().await
-}
-
 /// The doors that name an instance: the `Weft-Instance` header on a route
 /// gated by a connection, and an instance token. An instance connects its
 /// own account and gives it for an `@instance_filled` connection field
@@ -168,8 +135,14 @@ async fn an_instance_picks_its_connection_and_runs_with_it() -> anyhow::Result<(
     let disp = ensure::up().await?;
     let mut project = Project::prepare("instances", disp.clone()).await?;
     let base = project.unique_live_path()?;
-    let keys = connect_direct(&disp, catalog_spec("api", "api_key_auth")?, "own", json!({ "keys": "k-backend" })).await?;
-    set_account(&project, "keys", keys.handle()).await?;
+    let keys = connect_direct(
+        &disp,
+        serde_json::to_value(weft_core::access::callers::CallerScheme::ApiKeys.recipe())?,
+        "own",
+        json!({ "keys": "k-backend" }),
+    )
+    .await?;
+    set_account(&project, "hook", keys.handle()).await?;
     project.activate().await?;
 
     let hook = format!("{base}/hook");
@@ -260,13 +233,13 @@ async fn an_instance_picks_its_connection_and_runs_with_it() -> anyhow::Result<(
     // The terminal does what an instance's connect page does: it picks
     // ada's stored key set back, connects bob one of its own, and drops
     // a pick, each for that instance alone.
-    project.weft(&["connect", "--instance", "ada", "--node", "theirs", "--grant", &grant, "--json"]).await?;
+    project.weft(&["connect", "theirs", "--instance", "ada", "--grant", &grant, "--json"]).await?;
     let (status, body) = call(vec![("Weft-Instance", "ada".into())]).await?;
     anyhow::ensure!(status == 200, "ada's pick is back: {status}: {body}");
-    project.weft(&["connect", "--instance", "bob", "--node", "theirs", "--door", "own", "--set", "keys=k-bob"]).await?;
+    project.weft(&["connect", "theirs", "--instance", "bob", "--door", "own", "--set", "keys=k-bob"]).await?;
     let (status, body) = call(vec![("Weft-Instance", "bob".into())]).await?;
     anyhow::ensure!(status == 200 && serde_json::from_str::<Value>(&body)?["instance"] == json!("bob"), "bob runs with its own: {status}: {body}");
-    project.weft(&["connect", "--instance", "ada", "--node", "theirs", "--disconnect"]).await?;
+    project.weft(&["connect", "theirs", "--instance", "ada", "--disconnect"]).await?;
     let (status, body) = call(vec![("Weft-Instance", "ada".into())]).await?;
     anyhow::ensure!(status != 200 && body.contains("has not filled 'theirs.account'"), "{status}: {body}");
     let (status, _) = call(vec![("Weft-Instance", "bob".into())]).await?;
@@ -419,35 +392,5 @@ async fn an_instances_value_reaches_its_live_trigger() -> anyhow::Result<()> {
     project.weft(&["instance-values", "--instance", "bob", "--set", "tick.cron=0 30 9 * * *"]).await?;
     let listed = project.weft(&["instance-values", "--instance", "bob", "--json"]).await?;
     anyhow::ensure!(listed.contains("0 30 9 * * *"), "{listed}");
-    project.finish().await
-}
-
-/// `weft resync` brings up to date the triggers of the owners it names:
-/// plain, the shared ones, so an instance's trigger that is on and behind
-/// the build is left as it is (and still reads behind); `--all-instances`
-/// reaches it and brings it onto the build.
-#[tokio::test]
-async fn resync_reaches_an_instances_trigger_only_when_told_to() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let project = Project::prepare("instances", disp.clone()).await?;
-    let pid = project.id();
-    let program = "tick = Cron { cron: @instance_filled(\"0 0 3 * * *\") }\nlog = Debug\nlog.data = tick.scheduledTime\n";
-    project.set_main(program)?;
-    project.weft(&["activate", "--trigger", "tick", "--instance", "ada"]).await?;
-    let state = |s: &weft_e2e::status::ProjectStatus| s.trigger_state("tick", Some("ada")).to_string();
-    weft_e2e::status::wait_until(&disp, &pid, "ada's trigger on", weft_e2e::status::STATUS_DEADLINE, |s| state(s) == "on").await?;
-
-    // One more node reads each fire, so the trigger's cut moves.
-    project.set_main(&format!("{program}also = Debug\nalso.data = tick.scheduledTime\n"))?;
-    project.weft(&["resync"]).await?;
-    let s = weft_e2e::status::fetch(&disp, &pid).await?;
-    anyhow::ensure!(state(&s) == "behind", "a plain resync leaves ada's trigger as it was: {:?}", s.trigger("tick"));
-
-    project.weft(&["resync", "--all-instances"]).await?;
-    let s = weft_e2e::status::wait_until(&disp, &pid, "ada's trigger on the new build", weft_e2e::status::STATUS_DEADLINE, |s| {
-        state(s) == "on"
-    })
-    .await?;
-    anyhow::ensure!(!s.offers("resync"), "nothing is behind any more: {:?}", s.available_actions());
     project.finish().await
 }

@@ -725,6 +725,13 @@ export class GraphViewController {
       // file left the graph showing the old parse.
       for (const rel of n.includeContents?.files ?? []) includeRootRel.add(rel);
     }
+    // A group's written values name files the same way (a loop's sit on
+    // its LoopIn, one of the nodes above).
+    for (const g of (response.project.groups ?? []) as Array<{ fileRefs?: Record<string, { path: string; type: string }> }>) {
+      for (const ref of Object.values(g.fileRefs ?? {})) {
+        if (!typeReferencesFile(ref.type)) fileRel.add(ref.path);
+      }
+    }
     // Record the resolution base + @file set so saveFileRef and the watcher
     // reship from the same source of truth.
     this.fileBaseDir = rootDir;
@@ -883,6 +890,7 @@ export class GraphViewController {
         source,
         file: doc.uri.fsPath,
         reloadCatalog,
+        callPath: this.placeCallPath(),
       });
       if (seq !== this.parseSeq) return; // superseded by a newer parse
       this.applyParseResult(response, source, { code: layoutCode });
@@ -1614,8 +1622,8 @@ export class GraphViewController {
   }
 
   /// The STORED runtime files the picker offers: the same listing door
-  /// `weft files` uses (the dispatcher's tenant file list), narrowed to the
-  /// files this project's runs can read (see `storedFilePickerRows`), keys
+  /// `weft files` uses (the dispatcher's tenant file list), less the
+  /// tenant's assets (see `storedFilePickerRows`), keys
   /// handed back TENANT-LESS (the short address a picked ref writes into
   /// source).
   private async runListRuntimeFiles(requestId: number): Promise<void> {
@@ -1631,7 +1639,7 @@ export class GraphViewController {
     }
     try {
       const resp = await this.client.get<{ files: StoredFileRow[] }>('/storage/files');
-      const files = storedFilePickerRows(resp.files ?? [], pid);
+      const files = storedFilePickerRows(resp.files ?? []);
       this.post({ kind: 'runtimeFiles', requestId, files });
     } catch (e) {
       // A failed listing must never render as "this project has no stored
@@ -1902,6 +1910,7 @@ export class GraphViewController {
           ...req,
           source: openDoc.getText(),
           file: key,
+          callPath: this.placeCallPath(),
         });
         if (openDoc.version !== versionBefore) {
           return { aborted: true as const };
@@ -1973,6 +1982,7 @@ export class GraphViewController {
           kind: 'parse',
           source,
           file: key,
+          callPath: this.placeCallPath(),
         });
         return { response, source };
       });
@@ -2154,6 +2164,14 @@ export class GraphViewController {
   /// is meant: such a view draws the graph and nothing that belongs to
   /// a place (runs, displays, the action bar). A `.weft` outside any
   /// project is its own entry.
+  /// The call path a parse is asked at: this view's, when the view is a
+  /// place below the entry file (see `viewPlace`); none otherwise, where
+  /// the file's own answer is the only one there is.
+  private placeCallPath(): string[] | undefined {
+    const { callPath, interactive } = this.viewPlace();
+    return interactive && callPath.length > 0 ? callPath : undefined;
+  }
+
   private viewPlace(): { callPath: string[]; interactive: boolean } {
     const callPath = this.navStack.map((f) => f.alias);
     // The call path is a place only when it starts at the entry file:

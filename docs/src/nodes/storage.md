@@ -11,26 +11,31 @@ ctx.pulse_downstream(NodeOutput::stored_file(StoredFile::from_value(&stored)?)).
 
 ## The five scopes
 
-The scope decides where new files go, and how long they live.
+Any run of any project in your account can read any stored file, whatever its
+scope, for as long as the file exists. The scope decides only where a new file
+goes and how long it lives.
 
-| Scope | Lives | Gone when |
+| Scope | Holds | Gone when |
 |---|---|---|
-| `Run` (the default) | This run | Five minutes after the run ends, so its output is still downloadable, unless you kept it |
-| `Project` | Across runs of this project | `weft clean` or `weft rm`, or once its lifetime runs out if you gave it one |
-| `Shared { name }` | Across projects that name the same space | Explicit removal, or once its lifetime runs out if you gave it one |
-| `Asset` | The project's `@asset` copies | Readable by your node, and the worker refuses writes to it |
-| `Instance { of }` | One instance's space in this project (`StorageScope::instance()` for the run's own instance, `instance_of(id)` for any) | Until removed. For what removes them and who reaches them, go and read [an instance's files](../running/instances.md#an-instances-files) |
+| `Run` (the default) | What this run made | Its run is deleted, that is when the run's record goes (its keep time runs out, `weft clean`, `weft rm`). The run ending does not delete it |
+| `Project` | Files of this project | The project is deleted (`weft rm`) |
+| `Shared { name }` | Files several projects meet in by naming the same space | Somebody deletes them (`weft files rm`) |
+| `Asset` | The project's `@asset` copies | No version of the project names it any more, after a countdown. Your node reads it, and the worker refuses writes to it |
+| `Instance { of }` | One instance's files in this project (`StorageScope::instance()` for the run's own instance, `instance_of(id)` for any) | Somebody deletes them (`weft files rm`, or wiping the instance with `WipeInstance`), or the project is removed. For more, go and read [an instance's files](../running/instances.md#an-instances-files) |
 
 The scope governs **writes and lists**. Reading, deleting, keeping and linking
-act on whatever scope the key itself belongs to, so a later node can `get` a
-file without knowing where it came from. `copy` is the one that does both,
-reading from the key's scope and writing into yours, which is how a file
-crosses.
+act on whatever scope the key itself belongs to, so a later node, or a later
+run that kept the reference, can `get` a file without knowing where it came
+from. `copy` is the one that does both, reading from the key's scope and
+writing into yours, which is how a file moves to a scope that lives longer.
 
 ## How long a file lives
 
-A run-scoped file is swept shortly after the run ends. If you want it to
-outlive the run (anything a person will open later), give it a lifetime:
+A file can also have a deadline. It is deleted when the deadline arrives,
+whatever its scope, or with its owner (its run, its project) if that comes
+first. Every read, link or replace pushes the deadline back, so a file
+something still uses does not vanish underneath it. A file with no deadline
+lives as long as its scope says.
 
 ```rust
 storage.put(bytes, "image/png", "chart.png", Some(KeepTtl::Default)).await?;
@@ -38,16 +43,12 @@ storage.put(bytes, "image/png", "chart.png", Some(KeepTtl::Default)).await?;
 
 | `KeepTtl` | Meaning |
 |---|---|
-| `Default` | 30 days |
-| `Secs { secs }` | That long |
-| `Never` | No expiry. Only `weft files rm` or `weft clean` removes it |
+| `Default` | 30 days since it was last touched |
+| `Secs { secs }` | That long since it was last touched |
+| `Never` | No deadline: it lives as long as its scope says |
 
-The lifetime counts from the last time something touched the file: every read,
-link or replace pushes the expiry back, so a file something still uses does not
-vanish underneath it.
-
-Project, shared and instance files take a lifetime too. There, `None` means the
-file lives until somebody deletes it. A cache of fetched pages, say:
+`None` gives no deadline either. A cache of fetched pages that should go once
+nobody has read it for a week, say:
 
 ```rust
 ctx.storage(StorageScope::Project)
@@ -55,12 +56,12 @@ ctx.storage(StorageScope::Project)
     .await?;
 ```
 
-For a file that already exists, `keep(&file, ttl)` sets its lifetime from now
-on. On a run file it also marks the file to outlive its run, and that
-mark cannot be taken back. On the other scopes `keep(&file, KeepTtl::Never)`
-takes a lifetime away again. An asset lives as long as a version of the project
-still names it (once none does, it expires on its own), so you cannot give one
-a lifetime.
+For a file that already exists, `keep(&file, ttl)` sets its deadline from now
+on, and `keep(&file, KeepTtl::Never)` takes it away. Neither moves the file, so
+a run file still goes with its run. If you want a file to outlive the run that
+made it, `copy` it into the project (the `KeepFile` node with `scope: project`
+does that). An asset lives as long as a version of the project still names it
+(once none does, it expires on its own), so you cannot give one a deadline.
 
 ## Storing
 
@@ -69,11 +70,26 @@ a lifetime.
 | `put(bytes, mime, filename, keep)` | You have the bytes |
 | `put_stream(stream, mime, filename, keep)` | You do not want the whole file in memory |
 | `put_response(resp, what, mime, filename, keep)` | You already made an authenticated request and want its body |
-| `put_from_url(url, filename, keep)` | A plain URL, fetched straight in |
+| `put_json(&value, filename, keep)` | A value too big for a wire (a transcript, a conversation), stored as `application/json` |
+| `put_from_url(url, mime, filename, keep)` | A plain URL, fetched straight in (`mime` None takes the type the server says) |
 | `copy(&file, keep)` | A file that already exists, into this scope |
 
 Every one of these makes a new file under a fresh key, so two puts never
 collide, whatever their filenames.
+
+If you know a download's type better than its server does (a provider that
+serves every file as `application/octet-stream`), pass it as `put_from_url`'s
+`mime` and it wins over what the server says. With no `filename`, the name
+comes from the response, else from the URL. If your node names a file after a
+URL itself, `storage::filename_from_url(url)` gives the last part of its path
+(`talk.mp4` in `https://cdn.example.com/v/talk.mp4?sig=1`), or `download.bin`
+when the path names nothing, and `storage::name_in_url(url)` gives `None`
+there instead, so you can pick your own fallback.
+
+If the run is cancelled, `put`, `put_stream`, `put_json` and `put_response`
+end with the cancelled error on their own and nothing is stored. So do the
+reads below (`get`, `get_range`, `get_bytes`, `body`), chunk by chunk (go and read
+[cancelling](ctx.md#when-the-run-is-cancelled)).
 
 ### Changing a file in place
 
@@ -102,7 +118,7 @@ function must use only the bytes it is given: no counter it bumps, no call
 out, no other read. Returning the bytes unchanged writes nothing.
 
 The file keeps its key, so every reference already handed out now reads the
-new content. It also keeps its scope, name, type and lifetime. A reader sees
+new content. It also keeps its scope, name, type and deadline. A reader sees
 either the old bytes or the new ones, never a mix. What comes back is the file's value
 with its new `sizeBytes` and `version`.
 
@@ -161,8 +177,42 @@ takes one file and is received once, and an upload nobody received within
 | `get(&file)` | The bytes, as a stream |
 | `get_range(&file, range)` | Part of them |
 | `get_bytes(&file)` | The whole thing in memory. Small files only |
+| `body(&file)` | A request body that streams the file out of storage (see below) |
 | `list()` | Everything in this scope |
 | `delete(&file)` | Gone. Stored files only, not URL-backed ones. In a program, the `DeleteFile` node does the same |
+
+### Sending a stored file to a provider
+
+If you are uploading a stored file to a service, send it as a streamed body
+instead of reading it into memory with `get_bytes`:
+
+```rust
+use weft::access::client::{Multipart, StoredBodyExt};
+
+let body = ctx.storage(StorageScope::Run).body(&file).await?;
+http.post(url).header("content-type", body.mime_type()).stored_body(body)
+```
+
+`body` gives you a `StoredBody`: the bytes, read out of storage while the
+request is sent, with the file's record beside them. `len()`, `mime_type()`
+and `filename()` come from that record, so you know the length before a
+single byte is read, which is what a service that hands out an upload address
+for an exact size needs. `stored_body` sets `Content-Length` from it; the
+content type is yours to state.
+
+If the service wants a multipart form, a stored file can fill a part:
+
+```rust
+let form = Multipart::form_data().text("channel", &channel).stored("file", body);
+http.post(url).multipart(form)
+```
+
+`stored(name, body)` is a named file field of a `form_data()` form, under the
+file's stored name and type. For a `multipart/related` body (a JSON part, then
+the bytes), use `Multipart::related().part("application/json", serde_json::to_vec(&meta).node_err("encode the metadata")?).stored_part(body)`.
+`multipart` sends the form with its `Content-Type` and `Content-Length`,
+streaming every stored part. Keep `get_bytes` for when your node needs the
+bytes themselves: text it parses, a hash it computes.
 
 ## Handing a file out
 
@@ -172,10 +222,11 @@ who will open it:
 | Call | Use it when |
 |---|---|
 | `internal_link(&file)` | Code inside the install opens it: a script or a process your node runs on the worker. The link goes straight to storage, never out through a tunnel and back |
+| `container_link(&file)` | One of your project's own containers opens it: an infra unit your node hands the file to. Inside a container `127.0.0.1` is the container itself, so on a local install this link reaches your machine at `host.docker.internal`, through weft's internal port. On a cloud install it is the same link as `internal_link` |
 | `external_link(&file)` | Anything outside the install opens it: a browser, an app, a provider's API. This is the link a `Reply` puts in its answer in place of a file |
 | `external_file(&file)` | You are sending the file to an outside service: its external link when the open internet can open it, else a `data:` URL carrying the bytes, with the file's mime type and filename beside it |
 
-Both links come back as a `FileLink { url, public }`, where `public` says
+Every link comes back as a `FileLink { url, public }`, where `public` says
 whether the open internet can open `url`. An external link goes the first of
 these ways that exists:
 
@@ -239,6 +290,15 @@ exactly that.
 `internalize(&value, &ty, keep)` is the reverse: it takes a value full of
 `data:` URLs and external links and stores them, giving you back something you
 can emit and that will still work tomorrow.
+
+If you want some other form for each file going out (a dict a script reads,
+say), `storage::media::map_stored_files(&value, &ty, |slot| async move { .. })`
+is the walk `externalize` and a live caller's links go through: your function
+gets each stored file the type places (its handle, its kind and its marker)
+once, and returns what goes there instead. The type decides what is a file,
+so a `JsonDict` that happens to hold a marker is left whole. A `data:` URL or
+an `http(s)` link in a file place passes untouched, and anything else there
+is refused.
 
 The rule that makes it safe: **the marker never leaves weft, and a file value
 never holds a link.** So nothing you emit, park on or memoize carries one, and

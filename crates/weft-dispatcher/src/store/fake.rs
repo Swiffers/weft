@@ -260,11 +260,16 @@ fn remove_run_waits(g: &mut FakeState, run_id: RunId, cancelled: bool) -> (Vec<S
 /// End `run_id`, a run nobody drives, cancelled for `cause`, with
 /// the real cancel's rows (`cancel_terminal_events`: its open charges
 /// booked unknown, then its ending), less the per-node ones (the fake
-/// folds no nodes).
+/// folds no nodes), and queue what its firings owed
+/// (`owed_call_requests`).
 fn end_unowned(g: &mut FakeState, run_id: RunId, cause: &weft_core::run::CancelCause) -> anyhow::Result<()> {
     let record: Vec<RunEvent> = g.events.iter().filter(|e| e.run_id() == run_id).cloned().collect();
     let writes = crate::api::run::cancel_terminal_events(run_id, &record, None, cause, 0)?;
-    note(g.runs.get_mut(&run_id).expect("the run's row"), &writes);
+    let row = g.runs.get_mut(&run_id).expect("the run's row");
+    note(row, &writes);
+    let (tenant_id, project_id) = (row.tenant_id.clone(), row.project_id);
+    let owed = weft_journal::OwedCalls::of_record(&record);
+    g.cancel_calls.extend(crate::api::run::owed_call_requests(run_id, owed, &tenant_id, project_id));
     g.events.extend(writes);
     Ok(())
 }
@@ -322,7 +327,7 @@ impl BakeStore for FakeStore {
         Ok(self.inner.lock().unwrap().trigger_setups.contains_key(&run_id))
     }
 
-    async fn finish_trigger_setup(&self, run_id: RunId, bake: Option<&super::TriggerBake>) -> anyhow::Result<Option<super::UnreadablePriorBake>> {
+    async fn finish_trigger_setup(&self, run_id: RunId, bake: Option<&super::TriggerBake>) -> anyhow::Result<Option<super::UnreadableBake>> {
         let mut g = self.inner.lock().unwrap();
         let project = g.trigger_setups.get(&run_id).copied();
         if let Some(project) = project {
@@ -341,9 +346,11 @@ impl BakeStore for FakeStore {
         Ok(None)
     }
 
-    async fn trigger_bakes(&self, project_id: uuid::Uuid, instance: Option<&weft_core::instance::InstanceId>) -> anyhow::Result<Vec<super::TriggerBake>> {
-        Ok(self.inner.lock().unwrap().trigger_bakes.values()
-            .filter(|bake| bake.project_id == project_id && bake.instance.as_ref() == instance).cloned().collect())
+    async fn trigger_bakes(&self, project_id: uuid::Uuid, instance: Option<&weft_core::instance::InstanceId>) -> anyhow::Result<super::Bakes> {
+        let read = self.inner.lock().unwrap().trigger_bakes.values()
+            .filter(|bake| bake.project_id == project_id && bake.instance.as_ref() == instance).cloned().collect();
+        // The fake keeps bakes as values, which always read.
+        Ok(super::Bakes { read, unreadable: Vec::new() })
     }
 }
 
@@ -579,6 +586,17 @@ impl RunStore for FakeStore {
         Ok(out.into_iter().map(|(_, run_id, phase)| (run_id, phase)).collect())
     }
 
+    async fn unfinished_programs(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<String>> {
+        let g = self.inner.lock().unwrap();
+        let hashes: std::collections::BTreeSet<String> = g
+            .runs
+            .values()
+            .filter(|row| row.project_id == project_id && row.state != "ended")
+            .filter_map(|row| row.definition_hash.clone())
+            .collect();
+        Ok(hashes.into_iter().collect())
+    }
+
     async fn settled_run_ids_for_project(
         &self,
         project_id: uuid::Uuid,
@@ -644,16 +662,33 @@ impl SignalStore for FakeStore {
     /// worker of a run one drives (the state's `handed`).
     async fn answer(&self, token: &str, answer: &weft_core::primitive::WaitAnswer) -> anyhow::Result<Answered> {
         let mut g = self.inner.lock().unwrap();
-        let Some(consumed) = g.signals.get(token).filter(|s| s.is_resume).cloned() else { return Ok(Answered::Gone) };
-        g.signals.remove(token);
-        let Some(run_id) = consumed.run_id else { return Ok(Answered::Gone) };
+        let Some(answered) = g.signals.get(token).filter(|s| s.is_resume).cloned() else { return Ok(Answered::Gone) };
+        let Some(run_id) = answered.run_id else { return Ok(Answered::Gone) };
+        // A branch answers its wait, and takes every branch of it down.
+        let (waited, answer) = match crate::store::branch_of(&answered)? {
+            None => (token.to_string(), answer.clone()),
+            Some(of) => (of.wait.clone(), match answer {
+                weft_core::primitive::WaitAnswer::Given { value } => {
+                    weft_core::primitive::WaitAnswer::Given { value: weft_core::signal::first_of::branch_answer(of.branch, value.clone()) }
+                }
+                weft_core::primitive::WaitAnswer::Skipped => weft_core::primitive::WaitAnswer::Skipped,
+            }),
+        };
+        let mut gone = Vec::new();
+        for sig in g.signals.values().filter(|s| s.is_resume && s.run_id == Some(run_id)) {
+            let goes = if waited == token { sig.token == token } else { crate::store::answers_wait(sig, &waited)? };
+            if goes {
+                gone.push(sig.token.clone());
+            }
+        }
+        let consumed: Vec<SignalRegistration> = gone.iter().filter_map(|t| g.signals.remove(t)).collect();
         let Some(row) = g.runs.get_mut(&run_id).filter(|row| row.state != "ended") else { return Ok(Answered::RunEnded { consumed }) };
         if row.owner.is_some() {
-            g.handed.entry(run_id).or_default().push((token.to_string(), answer.clone()));
+            g.handed.entry(run_id).or_default().push((waited, answer));
             return Ok(Answered::Reached { consumed });
         }
         row.state = "queued";
-        g.events.push(RunEvent::wait_answered(run_id, token.to_string(), answer.clone(), 0));
+        g.events.push(RunEvent::wait_answered(run_id, waited, answer, 0));
         Ok(Answered::Reached { consumed })
     }
 
@@ -753,10 +788,15 @@ impl SignalStore for FakeStore {
             .cloned())
     }
 
-    async fn signal_withdraw(&self, run_id: RunId, token: &str) -> anyhow::Result<Option<SignalRegistration>> {
+    async fn signal_withdraw(&self, run_id: RunId, token: &str) -> anyhow::Result<Vec<SignalRegistration>> {
         let mut g = self.inner.lock().unwrap();
-        let of_run = g.signals.get(token).is_some_and(|s| s.run_id == Some(run_id));
-        Ok(if of_run { g.signals.remove(token) } else { None })
+        let mut gone = Vec::new();
+        for sig in g.signals.values().filter(|s| s.is_resume && s.run_id == Some(run_id)) {
+            if crate::store::answers_wait(sig, token)? {
+                gone.push(sig.token.clone());
+            }
+        }
+        Ok(gone.iter().filter_map(|t| g.signals.remove(t)).collect())
     }
 
     async fn signal_remove_many(
@@ -899,7 +939,7 @@ pub(crate) mod tests {
             run_id: None,
             node_id: "n".into(),
             is_resume: false,
-            spec_json: "{}".into(),
+            spec_json: r#"{"kind":"form"}"#.into(),
             access_id: None,
             consumer_kind: None,
             tags: vec![],
@@ -934,7 +974,7 @@ pub(crate) mod tests {
         let crate::store::Answered::Reached { consumed } = j.answer("tok-r", &weft_core::primitive::WaitAnswer::Given { value: serde_json::json!("yes") }).await.unwrap() else {
             panic!("the wait is answered")
         };
-        assert_eq!(consumed.token, "tok-r");
+        assert_eq!(consumed.iter().map(|s| s.token.as_str()).collect::<Vec<_>>(), ["tok-r"]);
         assert!(j.signal_get("tok-r").await.unwrap().is_none(), "single use");
         assert_eq!(j.inner.lock().unwrap().runs[&run].state, "queued");
         assert!(matches!(j.answer("tok-r", &weft_core::primitive::WaitAnswer::Skipped).await.unwrap(), crate::store::Answered::Gone));
@@ -943,6 +983,62 @@ pub(crate) mod tests {
         j.signal_insert(&registration("tok-e")).await.unwrap();
         assert!(matches!(j.answer("tok-e", &weft_core::primitive::WaitAnswer::Skipped).await.unwrap(), crate::store::Answered::Gone));
         assert!(j.signal_get("tok-e").await.unwrap().is_some(), "entry rows stay");
+    }
+
+    /// A branch of `wait` (a wait on the first of several), at `branch`.
+    fn branch(token: &str, run: RunId, wait: &str, branch: u32) -> SignalRegistration {
+        let mut spec = weft_core::primitive::SignalSpec::of_kind("form", serde_json::json!({}));
+        spec.branch_of = Some(weft_core::signal::first_of::BranchOf { wait: wait.into(), branch });
+        SignalRegistration { is_resume: true, run_id: Some(run), spec_json: serde_json::to_string(&spec).unwrap(), ..registration(token) }
+    }
+
+    /// The first branch of a wait on the first of several to be answered
+    /// answers the wait, under its token and saying which branch it was,
+    /// and takes every branch down with it; another wait of the run stays.
+    #[tokio::test]
+    async fn a_branch_answers_its_wait_and_takes_its_siblings_down() {
+        let j = FakeStore::new();
+        j.set_project_tenant(PROJECT, "t");
+        let run = uuid::Uuid::new_v4();
+        j.record_event(&started(run, PROJECT)).await.unwrap();
+        j.inner.lock().unwrap().runs.get_mut(&run).unwrap().owner = None;
+        for sig in [branch("w-0", run, "w", 0), branch("w-1", run, "w", 1), branch("v-0", run, "v", 0)] {
+            j.signal_insert(&sig).await.unwrap();
+        }
+        let crate::store::Answered::Reached { consumed } =
+            j.answer("w-1", &weft_core::primitive::WaitAnswer::Given { value: serde_json::json!({ "gone": true }) }).await.unwrap()
+        else {
+            panic!("the wait is answered")
+        };
+        let mut gone: Vec<&str> = consumed.iter().map(|s| s.token.as_str()).collect();
+        gone.sort_unstable();
+        assert_eq!(gone, ["w-0", "w-1"]);
+        assert!(j.signal_get("v-0").await.unwrap().is_some(), "another wait's branch stays");
+        let answered = j.inner.lock().unwrap().events.last().cloned();
+        assert!(
+            matches!(&answered, Some(RunEvent::SuspensionResolved { token, value, .. })
+                if token == "w" && value == &serde_json::json!({ "branch": 1, "value": { "gone": true } })),
+            "{answered:?}"
+        );
+        assert!(matches!(j.answer("w-0", &weft_core::primitive::WaitAnswer::Skipped).await.unwrap(), crate::store::Answered::Gone), "the loser is gone");
+    }
+
+    /// A run giving up a wait on the first of several withdraws every
+    /// branch of it, by the wait's token, which no row has.
+    #[tokio::test]
+    async fn withdrawing_a_wait_on_the_first_of_several_takes_every_branch() {
+        let j = FakeStore::new();
+        j.set_project_tenant(PROJECT, "t");
+        let run = uuid::Uuid::new_v4();
+        j.record_event(&started(run, PROJECT)).await.unwrap();
+        for sig in [branch("w-0", run, "w", 0), branch("w-1", run, "w", 1), branch("v-0", run, "v", 0)] {
+            j.signal_insert(&sig).await.unwrap();
+        }
+        let mut gone: Vec<String> = j.signal_withdraw(run, "w").await.unwrap().into_iter().map(|s| s.token).collect();
+        gone.sort_unstable();
+        assert_eq!(gone, ["w-0", "w-1"]);
+        assert!(j.signal_withdraw(uuid::Uuid::new_v4(), "v").await.unwrap().is_empty(), "another run's wait is left alone");
+        assert_eq!(j.signal_withdraw(run, "v").await.unwrap().len(), 1);
     }
 
     /// Erasing a run answers the questions it was parked on, so the
@@ -1144,8 +1240,8 @@ pub(crate) mod tests {
         let second = RunId::new_v4();
         store.inner.lock().unwrap().trigger_setups.insert(second, PROJECT);
         store.finish_trigger_setup(second, None).await.unwrap();
-        assert_eq!(store.trigger_bakes(PROJECT, None).await.unwrap()[0].run_id, first);
-        assert!(store.trigger_bakes(OTHER_PROJECT, None).await.unwrap().is_empty());
+        assert_eq!(store.trigger_bakes(PROJECT, None).await.unwrap().read[0].run_id, first);
+        assert!(store.trigger_bakes(OTHER_PROJECT, None).await.unwrap().read.is_empty());
         let mut refresh = bake.clone();
         refresh.run_id = second;
         refresh.targets = refresh.captured.keys().cloned().collect();
@@ -1154,7 +1250,7 @@ pub(crate) mod tests {
         store.finish_trigger_setup(second, Some(&refresh)).await.unwrap();
         store.finish_trigger_setup(first, Some(&bake)).await.unwrap();
         store.delete_run(second).await.unwrap();
-        let saved = store.trigger_bakes(PROJECT, None).await.unwrap();
+        let saved = store.trigger_bakes(PROJECT, None).await.unwrap().read;
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].run_id, second);
         assert!(saved[0].captured.is_empty(), "a skipped target cannot keep its old registration");

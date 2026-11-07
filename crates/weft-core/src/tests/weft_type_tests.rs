@@ -1918,10 +1918,10 @@ fn validate_value_names_the_offending_path() {
     let err = history
         .validate_value(&json!([{ "role": "user", "content": "a", "extra": 1 }]))
         .unwrap_err();
-    assert!(err.contains("unknown field \"extra\""), "{err}");
+    assert!(err.contains("unknown field 'extra'"), "{err}");
 
     let err = history.validate_value(&json!([{ "role": "user" }])).unwrap_err();
-    assert!(err.contains("missing required field \"content\""), "{err}");
+    assert!(err.contains("missing required field 'content'"), "{err}");
 
     // A raw URL string is NOT a stored image: the marker is the contract.
     let err = history
@@ -2191,12 +2191,136 @@ fn validate_value_refuses_an_unknown_key_only_on_a_closed_record() {
     use serde_json::json;
     let value = json!({ "email": "a@b", "utm": "x" });
     let e = ty("{ email: String }").validate_value(&value).unwrap_err();
-    assert!(e.contains("unknown field \"utm\""), "{e}");
+    assert!(e.contains("unknown field 'utm'"), "{e}");
     ty("{ email: String, .. }").validate_value(&value).expect("an open record takes it");
     for t in ["{ email: String }", "{ email: String, .. }"] {
         let e = ty(t).validate_value(&json!({})).unwrap_err();
-        assert!(e.contains("missing required field \"email\""), "{t}: {e}");
+        assert!(e.contains("missing required field 'email'"), "{t}: {e}");
     }
+}
+
+/// A record names every problem it has in one error, its own keys and
+/// its fields' values at any depth, each at its path; a list stops at
+/// its first bad item.
+#[test]
+fn a_record_names_every_problem_at_once() {
+    use serde_json::json;
+    let user = ty("{ email: String, name: String }");
+    let t = ty("{ id: String, n: Number, user: { email: String, name: String } }");
+    let e = t
+        .validate_value(&json!({ "n": "x", "extra": 1, "more": 2, "user": { "nick": "a" } }))
+        .unwrap_err();
+    assert_eq!(
+        e,
+        format!(
+            "value: unknown fields 'extra' and 'more' (not declared on {t}, and a type that should \
+             ignore keys it does not declare ends with `..`); value: missing required field 'id'; \
+             .n: expected Number, got String; .user: unknown field 'nick' (not declared on {user}, and \
+             a type that should ignore keys it does not declare ends with `..`); .user: missing \
+             required fields 'email' and 'name'"
+        )
+    );
+    let e = ty("List[{ a: String }]").validate_value(&json!([{}, {}])).unwrap_err();
+    assert_eq!(e, "[0]: missing required field 'a'");
+
+    let e = ty("{ a: Number, b: Number, c: Number }")
+        .cast_requested(&json!({ "a": "1", "x": 1 }))
+        .unwrap_err();
+    assert!(e.contains("unknown field 'x'") && e.contains("missing required fields 'b' and 'c'"), "{e}");
+}
+
+/// A cast names each problem of a nested record under the field it sits
+/// in, and a named type under its name, so none reads as the outer
+/// record's own.
+#[test]
+fn a_cast_names_each_nested_problem_under_its_field() {
+    use serde_json::json;
+    let inner = ty("{ x: Number, y: Number }");
+    let e = ty("{ a: { x: Number, y: Number }, b: Number }")
+        .cast_value(&json!({ "a": { "z": 1 }, "b": "no" }))
+        .unwrap_err();
+    assert_eq!(
+        e,
+        format!(
+            "field 'a': unknown field 'z' (not declared on {inner}, and a type that should ignore \
+             keys it does not declare ends with `..`); field 'a': missing required fields 'x' and \
+             'y'; field 'b': \"no\" is not a number"
+        )
+    );
+    let e = reg_parse("{ m: ChatMessage }")
+        .cast_value(&json!({ "m": { "role": [1], "zz": 1 } }))
+        .unwrap_err();
+    let problems: Vec<&str> = e.split("; ").collect();
+    assert_eq!(problems.len(), 3, "{e}");
+    assert!(problems[0].starts_with("field 'm': not a valid ChatMessage: unknown field 'zz'"), "{e}");
+    assert_eq!(problems[1], "field 'm': not a valid ChatMessage: missing required field 'content'");
+    assert!(problems[2].starts_with("field 'm': not a valid ChatMessage: field 'role': "), "{e}");
+
+    // A list names the item, a dict the (escaped) key, each problem under it.
+    let item = ty("{ x: Number }");
+    let e = ty("List[{ x: Number }]").cast_value(&json!([{ "x": 1 }, { "x": "no", "z": 1 }])).unwrap_err();
+    assert_eq!(
+        e,
+        format!(
+            "item 1: unknown field 'z' (not declared on {item}, and a type that should ignore keys \
+             it does not declare ends with `..`); item 1: field 'x': \"no\" is not a number"
+        )
+    );
+    let e = ty("Dict[String, Number]").cast_value(&json!({ "a\"b": "no" })).unwrap_err();
+    assert_eq!(e, r#"key 'a\"b': "no" is not a number"#);
+}
+
+/// A union of records takes a value only its second member fits, and a
+/// value only one member could have meant is refused with all of that
+/// member's problems.
+#[test]
+fn a_union_of_records_takes_the_member_that_fits_and_names_the_one_candidate() {
+    use serde_json::json;
+    let records = ty("{ a: String } | { b: Number }");
+    records.validate_value(&json!({ "b": 1 })).expect("the second member takes it");
+    assert!(records.accepts_runtime_value(&json!({ "b": 1 })));
+    assert!(!records.accepts_runtime_value(&json!({ "b": "x" })));
+
+    let member = ty("{ a: String, b: Number }");
+    let union = ty("String | { a: String, b: Number }");
+    union.validate_value(&json!({ "a": "x", "b": 1 })).expect("the record member takes it");
+    let e = union.validate_value(&json!({ "b": "x", "c": 1 })).unwrap_err();
+    assert_eq!(
+        e,
+        format!(
+            "value: unknown field 'c' (not declared on {member}, and a type that should ignore keys \
+             it does not declare ends with `..`); value: missing required field 'a'; .b: expected \
+             Number, got String"
+        )
+    );
+}
+
+/// A record names at most 20 undeclared keys and counts the rest, and
+/// spells each key escaped, since the sender wrote it.
+#[test]
+fn unknown_keys_are_capped_and_escaped() {
+    use serde_json::json;
+    let t = ty("{ a?: String }");
+    let mut value = serde_json::Map::new();
+    for i in 0..25 {
+        value.insert(format!("k{i:02}"), json!(1));
+    }
+    let e = t.validate_value(&serde_json::Value::Object(value)).unwrap_err();
+    let named: Vec<String> = (0..20).map(|i| format!("'k{i:02}'")).collect();
+    assert_eq!(
+        e,
+        format!(
+            "value: unknown fields {} and 5 more (not declared on {t}, and a type that should ignore \
+             keys it does not declare ends with `..`)",
+            named.join(", ")
+        )
+    );
+
+    let e = t.validate_value(&json!({ "it's\nhere": 1 })).unwrap_err();
+    assert!(e.contains(r"unknown field 'it\'s\nhere'"), "{e}");
+    assert!(!e.contains('\n'), "{e}");
+    let e = t.cast_value(&json!({ "it's\nhere": 1 })).unwrap_err();
+    assert!(e.contains(r"unknown field 'it\'s\nhere'"), "{e}");
 }
 
 #[test]
@@ -2215,7 +2339,7 @@ fn conform_value_drops_what_an_open_record_does_not_declare_at_any_depth() {
     let e = nested
         .conform_value(json!({ "id": 1, "extra": true, "user": { "email": "a" } }))
         .unwrap_err();
-    assert!(e.contains("unknown field \"extra\""), "the closed parent still refuses: {e}");
+    assert!(e.contains("unknown field 'extra'"), "the closed parent still refuses: {e}");
 
     let closed = ty("{ a: String, b?: Number }");
     let value = json!({ "a": "x", "b": null });
@@ -2396,7 +2520,7 @@ fn an_unresolved_leaf_takes_any_value_inside_a_checked_shape() {
     assert!(ty("{ x: T }").conform_value(json!({ "x": 1, "y": 2 })).is_err());
 
     let e = ty("{ score: Number }").conform_value(json!({})).unwrap_err();
-    assert!(e.contains("missing required field \"score\""), "{e}");
+    assert!(e.contains("missing required field 'score'"), "{e}");
 }
 
 // ── Json ─────────────────────────────────────────────────────────────
@@ -2521,7 +2645,7 @@ fn a_cast_narrows_json_and_checks_the_value() {
     let e = record.cast_requested(&json!([1, 2])).unwrap_err();
     assert!(e.contains("no cast from List"), "{e}");
     let e = record.cast_requested(&json!({ "n": 1 })).unwrap_err();
-    assert!(e.contains("missing required field \"id\""), "{e}");
+    assert!(e.contains("missing required field 'id'"), "{e}");
     assert_eq!(ty("List[List[Number]]").cast_requested(&json!([[1], [2, 3]])).unwrap(), json!([[1], [2, 3]]));
     assert!(ty("JsonDict").cast_requested(&json!([1])).is_err(), "a list is no object");
     // Into Json itself, any JSON value passes; a stored file does not.
@@ -2675,4 +2799,75 @@ fn a_record_holding_a_secret_narrows_an_object_output() {
     let record = WeftType::parse("{ token: Secret[String], expiresAt: Number }").unwrap();
     assert!(WeftType::fits_within(&record, &WeftType::JsonDict));
     assert!(!WeftType::is_compatible(&record, &WeftType::JsonDict));
+}
+
+/// `Access[service]` parses like `List[T]` and prints back the same; a
+/// service is named the way a recipe names it, and anything else is
+/// refused at parse.
+#[test]
+fn access_names_its_service_and_round_trips() {
+    for text in ["Access", "Access[fal]", "Access[google_drive]", "Access[openai] | Access[anthropic]", "List[Access[s3]]"] {
+        assert_eq!(WeftType::parse(text).expect(text).to_string(), text);
+    }
+    assert_eq!(WeftType::parse("Access[fal]").unwrap(), WeftType::Access(Some("fal".into())));
+    assert_eq!(WeftType::parse("Access").unwrap(), WeftType::Access(None));
+    assert_ne!(WeftType::parse("Access[fal]").unwrap(), WeftType::Access(None));
+    for bad in ["Access[]", "Access[Fal]", "Access[String]", "Access[a-b]", "Access[a, b]"] {
+        let e = WeftType::try_parse(bad).unwrap_err();
+        assert!(e.contains("takes a service's name"), "{bad}: {e}");
+    }
+}
+
+/// `Access[fal]` fits `Access[fal]` and bare `Access`; bare `Access`
+/// fits only bare `Access`; a union of services fits only a port taking
+/// each of them.
+#[test]
+fn an_access_fits_only_a_port_naming_its_service() {
+    let fits = |source: &str, target: &str| {
+        WeftType::is_compatible(&WeftType::parse(source).unwrap(), &WeftType::parse(target).unwrap())
+    };
+    let table = [
+        ("Access[fal]", "Access[fal]", true),
+        ("Access[fal]", "Access", true),
+        ("Access", "Access", true),
+        ("Access", "Access[fal]", false),
+        ("Access[slack]", "Access[fal]", false),
+        ("Access[a]", "Access[a] | Access[b]", true),
+        ("Access", "Access[a] | Access[b]", false),
+        ("Access[a] | Access[b]", "Access[a] | Access[b]", true),
+        ("Access[a] | Access[b]", "Access", true),
+        ("Access[a] | Access[b]", "Access[a]", false),
+        ("Access[a]", "JsonDict", false),
+        ("Access[a]", "Json", false),
+    ];
+    for (source, target, want) in table {
+        assert_eq!(fits(source, target), want, "{source} into {target}");
+    }
+}
+
+/// A value's type reads the service off its marker, and a value is held
+/// to the service its type names.
+#[test]
+fn an_access_value_is_typed_and_held_by_its_service() {
+    let fal = crate::access::Access::new("conn-1", "fal", None).to_value();
+    assert_eq!(WeftType::infer(&fal), WeftType::Access(Some("fal".into())));
+    assert_eq!(WeftType::infer(&serde_json::json!({ "__weft_access__": {} })), WeftType::Access(None));
+    assert!(WeftType::parse("Access[fal]").unwrap().validate_value(&fal).is_ok());
+    assert!(WeftType::parse("Access").unwrap().validate_value(&fal).is_ok());
+    assert!(WeftType::parse("Access[openai] | Access[fal]").unwrap().validate_value(&fal).is_ok());
+    let e = WeftType::parse("Access[slack]").unwrap().validate_value(&fal).unwrap_err();
+    assert!(e.contains("expected Access[slack], got Access[fal]"), "{e}");
+    assert!(WeftType::parse("Access[slack]").unwrap().validate_value(&serde_json::json!({ "a": 1 })).is_err());
+}
+
+/// A node's connection inputs: an `Access`, an `Access[x]`, or a union of
+/// those, and nothing else.
+#[test]
+fn is_access_reads_bare_named_and_unions() {
+    for yes in ["Access", "Access[fal]", "Access[a] | Access[b]"] {
+        assert!(WeftType::parse(yes).unwrap().is_access(), "{yes}");
+    }
+    for no in ["String", "Access[a] | String", "List[Access]"] {
+        assert!(!WeftType::parse(no).unwrap().is_access(), "{no}");
+    }
 }

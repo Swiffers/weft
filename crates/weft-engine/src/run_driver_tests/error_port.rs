@@ -6,7 +6,7 @@
     //! catch applying to that failure.
 
     use super::*;
-    use super::engine_test_rig::{catalog, drive, drive_journal, test_manifest};
+    use super::engine_test_rig::{catalog, drive, drive_journal, drive_journal_lost, test_manifest};
     use async_trait::async_trait;
     use serde_json::json;
     use weft_core::error::{WeftError, WeftResult};
@@ -234,6 +234,29 @@
         assert_eq!(starts, 1, "only the dead worker's start: {events:?}");
     }
 
+    /// The worker that died in the node went away with its memory nearly
+    /// full, and its claim says so: the failure says it ran out of memory
+    /// and which lever raises it. A worker that left no note only went
+    /// away.
+    #[tokio::test]
+    async fn a_node_the_worker_ran_out_of_memory_in_says_so() {
+        let note = weft_broker_client::protocol::MemoryNote { used_bytes: 966 << 20, limit_bytes: 1 << 30, at_unix: 101 };
+        let project = project("NeverAgain", false);
+        let run_id = uuid::Uuid::new_v4();
+        let rows = crashed_rows(&project, run_id);
+        let (outcome, events) = drive_journal_lost(project.clone(), nodes(), run_id, rows.clone(), Some(note)).await;
+        assert!(matches!(outcome.expect("the drive runs"), RunOutcome::Failed { .. }));
+        let error = failed(&events, "node").expect("the node is failed");
+        assert!(
+            error.starts_with("the worker running 'node' ran out of memory while it was running (it was at 94% of its 1Gi); raise it with `weft workers set --memory`"),
+            "{error}"
+        );
+        assert!(error.contains("not run again"), "{error}");
+
+        let (_, events) = drive_journal_lost(project, nodes(), run_id, rows, None).await;
+        assert!(failed(&events, "node").is_some_and(|e| e.contains("went away while it was running")), "{events:?}");
+    }
+
     /// A run's birth and its kick, with how it is kept: what the next
     /// worker reads when the node's own rows never landed.
     fn kicked_rows(project: &ProjectDefinition, run_id: RunId, settings: weft_core::run_settings::RunSettings) -> Vec<RunEvent> {
@@ -384,11 +407,12 @@
         }
     }
 
-    /// What a [`Reader`] read off its bus, and how the bus ended.
-    type ReadBack = Arc<StdMutex<Option<(Vec<serde_json::Value>, Option<weft_core::bus::StreamEnd>)>>>;
+    /// What a [`Reader`] read off its bus, and the failure its last read
+    /// handed back (`None` once the bus finished).
+    type ReadBack = Arc<StdMutex<Option<(Vec<serde_json::Value>, Option<String>)>>>;
 
     /// Reads the bus on `bus` from the start, as a stream to a caller
-    /// does, and keeps what it read and how the bus ended.
+    /// does, and keeps what it read and what its last read said.
     struct Reader {
         read: ReadBack,
     }
@@ -396,15 +420,22 @@
     #[async_trait]
     impl Node for Reader {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(()).await?;
             let bus = ctx.bus_from_input("bus")?;
-            let mut cursor = bus.cursor_from_start();
+            let mut cursor = bus.cursor_from_start()?;
             let mut pieces = Vec::new();
-            while let Some(entry) = cursor.next().await {
-                if let weft_core::bus::BusEntryKind::Message { payload: Some(payload), .. } = entry.kind {
-                    pieces.push(payload.into_json().expect("a json bus"));
+            let failure = loop {
+                match cursor.next(&mut state).await {
+                    Ok(Some(entry)) => {
+                        if let weft_core::bus::BusEntryKind::Message { .. } = entry.kind {
+                            pieces.push(entry.as_json().expect("a json message").1.clone());
+                        }
+                    }
+                    Ok(None) => break None,
+                    Err(e) => break Some(e.to_string()),
                 }
-            }
-            *self.read.lock().unwrap() = Some((pieces, bus.end()));
+            };
+            *self.read.lock().unwrap() = Some((pieces, failure));
             Ok(())
         }
     }
@@ -471,7 +502,7 @@
 
     /// Once the bus is open, a failure is not caught, even with `_error`
     /// wired: the node fails, the bus ends failed with its error, and the
-    /// reader reads what was sent, then that end.
+    /// reader reads what was sent, then that error.
     #[tokio::test]
     async fn a_failure_after_the_first_piece_fails_the_node_and_ends_the_bus_failed() {
         let (project, nodes, read) = streaming(Streamer { pieces: 3, fail_at: Some(1) });
@@ -480,12 +511,9 @@
         assert!(failed(&events, "node").is_some_and(|e| e.contains("mid-answer")), "{events:?}");
         assert!(error_value(&events).is_none(), "nothing caught once the bus opened");
         assert!(skipped(&events, "handler"), "{events:?}");
-        let (pieces, end) = read.lock().unwrap().clone().expect("the reader ran");
+        let (pieces, failure) = read.lock().unwrap().clone().expect("the reader ran");
         assert_eq!(pieces, vec![json!(0)]);
-        assert!(
-            matches!(&end, Some(weft_core::bus::StreamEnd::Failed { error }) if error.contains("mid-answer")),
-            "{end:?}"
-        );
+        assert!(failure.as_deref().is_some_and(|why| why.contains("mid-answer")), "{failure:?}");
         assert!(
             events.iter().any(|e| matches!(e, RunEvent::BusClosed { end: weft_core::bus::StreamEnd::Failed { .. }, .. })),
             "the record says how the bus ended: {events:?}"
@@ -498,9 +526,9 @@
         let (project, nodes, read) = streaming(Streamer { pieces: 2, fail_at: None });
         let (outcome, _events) = drive(project, nodes, &["node"]).await;
         assert!(matches!(outcome, RunOutcome::Completed), "{outcome:?}");
-        let (pieces, end) = read.lock().unwrap().clone().expect("the reader ran");
+        let (pieces, failure) = read.lock().unwrap().clone().expect("the reader ran");
         assert_eq!(pieces, vec![json!(0), json!(1)]);
-        assert_eq!(end, Some(weft_core::bus::StreamEnd::Finished));
+        assert_eq!(failure, None);
     }
 
     /// Yields one item on its `Generator` output `rows`, then fails.
@@ -521,8 +549,9 @@
     #[async_trait]
     impl Node for Puller {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            let mut state = ctx.keep(()).await?;
             let rows = ctx.inputs.get::<weft_core::Generator<i64>>("rows")?;
-            while rows.next().await?.is_some() {}
+            while rows.next(&mut state).await?.is_some() {}
             Ok(())
         }
     }

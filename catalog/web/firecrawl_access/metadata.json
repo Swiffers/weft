@@ -18,11 +18,22 @@
     ],
     "acquisition": {
       "kind": "static",
-      "fields": [
+      "ways": [
         {
-          "name": "key",
-          "label": "API key",
-          "placeholder": "fc-..."
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "fc-..."
+            }
+          ],
+          "guide": {
+            "link": "https://www.firecrawl.dev/app/api-keys",
+            "steps": [
+              "Open firecrawl.dev, sign in, and create an API key.",
+              "Paste it below and name the connection."
+            ]
+          }
         }
       ]
     },
@@ -40,21 +51,12 @@
     "verification": {
       "rung": "reports_validity",
       "cost": "free"
-    },
-    "ownPage": {
-      "guide": {
-        "link": "https://www.firecrawl.dev/app/api-keys",
-        "steps": [
-          "Open firecrawl.dev, sign in, and create an API key.",
-          "Paste it below and name the connection."
-        ]
-      }
     }
   },
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[firecrawl]",
       "widget": {
         "kind": "access"
       },
@@ -64,7 +66,7 @@
   "outputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[firecrawl]",
       "description": "Wire into Fetch Page or Crawl Site."
     }
   ]

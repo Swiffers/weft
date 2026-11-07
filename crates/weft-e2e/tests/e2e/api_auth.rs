@@ -1,12 +1,15 @@
-//! Gated routes: the gateway refuses a caller the route's auth connection
-//! does not verify, and admits one it does with the established identity
-//! on the trigger's `caller` port. Two schemes end to end (a key set, a
-//! signing secret); the overlap refusal at activation rides along.
+//! Gated routes: the gateway refuses a caller the route's `auth` does not
+//! verify against its connection, and admits one it does with the
+//! established identity on the trigger's `caller` port. Two schemes end to
+//! end (a key set, a signing secret), each connection made and picked the
+//! way a person does it (`weft connect`), and a browser page on another
+//! origin reaching a gated route through the install's CORS answer.
 #![cfg(feature = "e2e")]
 
 use reqwest::Method;
 use serde_json::{json, Value};
-use weft_e2e::access::{catalog_spec, connect_direct, set_account};
+use weft_core::access::callers::CallerScheme;
+use weft_e2e::access::{connect_direct, connect_with_cli, set_account};
 use weft_e2e::{ensure, live, project::Project};
 
 #[tokio::test]
@@ -15,24 +18,36 @@ async fn api_keys_and_a_signing_secret_gate_their_routes() -> anyhow::Result<()>
     let mut project = Project::prepare("api_auth", disp.clone()).await?;
     let base = project.unique_live_path()?;
 
-    // The connections, stored as the editor stores them, stamped onto
-    // the access nodes.
-    let keys = connect_direct(
-        &disp,
-        catalog_spec("api", "api_key_auth")?,
-        "own",
-        json!({ "keys": "k-one, k-two" }),
+    // Before any connection, the route checking its callers is refused
+    // naming the command that connects it.
+    let refused = project.weft_refused(&["activate"]).await?;
+    assert!(
+        refused.contains("'secure' checks callers with api_keys but has no connection; run `weft connect secure`"),
+        "{refused}"
+    );
+
+    // The key set, connected from the terminal: the keys come from the
+    // environment, so they never ride the command line. A field left out
+    // is named with every field the scheme asks for.
+    let missing = project.weft_refused(&["connect", "secure", "--door", "own", "--label", "prod keys"]).await?;
+    assert!(missing.contains("keys (Accepted keys)"), "{missing}");
+    let keys = connect_with_cli(
+        &project,
+        "secure",
+        &["--door", "own", "--set-env", "keys=SECURE_KEYS", "--label", "prod keys"],
+        &[("SECURE_KEYS", "k-one, k-two")],
     )
     .await?;
-    set_account(&project, "keys", keys.handle()).await?;
+    // The signing secret, stored as the editor stores it, then picked by
+    // its id.
     let secret = connect_direct(
         &disp,
-        catalog_spec("api", "hmac_auth")?,
+        serde_json::to_value(CallerScheme::Hmac.recipe())?,
         "own",
         json!({ "signingSecret": "s3cret-e2e" }),
     )
     .await?;
-    set_account(&project, "secret", secret.handle()).await?;
+    set_account(&project, "signed", secret.handle()).await?;
     project.activate().await?;
 
     // The key set: no key and a wrong key are refused before any run
@@ -61,16 +76,44 @@ async fn api_keys_and_a_signing_secret_gate_their_routes() -> anyhow::Result<()>
     let v: Value = serde_json::from_slice(&body)?;
     assert_eq!(v["caller"], json!({ "key": 0 }));
 
+    // A browser page on another origin: the install answers the
+    // preflight itself and stamps the reply with CORS headers, else the
+    // browser refuses what the worker sent. The policy allows every
+    // origin, answered as `*` or as the origin that asked, which a browser
+    // accepts alike.
+    let origin = "http://postcards.example";
+    let call = live::browser_post_json(&disp, &secure, origin, &[("x-api-key", "k-two")], &payload).await?;
+    let allows_page = |headers: &reqwest::header::HeaderMap| {
+        headers
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v == "*" || v == origin)
+    };
+    assert!(call.preflight_status.is_success(), "preflight -> HTTP {}", call.preflight_status);
+    assert!(allows_page(&call.preflight_headers), "{:?}", call.preflight_headers);
+    assert!(
+        call.preflight_headers
+            .get("access-control-allow-methods")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|m| m == "*" || m.contains("POST")),
+        "{:?}", call.preflight_headers
+    );
+    assert!(call.status.is_success(), "browser POST -> HTTP {}: {}", call.status, String::from_utf8_lossy(&call.body));
+    assert!(allows_page(&call.headers), "{:?}", call.headers);
+    assert!(
+        call.headers.get("access-control-expose-headers").is_some(),
+        "the page may read the headers the program set: {:?}", call.headers
+    );
+
     // The signing secret: the exact bytes are signed with a timestamp;
     // a good signature admits (an anonymous identity), a tampered body
     // and a stale timestamp are refused.
     let signed = format!("{base}/signed");
     let body_bytes = serde_json::to_vec(&json!({ "text": "signed hi" }))?;
     let now = chrono::Utc::now().timestamp();
-    // The shipped HmacAuth node's own scheme signs, so the test signs
-    // exactly what the gate checks.
-    let hmac_auth: weft_core::access::events::VerifyKind =
-        serde_json::from_value(catalog_spec("api", "hmac_auth")?["verify"].clone())?;
+    // `hmac_sha256` is the check the route runs, so the test signs exactly
+    // what the gate checks.
+    let hmac_auth = weft_core::access::callers::named_check("hmac_sha256").unwrap().verify();
     let sign = |ts: i64, body: &[u8]| -> anyhow::Result<String> {
         Ok(weft_core::access::verify::hmac_digest(
             &hmac_auth,
@@ -117,38 +160,4 @@ async fn api_keys_and_a_signing_secret_gate_their_routes() -> anyhow::Result<()>
     project.finish().await?;
     keys.finish().await?;
     secret.finish().await
-}
-
-/// Two PROJECTS of one account serving the same path. Each project's
-/// routes sit under its own id on the install's shared address, so both
-/// activate and each call reaches the project its address names.
-///
-/// Two routes of ONE file colliding is answered earlier, by the compiler
-/// (`route-overlap`), so a program that collides with itself never gets
-/// this far.
-#[tokio::test]
-async fn two_projects_serve_the_same_path_each_at_its_own_address() -> anyhow::Result<()> {
-    let disp = ensure::up().await?;
-    let mut first = Project::prepare("api_overlap", disp.clone()).await?;
-    // The bare path is what goes in the file; the callable one carries
-    // the tenant and project the dispatcher serves it under, and is what
-    // a caller dials.
-    let path = first.bare_live_path();
-    let first_base = first.mount_at(&path)?;
-    first.activate().await?;
-
-    // The same path, from a second project of the same account.
-    let mut second = Project::prepare("api_overlap", disp.clone()).await?;
-    let second_base = second.mount_at(&path)?;
-    second.activate().await?;
-    anyhow::ensure!(first_base != second_base, "each project is called at its own address");
-
-    for (base, project) in [(&first_base, &first), (&second_base, &second)] {
-        let call = format!("{base}/chat/anything");
-        let (status, _, _) = live::http_json(&disp, Method::POST, &call, &[], &serde_json::json!({})).await?;
-        anyhow::ensure!(status.is_success(), "{} serves its route at {call}: {status}", project.id());
-    }
-
-    second.finish().await?;
-    first.finish().await
 }

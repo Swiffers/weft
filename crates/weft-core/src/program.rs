@@ -62,34 +62,49 @@ impl ProgramCall {
         }
     }
 
-    /// The name the call is journaled under (`ctx.run`), so a replayed
-    /// run gets the recorded answer instead of asking again.
-    pub fn journal_name(&self) -> &'static str {
+    /// The call's name: the dispatcher's action it is carried to, and
+    /// what its errors start with.
+    pub fn name(&self) -> &'static str {
         match self {
-            ProgramCall::Infra(call) => call.journal_name(),
-            ProgramCall::Triggers(call) => call.journal_name(),
-            ProgramCall::Instances(call) => call.journal_name(),
-            ProgramCall::Runs(call) => call.journal_name(),
-            ProgramCall::Versions(call) => call.journal_name(),
-            ProgramCall::Project(call) => call.journal_name(),
-            ProgramCall::Settings(call) => call.journal_name(),
+            ProgramCall::Infra(call) => call.name(),
+            ProgramCall::Triggers(call) => call.name(),
+            ProgramCall::Instances(call) => call.name(),
+            ProgramCall::Runs(call) => call.name(),
+            ProgramCall::Versions(call) => call.name(),
+            ProgramCall::Project(call) => call.name(),
+            ProgramCall::Settings(call) => call.name(),
         }
     }
 
-    /// Every call's journal name, area by area: what the dispatcher's list
+    /// Every call's name, area by area: what the dispatcher's list
     /// of actions is held to (`weft_dispatcher::actions::NAMES`).
-    pub fn journal_names() -> Vec<&'static str> {
+    pub fn names() -> Vec<&'static str> {
         [
-            infra::InfraCall::JOURNAL_NAMES,
-            triggers::TriggerCall::JOURNAL_NAMES,
-            instances::InstanceCall::JOURNAL_NAMES,
-            runs::RunCall::JOURNAL_NAMES,
-            versions::VersionCall::JOURNAL_NAMES,
-            project::ProjectCall::JOURNAL_NAMES,
-            settings::SettingsCall::JOURNAL_NAMES,
+            infra::InfraCall::NAMES,
+            triggers::TriggerCall::NAMES,
+            instances::InstanceCall::NAMES,
+            runs::RunCall::NAMES,
+            versions::VersionCall::NAMES,
+            project::ProjectCall::NAMES,
+            settings::SettingsCall::NAMES,
         ]
         .concat()
     }
+}
+
+/// Namespace of program calls' ids: generated once and frozen.
+const PROGRAM_CALL_NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(0x5e1f_93c2_7a0d_4b6e_9f24_c8a1_3d7b_e092);
+
+/// The id of the call a run makes at `step`, the place in the run that
+/// makes it (the run, its node, the node's loop frames, the call's
+/// program-call number there and a digest of the call itself, as the
+/// worker spells them in the call's task's dedup key, which a resumed body
+/// making the same call reaches again): the same however often the call is
+/// issued again, so what the call makes (a run it starts) is made once.
+/// Derived by the install from the task's own key, never taken from what
+/// the worker says.
+pub fn program_call_id(step: &str) -> uuid::Uuid {
+    uuid::Uuid::new_v5(&PROGRAM_CALL_NAMESPACE, step.as_bytes())
 }
 
 /// The durable task that carries a [`ProgramCall`]: who asked, what
@@ -341,13 +356,18 @@ pub struct RunFilter {
 crate::wire_enum! {
     /// Where one node of a run stands ([`NodeState::status`]).
     // SYNC: NodeStatus <-> catalog/logic/get_node_state/metadata.json (the `state` output's description)
+    // SYNC: NodeStatus <-> packages/weft-graph/src/protocol.ts NodeFiringStatus
     pub enum NodeStatus {
         /// It has not fired in this run (yet).
         Pending = "pending",
         Running = "running",
-        /// It is waiting on a signal (`ctx.await_signal`): an outside job,
+        /// It is waiting on a signal (`state.wait`): an outside job,
         /// a person, a timer.
         Waiting = "waiting",
+        /// It has no wait of its own: its whole run paused while it was
+        /// inside it (a bus read, a stream pull), and it carries on when
+        /// the run does.
+        Paused = "paused",
         Completed = "completed",
         Failed = "failed",
         Skipped = "skipped",
@@ -850,6 +870,15 @@ mod tests {
         let other = ProgramCallPayload { project: Some(uuid::Uuid::from_u128(7)), ..own };
         let back: ProgramCallPayload = serde_json::from_value(serde_json::to_value(&other).unwrap()).unwrap();
         assert_eq!(back, other);
+    }
+
+    /// A call issued again at the same place of the same run is the same
+    /// call; any other place is another.
+    #[test]
+    fn a_call_is_named_after_the_place_that_makes_it() {
+        assert_eq!(program_call_id("program_call/r1/n/f/0"), program_call_id("program_call/r1/n/f/0"));
+        assert_ne!(program_call_id("program_call/r1/n/f/0"), program_call_id("program_call/r1/n/f/1"));
+        assert_ne!(program_call_id("program_call/r1/n/f/0"), program_call_id("program_call/r2/n/f/0"));
     }
 
     #[test]

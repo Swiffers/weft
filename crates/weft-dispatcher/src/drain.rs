@@ -97,6 +97,12 @@ pub async fn drain(
     let mut heard = state.signals.subscribe();
     loop {
         let reached = Reached::now(state, scope).await?;
+        // Watched before counted: a run that ends after the mark announces
+        // its ending, which the subscription above hears; one that ended
+        // before it is no longer going when counted. Marked after the
+        // count, a run that ended in between was counted, never announced,
+        // and waited on for good.
+        mark_watched(&state.pg_pool, scope.project_id, &reached.all_runs()).await?;
         let left = going(&state.pg_pool, scope.project_id, &reached.door, &reached.all_runs()).await?;
         if left == 0 {
             return Ok(());
@@ -105,7 +111,6 @@ pub async fn drain(
             say.going(going_since(&state.pg_pool, &reached.all_runs()).await?).await?;
         }
         let now = Instant::now();
-        mark_watched(&state.pg_pool, scope.project_id, &reached.all_runs()).await?;
         let look = workers_look(&state.pg_pool, scope.project_id, &reached.door, &reached.all_runs())
             .await?
             .map(|at| now + Duration::from_secs((at + 1 - crate::lease::now_unix()).max(1).unsigned_abs()));
@@ -257,14 +262,11 @@ impl Reached {
             Reaching::Fired { keys, tokens } => return Self::fired(state, scope.project_id, keys, tokens).await,
             Reaching::Builds(builds) => return Self::on_builds(state, scope.project_id, builds).await,
         };
-        let project = state
-            .projects
-            .project(scope.project_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("project {} is gone", scope.project_id))?;
+        let registered = state.registered(scope.project_id).await?.ok_or_else(|| anyhow::anyhow!("project {} is gone", scope.project_id))?;
+        let cuts = state.trigger_cuts(scope.project_id, &registered).await?;
         let activations = state.activations.list(scope.project_id).await?;
         let keys: Vec<weft_core::activation::ActivationKey> =
-            crate::infra_reach::activations_reached(reach, &activations, &project).into_iter().map(|a| a.key.clone()).collect();
+            crate::infra_reach::activations_reached(reach, &activations, &cuts).into_iter().map(|a| a.key.clone()).collect();
         let mut tokens = crate::store::postgres::entry_tokens(&state.pg_pool, scope.project_id, &keys).await?;
         tokens.extend(taken_down.iter().cloned());
         tokens.sort();

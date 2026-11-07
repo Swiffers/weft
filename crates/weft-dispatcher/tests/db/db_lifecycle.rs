@@ -137,7 +137,7 @@ fn entry_signal(token: &str, project_id: Uuid) -> SignalRegistration {
         run_id: None,
         node_id: "feed".to_string(),
         is_resume: false,
-        spec_json: "{}".to_string(),
+        spec_json: r#"{"kind":"form"}"#.to_string(),
         consumer_kind: None,
         tags: Vec::new(),
         consumer_payload: None,
@@ -223,7 +223,7 @@ async fn pruning_a_source_waits_for_setup_and_removes_its_unused_bake(pool: Pool
     let bake = weft_dispatcher::store::TriggerBake::from_events(&[birth, complete], &setup_program()).unwrap().unwrap();
     store.finish_trigger_setup(run_id, Some(&bake)).await.unwrap();
     versions.delete_versions(id, &["source".into()]).await.unwrap();
-    assert!(store.trigger_bakes(id, None).await.unwrap().is_empty());
+    assert!(store.trigger_bakes(id, None).await.unwrap().read.is_empty());
     assert!(versions.version(id, "source").await.unwrap().is_none());
 }
 
@@ -249,12 +249,28 @@ async fn a_fresh_capture_replaces_a_prior_bake_that_no_longer_reads(pool: Pool) 
     )
     .await
     .unwrap();
-    assert!(store.trigger_bakes(id, None).await.is_err(), "the prior bake does not read");
+    // Another program's bake, which reads, beside it.
+    let mut elsewhere = bake.clone();
+    elsewhere.program.binary_hash = "bin-B".into();
+    pool.execute(
+        "INSERT INTO trigger_bake (project_id, instance_id, program_hash, bake_json, bake_json_version, source_version) \
+         VALUES ($1, NULL, $2, $3, $4, 'source')",
+        &[&id, &elsewhere.program.digest(), &serde_json::to_string(&elsewhere).unwrap(), &weft_dispatcher::store::TriggerBake::STORED.version()],
+    )
+    .await
+    .unwrap();
+    let before = store.trigger_bakes(id, None).await.unwrap();
+    assert_eq!(before.read.len(), 1, "the row that reads is read past the one that does not");
+    assert_eq!(before.read[0].program, elsewhere.program);
+    let unreadable = before.unreadable_for(&bake.program).expect("read past, and named");
+    assert!(unreadable.error.contains(&weft_dispatcher::store::TriggerBake::row(id, None, &bake.program.digest())), "{}", unreadable.error);
     assert!(store.is_trigger_setup_pending(run_id).await.unwrap());
     let lost = store.finish_trigger_setup(run_id, Some(&bake)).await.unwrap().expect("the prior did not read");
     assert!(lost.error.contains(&weft_dispatcher::store::TriggerBake::row(id, None, &bake.program.digest())), "{}", lost.error);
     assert!(!store.is_trigger_setup_pending(run_id).await.unwrap(), "the setup landed");
     let saved = store.trigger_bakes(id, None).await.unwrap();
+    assert!(saved.unreadable.is_empty());
+    let saved: Vec<_> = saved.read.into_iter().filter(|saved| saved.program == bake.program).collect();
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0].run_id, run_id, "the fresh capture replaced the prior");
 }
@@ -1100,12 +1116,46 @@ async fn trigger_bake_ownership_publication_and_project_cleanup(pool: Pool) {
     activations.end_activating(id, second, &ActivationLifecycle::active(), false, None).await.unwrap();
     assert!(store.signal_insert(&entry).await.is_err(), "no late registration after activation ends");
     store.finish_trigger_setup(second, None).await.unwrap();
-    assert_eq!(store.trigger_bakes(id, None).await.unwrap()[0].run_id, first);
+    assert_eq!(store.trigger_bakes(id, None).await.unwrap().read[0].run_id, first);
     store.delete_run(first).await.unwrap();
-    assert_eq!(store.trigger_bakes(id, None).await.unwrap()[0].run_id, first);
-    assert!(store.trigger_bakes(Uuid::new_v4(), None).await.unwrap().is_empty());
+    assert_eq!(store.trigger_bakes(id, None).await.unwrap().read[0].run_id, first);
+    assert!(store.trigger_bakes(Uuid::new_v4(), None).await.unwrap().read.is_empty());
     projects.remove(id).await.unwrap();
-    assert!(store.trigger_bakes(id, None).await.unwrap().is_empty());
+    assert!(store.trigger_bakes(id, None).await.unwrap().read.is_empty());
+}
+
+/// A run's files go with its record, never with its end: ending a run
+/// queues nothing, and each way its record is deleted (a clean of the
+/// run, its keep running out, its project removed) queues its files for
+/// the broker to delete.
+#[weft_db_macros::test]
+async fn a_runs_files_are_queued_when_its_record_goes_not_when_it_ends(pool: Pool) {
+    let (store, projects) = setup(&pool).await;
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    let queued = |run: weft_core::RunId| {
+        let pool = pool.clone();
+        async move { pool.scalar::<i64>("SELECT COUNT(*) FROM storage_sweep WHERE run_id = $1", &[&run]).await.unwrap() }
+    };
+    let [cleaned, expired, removed] = [(); 3].map(|_| weft_core::new_run_id());
+    for run in [cleaned, expired, removed] {
+        assert!(queue(&store, &[birth(run, id, weft_core::context::Phase::Fire, "bin-A")], false).await.unwrap());
+    }
+    for run in [cleaned, expired, removed] {
+        complete(&store, run).await;
+    }
+    for run in [cleaned, expired, removed] {
+        assert_eq!(queued(run).await, 0, "ending a run leaves its files");
+    }
+    store.delete_run(cleaned).await.unwrap();
+    assert_eq!(queued(cleaned).await, 1, "a clean of the run");
+    pool.execute("UPDATE run SET keep_until = 0 WHERE run_id = $1", &[&expired]).await.unwrap();
+    assert_eq!(store.erase_expired(1, 100).await.unwrap().0, 1);
+    assert_eq!(queued(expired).await, 1, "its keep ran out");
+    projects.remove(id).await.unwrap();
+    assert_eq!(queued(removed).await, 1, "its project removed");
+    let tenant: String = pool.scalar("SELECT tenant_id FROM storage_sweep WHERE run_id = $1", &[&cleaned]).await.unwrap();
+    assert_eq!(tenant, TENANT, "queued under the tenant its files were written under");
 }
 
 /// How many rows of `table` belong to run `run_id`.
@@ -1340,7 +1390,7 @@ async fn a_vouching_workers_runs_are_its_own_until_its_vouch_passes(pool: Pool) 
         async move {
             let in_flight = std::collections::BTreeMap::from([("t1".to_string(), 1u32)]);
             let weft_task_store::db::Json(answer): weft_task_store::db::Json<serde_json::Value> = pool.scalar(
-                "SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::boolean)",
+                "SELECT weft_door_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
                 &[
                     &replica,
                     &id,
@@ -1351,7 +1401,11 @@ async fn a_vouching_workers_runs_are_its_own_until_its_vouch_passes(pool: Pool) 
                     &0i64,
                     &Vec::<String>::new(),
                     &Vec::<i64>::new(),
+                    &Vec::<Option<String>>::new(),
                     &false,
+                    &None::<i64>,
+                    &None::<i64>,
+                    &None::<i64>,
                 ],
             )
             .await
@@ -1469,7 +1523,7 @@ async fn a_cancel_queues_the_last_call_of_each_wait_that_carries_one(pool: Pool)
     assert_eq!(*task_run, Some(run));
     let call: weft_core::signal::listener_protocol::CancelCallRequest = serde_json::from_value(payload.0.clone()).unwrap();
     assert_eq!(call.token, "tok-calling");
-    assert_eq!(call.spec.on_cancel, Some(weft_core::signal::CancelCall::put("https://queue.example/requests/7/cancel")));
+    assert_eq!(call.call, weft_core::signal::CancelCall::put("https://queue.example/requests/7/cancel"));
 
     let again = store.cancel_run(run, None, &weft_core::run::CancelCause::User).await.unwrap();
     assert_eq!((again.removed.len(), again.cancel_calls), (0, 0), "the waits went with the first cancel");
@@ -1765,6 +1819,42 @@ async fn seed_wait(store: &PostgresStore, token: &str, project: Uuid, run_id: we
     store.signal_insert(&wait).await.expect("seed the wait");
 }
 
+/// A wait on the first of several signals has no row of its own, only its
+/// branches: the first branch answered answers the wait, under the wait's
+/// token and saying which branch, and takes every branch down in the same
+/// transaction; another wait of the run stays, and withdrawing it by its
+/// token takes its branches.
+#[weft_db_macros::test]
+async fn a_branch_answers_its_wait_and_takes_its_siblings_down(pool: Pool) {
+    use weft_dispatcher::store::Answered;
+    let (store, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project, "bin-A").await;
+    let run = queued_run(&store, project).await;
+    pool.execute("UPDATE run SET state = 'parked' WHERE run_id = $1", &[&run]).await.unwrap();
+    for (token, wait, branch) in [("w-0", "w", 0), ("w-1", "w", 1), ("v-0", "v", 0)] {
+        let mut sig = entry_signal(token, project);
+        sig.node_id = format!("wait-{token}");
+        sig.is_resume = true;
+        sig.run_id = Some(run);
+        let mut spec = weft_core::primitive::SignalSpec::of_kind("form", json!({}));
+        spec.branch_of = Some(weft_core::signal::first_of::BranchOf { wait: wait.into(), branch });
+        sig.spec_json = serde_json::to_string(&spec).unwrap();
+        store.signal_insert(&sig).await.expect("seed a branch");
+    }
+    let Answered::Reached { consumed } = store.answer("w-1", &weft_core::primitive::WaitAnswer::Given { value: json!("dropped") }).await.unwrap() else {
+        panic!("reached")
+    };
+    let mut gone: Vec<&str> = consumed.iter().map(|s| s.token.as_str()).collect();
+    gone.sort_unstable();
+    assert_eq!(gone, ["w-0", "w-1"], "both branches go with the answer");
+    assert!(matches!(crate::events(store.events_log(run).await.unwrap()).last(),
+        Some(RunEvent::SuspensionResolved { token, value, .. }) if token == "w" && value == &json!({ "branch": 1, "value": "dropped" })));
+    assert!(matches!(store.answer("w-0", &weft_core::primitive::WaitAnswer::Given { value: json!("late") }).await.unwrap(), Answered::Gone), "the loser is gone");
+    let withdrawn = store.signal_withdraw(run, "v").await.unwrap();
+    assert_eq!(withdrawn.iter().map(|s| s.token.as_str()).collect::<Vec<_>>(), ["v-0"], "a wait withdrawn by its token takes its branches");
+}
+
 /// An answer reaches its run once: a run nobody drives gets it in its
 /// record and is queued to carry on; a run a worker drives has it handed
 /// to that worker (nobody else writes its record); a run that ended takes
@@ -1783,7 +1873,7 @@ async fn an_answer_reaches_its_run_once(pool: Pool) {
     pool.execute("UPDATE run SET state = 'parked' WHERE run_id = $1", &[&parked_run]).await.unwrap();
     seed_wait(&store, "tok-parked", project, parked_run).await;
     let Answered::Reached { consumed } = store.answer("tok-parked", &weft_core::primitive::WaitAnswer::Given { value: json!("yes") }).await.unwrap() else { panic!("reached") };
-    assert_eq!(consumed.token, "tok-parked");
+    assert_eq!(consumed.iter().map(|s| s.token.as_str()).collect::<Vec<_>>(), ["tok-parked"]);
     assert!(store.signal_get("tok-parked").await.unwrap().is_none(), "answered once");
     assert_eq!(run_column::<String>(&pool, "state", parked_run).await.as_deref(), Some("queued"), "queued to carry on");
     assert!(matches!(crate::events(store.events_log(parked_run).await.unwrap()).last(),
@@ -1860,6 +1950,75 @@ async fn the_consumer_listing_reads_the_whole_signal_row(pool: Pool) {
     assert_eq!(listed[0].token, "tok-entry");
     assert_eq!(listed[0].node_id, "trigger-tok-entry");
     assert!(signals_visible_to(&pool, "someone-else", &[], &[], None).await.unwrap().is_empty());
+}
+
+/// The signal-token listing shows an entry form as a trigger
+/// (`isResume: false`, its rendered kind kept) and goes on showing it
+/// after a fire was queued on it, since an entry starts runs for as long
+/// as it is registered; a run's question is listed as a resume until it
+/// is answered, and gone from the listing once it is.
+#[weft_db_macros::test]
+async fn an_entry_form_lists_as_a_trigger_before_and_after_a_fire(pool: Pool) {
+    use weft_dispatcher::api::signal::consumer_listing;
+    let (store, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project, "bin-A").await;
+    let rendered = |node: &str| json!({ "kind": "form", "node": node });
+    let mut entry = entry_signal("tok-start", project);
+    entry.node_id = "start".into();
+    entry.consumer_payload = Some(rendered("start"));
+    store.signal_insert(&entry).await.unwrap();
+    let run_id = queued_run(&store, project).await;
+    for token in ["tok-ask", "tok-answered"] {
+        let mut wait = entry_signal(token, project);
+        wait.node_id = format!("wait-{token}");
+        wait.is_resume = true;
+        wait.run_id = Some(run_id);
+        wait.consumer_payload = Some(rendered(&wait.node_id));
+        store.signal_insert(&wait).await.unwrap();
+    }
+    assert_eq!(park(&pool, "tok-start", &parked(0, 0), None).await.unwrap(), ParkAppend::Parked, "a fire queued on the entry");
+    assert_eq!(park(&pool, "tok-answered", &parked(0, 0), None).await.unwrap(), ParkAppend::Parked, "an answer queued on the question");
+
+    let listed = consumer_listing(signals_visible_to(&pool, TENANT, &[], &[], None).await.unwrap());
+    let shown: Vec<(&str, &str, bool)> = listed
+        .iter()
+        .map(|payload| (payload["node"].as_str().unwrap(), payload["kind"].as_str().unwrap(), payload["isResume"].as_bool().unwrap()))
+        .collect();
+    assert_eq!(shown, vec![("start", "form", false), ("wait-tok-ask", "form", true)]);
+}
+
+/// A run whose build's worker cannot start ends every run queued on that
+/// build, and only those: a parked run of the build waits on in its
+/// record, and a run queued on another build of the project is not
+/// touched. A new build of the project moves no paused run: it resumes on
+/// the build it was born on until a resync moves it.
+#[weft_db_macros::test]
+async fn a_worker_that_cannot_start_ends_the_runs_queued_on_its_build_alone(pool: Pool) {
+    use weft_core::context::Phase;
+    let (store, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project, "bin-A").await;
+    let on = |binary: &'static str| {
+        let store = &store;
+        async move {
+            let run_id = weft_core::new_run_id();
+            assert!(queue(store, &[birth(run_id, project, Phase::Fire, binary)], false).await.unwrap());
+            run_id
+        }
+    };
+    let (first, second, paused, other) = (on("bin-A").await, on("bin-A").await, on("bin-A").await, on("bin-B").await);
+    pool.execute("UPDATE run SET state = 'parked' WHERE run_id = $1", &[&paused]).await.unwrap();
+
+    let mut ending = weft_dispatcher::delivery::queued_on_build(&pool, project, Some("bin-A")).await.unwrap();
+    ending.sort();
+    let mut expected = vec![first, second];
+    expected.sort();
+    assert_eq!(ending, expected, "the queued runs of that build, never the parked one nor another build's");
+
+    seed_project(&projects, project, "bin-C").await;
+    assert_eq!(run_column::<String>(&pool, "binary_hash", paused).await.as_deref(), Some("bin-A"), "a build moves no paused run");
+    assert_eq!(run_column::<String>(&pool, "binary_hash", other).await.as_deref(), Some("bin-B"));
 }
 
 /// The park names its refusal instead of returning "0 rows": a re-run
@@ -2458,7 +2617,6 @@ async fn a_project_being_removed_has_no_run_born(pool: Pool) {
                     row_sizes: vec![row.len() as u32],
                     born: Born::of(&events[0], weft_core::run_settings::KeepFor::WEFT_DEFAULT),
                     written: Written::of(&events),
-                    wrote_files: false,
                     secrets: Vec::new(),
                 }],
                 programs: Vec::new(),
@@ -3397,7 +3555,7 @@ async fn what_an_infra_says_changed_is_written_where_its_node_put_it(pool: Pool)
     .unwrap();
     let spec: weft_core::AccessSpec = serde_json::from_value(json!({
         "service": "selfrun",
-        "acquisition": { "kind": "static", "fields": [{ "name": "host", "secret": false }, { "name": "password" }] },
+        "acquisition": { "kind": "static", "ways": [{ "fields": [{ "name": "host", "secret": false }, { "name": "password" }] }] },
     }))
     .unwrap();
     weft_access_store::publish_grant(
@@ -3892,6 +4050,19 @@ async fn a_run_its_workers_keep_answering_busy_is_tried_again_with_a_growing_pau
     claim(&pool, back, id, "worker-a").await;
     assert_eq!(written().await, 0, "a run they failed reaching a worker clears it, its tries started again or not");
     assert_eq!(run_column::<bool>(&pool, "waited_on_workers", back).await, Some(false), "a claim clears the mark");
+
+    // A run its worker keeps answering busy (a worker that could not read
+    // it from the store answers the same way) never stops being tried,
+    // however many answers in a row: each is handed out again once its
+    // pause runs out.
+    let again = queued_run(&store, id).await;
+    for _ in 0..=UNREACHED_TO_STOP {
+        busy(&pool, again).await.unwrap().expect("queued");
+    }
+    assert_eq!(run_column::<i16>(&pool, "unreached", again).await, Some(0), "counting no try");
+    let due: i64 = run_column(&pool, "delivered_until", again).await.unwrap();
+    let taken: Vec<_> = take(&pool, due + 1, 32).await.unwrap().into_iter().map(|d| d.run_id).collect();
+    assert!(taken.contains(&again), "handed out again after its pause: {taken:?}");
 }
 
 /// A drain marks the runs it waits on watched, and the ones waiting to
@@ -4395,7 +4566,7 @@ async fn a_bake_whose_captured_values_hold_a_nul_is_kept_exactly(pool: Pool) {
         },
     );
     assert_eq!(store.finish_trigger_setup(run_id, Some(&bake)).await.unwrap(), None);
-    let saved = store.trigger_bakes(id, None).await.unwrap();
+    let saved = store.trigger_bakes(id, None).await.unwrap().read;
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0].captured["entry"].ports, ports);
     let source: String = pool.scalar("SELECT source_version FROM trigger_bake WHERE project_id = $1", &[&id]).await.unwrap();

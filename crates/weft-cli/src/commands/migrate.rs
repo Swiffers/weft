@@ -181,17 +181,17 @@ async fn connections(ctx: &Ctx, source: &DispatcherClient, target: &DispatcherCl
     let key: Option<TransferKey> = match picks.dry_run {
         true => None,
         false => Some(
-            serde_json::from_value(target.post_json("/access/migrate/key", &serde_json::json!({})).await?)
+            serde_json::from_value(target.waiting_on_its_work().post_json("/access/migrate/key", &serde_json::json!({})).await?)
                 .with_context(|| format!("read {}'s transfer key", picks.to))?,
         ),
     };
     let request = ExportConnections { selection, public_key: key.as_ref().map(|k| k.public_key.clone()) };
-    let exported: ExportedConnections = serde_json::from_value(source.post_json("/access/migrate/export", &serde_json::to_value(&request)?).await?)
+    let exported: ExportedConnections = serde_json::from_value(source.waiting_on_its_work().ask_json("/access/migrate/export", &serde_json::to_value(&request)?).await?)
         .context("read the connections to copy")?;
     let outcomes: BTreeMap<uuid::Uuid, Outcome> = match (key, &exported.sealed) {
         (Some(key), Some(sealed)) => {
             let request = ImportConnections { key_id: key.key_id, sealed: sealed.clone() };
-            let imported: ImportedConnections = serde_json::from_value(target.post_json("/access/migrate/import", &serde_json::to_value(&request)?).await?)
+            let imported: ImportedConnections = serde_json::from_value(target.waiting_on_its_work().post_json("/access/migrate/import", &serde_json::to_value(&request)?).await?)
                 .with_context(|| format!("read what {} did with the connections", picks.to))?;
             imported.connections.into_iter().map(|c| (c.id, c.outcome)).collect()
         }
@@ -260,7 +260,7 @@ async fn connections(ctx: &Ctx, source: &DispatcherClient, target: &DispatcherCl
     if !picks_to_set.is_empty() {
         println!("these nodes use the copied connections here; to pick them on {} too, run in each project's folder:", picks.to);
         for p in picks_to_set {
-            println!("  project {}: weft connect --node {} --grant {} --on {}   (its field {})", p.project_id, p.node, p.grant_id, picks.to, p.field);
+            println!("  project {}: weft connect {} --grant {} --on {}   (its field {})", p.project_id, p.node, p.grant_id, picks.to, p.field);
         }
     }
     Ok(())
@@ -271,8 +271,8 @@ fn not_copied(meta: &StoredFileMeta, source: &str) -> Option<String> {
     match weft_core::storage::key::parse_key(&meta.key) {
         Err(e) => Some(format!("its key is not one weft makes ({e})")),
         Ok(parsed) => match parsed.scope {
-            weft_core::storage::key::KeyScope::Run { .. } if !meta.keep => {
-                Some(format!("a run's file goes with its run, which stays on {source} (a kept one would be copied)"))
+            weft_core::storage::key::KeyScope::Run { .. } => {
+                Some(format!("a run's file goes with its run, which stays on {source}"))
             }
             _ => None,
         },
@@ -379,13 +379,12 @@ mod tests {
         assert!(parse_moment("yesterday").unwrap_err().contains("neither a date"));
     }
 
-    fn meta(key: &str, keep: bool) -> StoredFileMeta {
+    fn meta(key: &str) -> StoredFileMeta {
         StoredFileMeta {
             key: key.into(),
             mime_type: "text/plain".into(),
             size_bytes: 1,
             filename: "f".into(),
-            keep,
             expires_at_unix: None,
             keep_ttl_secs: None,
             created_at_unix: 0,
@@ -394,11 +393,10 @@ mod tests {
     }
 
     #[test]
-    fn a_runs_file_stays_unless_kept() {
+    fn a_runs_file_stays_with_its_run() {
         let run = format!("t/run/{}/f", uuid::Uuid::nil());
-        assert!(not_copied(&meta(&run, false), "local").unwrap().contains("stays on local"));
-        assert_eq!(not_copied(&meta(&run, true), "local"), None);
-        assert_eq!(not_copied(&meta(&format!("t/project/{}/f", uuid::Uuid::nil()), false), "local"), None);
+        assert!(not_copied(&meta(&run), "local").unwrap().contains("stays on local"));
+        assert_eq!(not_copied(&meta(&format!("t/project/{}/f", uuid::Uuid::nil())), "local"), None);
     }
 
     #[test]

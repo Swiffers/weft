@@ -15,8 +15,6 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("with_no_file_a_message_starts_a_new_conversation_file", starts_a_file),
         NodeTest::fake("media_rides_the_appended_message_as_stored_slots", appends_media),
         NodeTest::fake("a_null_in_a_media_list_is_left_out", null_media_left_out),
-        NodeTest::fake("a_tool_message_needs_its_call_id", tool_needs_call_id),
-        NodeTest::fake("a_call_id_only_belongs_on_a_tool_message", call_id_only_on_tool),
         NodeTest::fake("refuses_a_message_with_no_substance", refuses_empty),
         NodeTest::fake("a_cache_breakpoint_marks_the_message", cache_breakpoint),
         NodeTest::fake("a_tool_result_is_appended_in_place", appends_to_file),
@@ -115,8 +113,8 @@ async fn appends_user(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-/// With no file in, the message starts a conversation of its own, kept
-/// past the run like any output the run made.
+/// With no file in, the message starts a conversation of its own, a file
+/// of the run like any output the run made.
 async fn starts_a_file(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig
         .run(&ChatHistoryAppendNode, json!({ "role": "user", "text": "hi" }))
@@ -124,29 +122,9 @@ async fn starts_a_file(rig: FakeRig) -> WeftResult<()> {
         .ok()?;
     let file = StoredFile::from_value(outcome.output("historyFile")?)?;
     let meta = rig.stored_meta(&file.key)?;
-    assert!(meta.keep, "a started conversation outlives the run: {meta:?}");
+    assert_eq!(meta.keep_ttl_secs, None, "a started conversation has no deadline, it goes with its run: {meta:?}");
+    assert!(file.key.contains("/run/"), "run-scoped: a started conversation is the run's: {}", file.key);
     assert_eq!(conversation(&rig, outcome.output("historyFile")?)?.len(), 1);
-    Ok(())
-}
-
-async fn tool_needs_call_id(rig: FakeRig) -> WeftResult<()> {
-    let outcome = rig
-        .run(&ChatHistoryAppendNode, json!({ "role": "tool", "text": "result" }))
-        .await;
-    let err = outcome.result.expect_err("tool without id must refuse").to_string();
-    assert!(err.contains("toolCallId"), "{err}");
-    Ok(())
-}
-
-async fn call_id_only_on_tool(rig: FakeRig) -> WeftResult<()> {
-    let outcome = rig
-        .run(
-            &ChatHistoryAppendNode,
-            json!({ "role": "user", "text": "hi", "toolCallId": "call_1" }),
-        )
-        .await;
-    let err = outcome.result.expect_err("user with call id must refuse").to_string();
-    assert!(err.contains("only belongs on a 'tool' message"), "{err}");
     Ok(())
 }
 

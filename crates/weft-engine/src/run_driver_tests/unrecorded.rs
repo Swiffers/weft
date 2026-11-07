@@ -38,7 +38,7 @@
     impl Node for Waits {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let timer = weft_core::signal::Timer { spec: weft_core::signal::TimerSpec::After { duration_ms: 5_000 } };
-            ctx.await_signal(timer).await?;
+            crate::run_driver::engine_test_rig::wait_once(&ctx, timer).await?;
             ctx.pulse_downstream(NodeOutput::new().set("value", json!("late"))).await
         }
     }
@@ -51,7 +51,7 @@
     impl Node for Abandons {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let timer = weft_core::signal::Timer { spec: weft_core::signal::TimerSpec::After { duration_ms: 5_000 } };
-            let waiting = ctx.await_signal(timer);
+            let waiting = crate::run_driver::engine_test_rig::wait_once(&ctx, timer);
             tokio::pin!(waiting);
             // Polled until it holds (registered, and waiting in its call),
             // then dropped.
@@ -73,7 +73,7 @@
     impl Node for PanicsWaiting {
         async fn run(&self, ctx: RunContext) -> WeftResult<()> {
             let timer = weft_core::signal::Timer { spec: weft_core::signal::TimerSpec::After { duration_ms: 5_000 } };
-            let waiting = ctx.await_signal(timer);
+            let waiting = crate::run_driver::engine_test_rig::wait_once(&ctx, timer);
             tokio::pin!(waiting);
             for _ in 0..50 {
                 if futures::poll!(waiting.as_mut()).is_ready() {
@@ -371,6 +371,84 @@
         assert!(!written.iter().any(|e| matches!(e, RunEvent::NodeSuspended { .. })), "nothing parked");
     }
 
+    /// A wait given up is a time limit to the caller still waiting on the
+    /// run: with nothing sent yet, the exchange ends as one (`504`), the
+    /// plain failure its caller is told carrying no more than that the run
+    /// failed and which run it was. With its caller on the line the hold
+    /// clock does not run, so the one wait given up under a caller is one
+    /// whose `holdSecs` is 0, given up at once.
+    #[tokio::test]
+    async fn a_wait_given_up_ends_its_callers_exchange_as_a_time_limit() {
+        use crate::caller_conn::{Ending, Outbound};
+        let run_id = weft_core::new_run_id();
+        let project = project();
+        let birth = birth(run_id, &project, 0);
+        let run_clients = EngineClients { tasks: AwaitTasks::new(), ..clients(Arc::new(MemJournal::default())) };
+        let run = born(&run_clients, run_id, &birth).await;
+        let cfg = weft_core::caller::CallerRuntimeConfig {
+            protocol: weft_core::signal::Protocol::Http,
+            data_type: weft_core::signal::DataType::Json,
+            backpressure: weft_core::signal::Backpressure::Block,
+            error_mode: weft_core::signal::ErrorMode::Surface,
+            max_inbound_bytes: 1024,
+            caller_silence_secs: weft_core::signal::DEFAULT_CALLER_SILENCE_SECS,
+            max_session_secs: 0,
+            outlives_caller: false,
+            inbound_window: 4,
+            journal: weft_core::stream_journal::JournalPolicy::default(),
+        };
+        let (conn, outbound, _) =
+            crate::caller_conn::new_connection(cfg, run_id, Arc::new(weft_core::caller::LiveRequest::default()), None, Arc::new(super::engine_test_rig::Unkept));
+        // The caller's side: everything the run says to it, in order, and
+        // once the run hangs up, the caller is gone.
+        let heard = Arc::new(std::sync::Mutex::new(Vec::new()));
+        tokio::spawn({
+            let (heard, conn) = (heard.clone(), conn.clone());
+            async move {
+                while let Some(item) = outbound.recv().await {
+                    heard.lock().unwrap().push(item);
+                }
+                conn.mark_disconnected("the call ended");
+            }
+        });
+        let holds = crate::run_holds::Holds::new(Box::new(|| {}));
+        let project = Arc::new(project);
+        let claimed = super::engine_test_rig::claimed(&run_clients, run_id, &project, &birth).await;
+        let drive = RunDrive {
+            run_id,
+            journal: run,
+            program: Arc::new(crate::plan::ProgramTables::new(project)),
+            starts_from: StartsFrom::Record(Box::new(claimed)),
+            cancellation: CancellationFlag::new_arc(),
+            exchange: Some(super::engine_test_rig::live_exchange(conn)),
+            hand_back: None,
+            hold: Some(holds.of(run_id, None)),
+        };
+        let drove = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_one_observed(catalog(vec![("Answer", Box::new(Waits) as Box<dyn Node>)]), &run_clients, drive, "instance-test", "tenant-test"),
+        )
+        .await
+        .expect("the drive ends")
+        .expect("the drive runs");
+        assert!(matches!(&drove.outcome, RunOutcome::Failed { error, held_too_long: true } if error.contains("gave up its wait")), "{:?}", drove.outcome);
+        let ending = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Some(ending) = heard.lock().unwrap().iter().find_map(|item| match item {
+                    Outbound::Error { ending } => Some(*ending),
+                    _ => None,
+                }) {
+                    return ending;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the caller is told the run failed");
+        assert_eq!(ending, Ending::TimeLimit, "{:?}", heard.lock().unwrap());
+        assert_eq!(ending.status(), 504);
+    }
+
     /// A firing that went on without a wait it started (its call dropped)
     /// leaves nothing behind once it ends: the wait is withdrawn, so
     /// nobody is asked to answer it, and the run completes.
@@ -401,4 +479,70 @@
         let (outcome, _) = drive_holding(Box::new(Waits), 0, tasks.clone(), Arc::new(Answers::default()), &crate::run_holds::Holds::new(Box::new(|| {}))).await;
         assert!(matches!(&outcome, RunOutcome::Failed { error, held_too_long: true } if error.contains("is 0")), "{outcome:?}");
         assert_eq!(*tasks.withdrawn.lock().unwrap(), vec![tasks.minted().expect("the wait was registered")]);
+    }
+
+    /// Tags its run, then answers.
+    struct Tags;
+    test_manifest!(Tags, "Answer");
+    #[async_trait]
+    impl Node for Tags {
+        async fn run(&self, ctx: RunContext) -> WeftResult<()> {
+            ctx.tag_run(["user_7"]).await?;
+            ctx.pulse_downstream(NodeOutput::new().set("value", json!("tagged"))).await
+        }
+    }
+
+    /// The broker's side of a tag: the tags asked for, each with what the
+    /// record held of the run when the call came.
+    struct SeeingSteering {
+        journal: Arc<MemJournal>,
+        seen: std::sync::Mutex<Vec<(Vec<String>, Vec<RunEvent>)>>,
+    }
+
+    #[async_trait]
+    impl crate::context::RunSteeringClient for SeeingSteering {
+        async fn tag_run(&self, run_id: weft_core::RunId, tags: Vec<String>) -> anyhow::Result<()> {
+            self.seen.lock().unwrap().push((tags, self.journal.events_of(run_id)));
+            Ok(())
+        }
+        async fn stop_tagged(&self, _: weft_core::RunId, _: String, _: weft_core::StopSelf) -> anyhow::Result<bool> {
+            unreachable!("the run stops nothing")
+        }
+    }
+
+    /// An unrecorded run tags itself: its birth is written before the
+    /// tag call reaches the broker (the row a stop by tag finds it
+    /// through), and its ending once it ends, since a row that exists is
+    /// closed. Nothing else of it is written.
+    #[tokio::test]
+    async fn a_run_tags_itself_and_leaves_its_birth_and_its_ending() {
+        let run_id = weft_core::new_run_id();
+        let project = project();
+        let birth = birth(run_id, &project, weft_core::run_settings::DEFAULT_HOLD_SECS);
+        let journal = Arc::new(MemJournal::default());
+        let base = clients(journal.clone());
+        let seeing = Arc::new(SeeingSteering { journal: journal.clone(), seen: Default::default() });
+        let steering = crate::record_first::RecordFirst::new(seeing.clone() as Arc<dyn crate::context::RunSteeringClient>, base.writer.clone());
+        let run_clients = EngineClients { steering, ..base };
+        let run = born(&run_clients, run_id, &birth).await;
+        let holds = crate::run_holds::Holds::new(Box::new(|| {}));
+        let drove = run_on_holding(Arc::new(project), catalog(vec![("Answer", Box::new(Tags) as Box<dyn Node>)]), &run_clients, run_id, run, birth, CancellationFlag::new_arc(), None, None, &holds)
+            .await
+            .expect("the drive ends");
+        run_clients.writer.written().await;
+        assert!(matches!(drove.outcome, RunOutcome::Completed), "{:?}", drove.outcome);
+
+        let seen = seeing.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].0, vec![weft_core::tag::normalize_tag("user_7").unwrap()]);
+        assert!(
+            matches!(seen[0].1.as_slice(), [RunEvent::RunStarted { settings, .. }] if !settings.recorded()),
+            "its birth alone was on record when the tag went out: {:?}",
+            seen[0].1
+        );
+        let written = journal.events_of(run_id);
+        assert!(
+            matches!(written.as_slice(), [RunEvent::RunStarted { .. }, RunEvent::RunCompleted { .. }]),
+            "its birth and its ending: {written:?}"
+        );
     }

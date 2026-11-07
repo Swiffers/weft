@@ -18,11 +18,21 @@
     "doors": ["own"],
     "acquisition": {
       "kind": "static",
-      "fields": [
+      "ways": [
         {
-          "name": "key",
-          "label": "API key",
-          "placeholder": "..."
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "..."
+            }
+          ],
+          "guide": {
+            "steps": [
+              "Paste the endpoint's API key below and name the connection.",
+              "The endpoint's address lives on the Custom Provider node itself, not here."
+            ]
+          }
         }
       ]
     },
@@ -36,20 +46,12 @@
     "verification": {
       "rung": "silent",
       "cost": "free"
-    },
-    "ownPage": {
-      "guide": {
-        "steps": [
-          "Paste the endpoint's API key below and name the connection.",
-          "The endpoint's address lives on the Custom Provider node itself, not here."
-        ]
-      }
     }
   },
   "inputs": [
     {
       "name": "connection",
-      "type": "Access",
+      "type": "Access[custom_llm]",
       "widget": {
         "kind": "access"
       },
@@ -87,6 +89,7 @@
     }
   ],
   "validate": [
+    { "when": { "kind": "input_wired", "port": "connection" }, "then": { "message": "CustomProvider '{id}' picks its own connection on `connection`, and no access node holds a custom endpoint's key: pick the connection on the node instead of wiring one in", "port": "connection" } },
     {
       "when": {
         "kind": "all",
@@ -101,8 +104,9 @@
           {
             "kind": "not",
             "of": {
-              "kind": "config_nonempty",
-              "field": "baseUrl"
+              "kind": "value",
+              "field": "baseUrl",
+              "nonempty": true
             }
           }
         ]
@@ -127,8 +131,9 @@
           {
             "kind": "not",
             "of": {
-              "kind": "config_nonempty",
-              "field": "model"
+              "kind": "value",
+              "field": "model",
+              "nonempty": true
             }
           }
         ]
@@ -144,15 +149,15 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_present",
+            "kind": "value",
             "field": "baseUrl"
           },
           {
             "kind": "not",
             "of": {
-              "kind": "config_matches",
+              "kind": "value",
               "field": "baseUrl",
-              "regex": "(?i)^https?://"
+              "matches": "(?i)^https?://"
             }
           }
         ]

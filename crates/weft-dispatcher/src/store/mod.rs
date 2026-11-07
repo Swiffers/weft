@@ -29,6 +29,7 @@ pub use fake::FakeStore;
 use weft_core::signal_token::TokenKind;
 use weft_journal::RunEvent;
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -57,11 +58,31 @@ pub struct TriggerBake {
     pub at_unix: u64,
 }
 
-/// An earlier bake a trigger setup replaced because it no longer read
-/// ([`BakeStore::finish_trigger_setup`]): why, its row named.
+/// A stored bake that no longer reads: the program it was baked on (its
+/// row's `program_hash`, `ProgramIdentity::digest`), and why, its row
+/// named. Read past by [`BakeStore::trigger_bakes`], and replaced by the
+/// next setup of the same program ([`BakeStore::finish_trigger_setup`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnreadablePriorBake {
+pub struct UnreadableBake {
+    pub program_hash: String,
     pub error: String,
+}
+
+/// One owner's bakes ([`BakeStore::trigger_bakes`]): those that read, and
+/// apart those that no longer do, so one row that does not read never
+/// hides the others.
+#[derive(Debug, Clone, Default)]
+pub struct Bakes {
+    pub read: Vec<TriggerBake>,
+    pub unreadable: Vec<UnreadableBake>,
+}
+
+impl Bakes {
+    /// The bake of the program `program` when it no longer reads.
+    pub fn unreadable_for(&self, program: &weft_core::project::hash::ProgramIdentity) -> Option<&UnreadableBake> {
+        let digest = program.digest();
+        self.unreadable.iter().find(|bake| bake.program_hash == digest)
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -72,7 +93,11 @@ pub struct TriggerCapture {
 
 impl TriggerBake {
     /// A trigger's bake as its row stores it (`trigger_bake.bake_json`).
-    pub const STORED: weft_core::stored::Kind<TriggerBake> = weft_core::stored::Kind::new("trigger bake", &[]);
+    pub const STORED: weft_core::stored::Kind<TriggerBake> = weft_core::stored::Kind::new(
+        "trigger bake",
+        // 1 -> 2: a live caller's gate names its check, in each captured spec.
+        &[&[weft_core::stored::Op::Within { at: "captured.*.spec", ops: weft_core::primitive::SIGNAL_SPEC_V2 }]],
+    );
 
     /// Where a stored bake sits, for a message about it: the project, whose
     /// triggers (an instance's, or the shared ones) and the program they
@@ -329,6 +354,13 @@ pub trait RunStore: Send + Sync {
         project_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<(RunId, weft_core::context::Phase)>>;
 
+    /// The program of every run of `project_id` that has not ended
+    /// (queued, running, parked), by definition hash, once each: what the
+    /// project's asset references keep beside its running build's, so
+    /// the content an older build stored outlives the build while a run
+    /// of it waits.
+    async fn unfinished_programs(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<String>>;
+
     /// Every run of `project_id` that ended or is parked on a wait: the
     /// runs that write nothing until something answers them.
     async fn settled_run_ids_for_project(
@@ -431,10 +463,12 @@ pub trait SignalStore: Send + Sync {
     async fn signal_remove_registration(&self, token: &str, generation: i64) -> anyhow::Result<Option<SignalRegistration>>;
 
     /// Delete the wait `token` of run `run_id`, given up by its run,
-    /// and return it for the listener to let go of. A token that is no
-    /// wait of that run (an entry trigger, another run's wait, a wait
-    /// already answered) is left alone: `None`.
-    async fn signal_withdraw(&self, run_id: RunId, token: &str) -> anyhow::Result<Option<SignalRegistration>>;
+    /// and return its signals for the listener to let go of: the wait's
+    /// own, or every branch of a wait on the first of several (which has
+    /// no row of its own, `weft_core::signal::first_of`). A token that is
+    /// no wait of that run (an entry trigger, another run's wait, a wait
+    /// already answered) is left alone: nothing comes back.
+    async fn signal_withdraw(&self, run_id: RunId, token: &str) -> anyhow::Result<Vec<SignalRegistration>>;
 
     /// The RESUME registrations of one run: what that run is
     /// parked on.
@@ -508,11 +542,12 @@ pub trait BakeStore: Send + Sync {
     /// that no longer reads is replaced by this one, which carries nothing
     /// of it: answered, so the caller says which triggers lost their bake
     /// (`crate::run_ends::land_trigger_bake`).
-    async fn finish_trigger_setup(&self, run_id: RunId, bake: Option<&TriggerBake>) -> anyhow::Result<Option<UnreadablePriorBake>>;
+    async fn finish_trigger_setup(&self, run_id: RunId, bake: Option<&TriggerBake>) -> anyhow::Result<Option<UnreadableBake>>;
 
     /// The bakes of one owner's triggers: the shared ones for `None`, an
-    /// instance's for `Some`.
-    async fn trigger_bakes(&self, project_id: uuid::Uuid, instance: Option<&weft_core::instance::InstanceId>) -> anyhow::Result<Vec<TriggerBake>>;
+    /// instance's for `Some`. A row that no longer reads is answered
+    /// apart, never failing the read of the others.
+    async fn trigger_bakes(&self, project_id: uuid::Uuid, instance: Option<&weft_core::instance::InstanceId>) -> anyhow::Result<Bakes>;
 }
 
 /// Durable replacement for the in-RAM `SignalTracker` row.
@@ -665,9 +700,7 @@ impl SignalRegistration {
     /// whether it carries one is unknown.
     pub fn cancel_call(&self) -> anyhow::Result<Option<weft_core::signal::listener_protocol::CancelCallRequest>> {
         let spec = self.spec()?;
-        if spec.on_cancel.is_none() {
-            return Ok(None);
-        }
+        let Some(call) = spec.on_cancel else { return Ok(None) };
         Ok(Some(weft_core::signal::listener_protocol::CancelCallRequest {
             token: self.token.clone(),
             tenant_id: self.tenant_id.clone(),
@@ -675,7 +708,8 @@ impl SignalRegistration {
                 .instance
                 .clone()
                 .map(|instance| weft_core::instance::InstanceScope { project_id: self.project_id, instance }),
-            spec,
+            call,
+            access: spec.access,
         }))
     }
 
@@ -773,15 +807,32 @@ impl RunOwner {
     }
 }
 
+/// The wait `sig` is a branch of, when it is one of the branches of a
+/// wait on the first of several (`weft_core::signal::first_of`): read off
+/// its spec, where the dispatcher put it as it armed the branch.
+pub fn branch_of(sig: &SignalRegistration) -> anyhow::Result<Option<weft_core::signal::first_of::BranchOf>> {
+    let spec: weft_core::primitive::SignalSpec =
+        serde_json::from_str(&sig.spec_json).with_context(|| format!("signal {}'s spec does not read", sig.token))?;
+    Ok(spec.branch_of)
+}
+
+/// Whether `sig` is the signal of the wait `token`, or one of its branches.
+pub fn answers_wait(sig: &SignalRegistration, token: &str) -> anyhow::Result<bool> {
+    Ok(sig.token == token || branch_of(sig)?.is_some_and(|of| of.wait == token))
+}
+
 /// What became of an answer to a wait (`SignalStore::answer`).
 #[derive(Debug)]
 pub enum Answered {
     /// It reached its run: written into its record (the run is queued to
     /// carry on), or handed to the worker that drives it. The wait's
     /// signal is gone; the listener still holds it in memory.
-    Reached { consumed: SignalRegistration },
-    /// The run had ended: the wait's signal is gone, nothing was written.
-    RunEnded { consumed: SignalRegistration },
+    ///
+    /// `consumed` is every signal the answer took down: the wait's own, or
+    /// every branch of a wait on the first of several.
+    Reached { consumed: Vec<SignalRegistration> },
+    /// The run had ended: the wait's signals are gone, nothing was written.
+    RunEnded { consumed: Vec<SignalRegistration> },
     /// No such wait: it was answered already, or never existed.
     Gone,
 }

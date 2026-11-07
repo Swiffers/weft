@@ -24,6 +24,7 @@ pub mod daemon;
 pub mod infra;
 pub mod infra_card;
 pub mod infra_env;
+pub mod infra_take_disk;
 pub mod catalog;
 pub mod deps_install;
 pub mod describe_nodes;
@@ -315,6 +316,17 @@ impl Ctx {
         self.client_keyed(false)
     }
 
+    /// The kind of the install this command acts on, as it says itself
+    /// (`GET /install`). A command whose compile is held to the install's
+    /// own build (the drift `weft status` reads, a refusal it predicts)
+    /// compiles for it: what is broken, and the rules recorded for the run,
+    /// depend on it (a node's rule may ask `local_install`).
+    pub async fn install_kind(&self) -> anyhow::Result<weft_core::install::InstallKind> {
+        let info: weft_core::install::InstallInfo = serde_json::from_value(self.client()?.get_json("/install").await?)
+            .map_err(|e| anyhow::anyhow!("read what the install says about itself: {e}"))?;
+        Ok(info.kind())
+    }
+
     /// The cwd-discovered project, lazy-loaded and cached, keeping
     /// [`Project::find`]'s three answers apart: found, no weft.toml
     /// anywhere up the tree (`Ok(None)`), or a manifest that is here
@@ -411,7 +423,7 @@ pub fn unqualified(name: &str) -> &str {
 }
 
 /// One node of the folder's program, from the way a person spells it
-/// (`weft options`, `weft connect --node`, the infra verbs): what it names
+/// (`weft options`, `weft connect <node>`, the infra verbs): what it names
 /// in the compiled definition, its id and the call path that use of it
 /// runs under (`auth.check` is the node `Auth.check` under `["auth"]`).
 /// The spelling is read the one way every surface reads one

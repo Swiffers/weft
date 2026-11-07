@@ -16,11 +16,22 @@
     "doors": ["own"],
     "acquisition": {
       "kind": "static",
-      "fields": [
+      "ways": [
         {
-          "name": "key",
-          "label": "API key",
-          "placeholder": "sk-ant-..."
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "sk-ant-..."
+            }
+          ],
+          "guide": {
+            "link": "https://console.anthropic.com/settings/keys",
+            "steps": [
+              "Open console.anthropic.com, Settings > API Keys, and create an API key.",
+              "Paste it below and name the connection."
+            ]
+          }
         }
       ]
     },
@@ -42,21 +53,12 @@
     "verification": {
       "rung": "reports_validity",
       "cost": "free"
-    },
-    "ownPage": {
-      "guide": {
-        "link": "https://console.anthropic.com/settings/keys",
-        "steps": [
-          "Open console.anthropic.com, Settings > API Keys, and create an API key.",
-          "Paste it below and name the connection."
-        ]
-      }
     }
   },
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[anthropic]",
       "widget": {
         "kind": "access"
       },
@@ -66,7 +68,7 @@
   "outputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[anthropic]",
       "description": "Wire into Anthropic Model nodes' `access` input."
     }
   ]

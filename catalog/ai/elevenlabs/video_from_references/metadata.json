@@ -13,7 +13,7 @@
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[elevenlabs]",
       "accepts": [
         "wire"
       ],
@@ -155,7 +155,7 @@
     {
       "name": "video",
       "type": "Video",
-      "description": "The generated video, kept for 30 days after it was last read."
+      "description": "The generated video, stored with the run and deleted with it (once the run's record goes); wire it through KeepFile to keep it past that."
     }
   ],
   "features": {
@@ -171,5 +171,35 @@
   "display": {
     "kind": "media",
     "output": "video"
-  }
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "value",
+            "field": "styles",
+            "nonempty": true
+          },
+          {
+            "kind": "value",
+            "field": "model"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "value",
+              "field": "model",
+              "matches": "^veo-"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsVideoFromReferences '{id}' sets `styles`, which only Veo takes: other models take their reference images without a role, so put these images in `subjects`, or pick a veo `model`.",
+        "port": "styles"
+      }
+    }
+  ]
 }

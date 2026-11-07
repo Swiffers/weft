@@ -639,7 +639,7 @@ where
     loop {
         match work().await {
             Ok(done) => return Ok(done),
-            Err(e) if contended(&e) && started.elapsed() < CONTENDED_FOR => {
+            Err(e) if contended(&e).is_some() && started.elapsed() < CONTENDED_FOR => {
                 tracing::warn!(
                     target: "weft_task_store::schema_guard",
                     error = %format!("{e:#}"),
@@ -649,7 +649,13 @@ where
                 tokio::time::sleep(wait).await;
                 wait = (wait * 2).min(CONTENDED_LONGEST);
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                let gave_up = contended(&e).map(|given_up| gave_up_waiting(&given_up));
+                return Err(match gave_up {
+                    Some(why) => e.context(why),
+                    None => e,
+                });
+            }
         }
     }
 }
@@ -662,16 +668,56 @@ const CONTENDED_FIRST: std::time::Duration = std::time::Duration::from_millis(50
 const CONTENDED_LONGEST: std::time::Duration = std::time::Duration::from_secs(10);
 const CONTENDED_FOR: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// How the database gave up a lock for the schema's work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GivenUp {
+    /// It broke a deadlock (40P01) rather than letting the wait run out
+    /// (55P03).
+    deadlock: bool,
+    /// Where it was waiting, when the database says ("while updating tuple
+    /// (0,5) in relation \"run\""); a wait for a whole table names none.
+    waiting: Option<String>,
+}
+
 /// Whether `e` is the database giving up a lock (its wait ran out, or it
-/// broke a deadlock with a write): the whole transaction rolled back and can
-/// be tried again as it was.
-fn contended(e: &anyhow::Error) -> bool {
-    e.chain().any(|cause| {
-        cause
-            .downcast_ref::<crate::db::Error>()
-            .and_then(|e| e.code())
-            .is_some_and(|code| code == "55P03" || code == "40P01")
+/// broke a deadlock with a write), and how: the whole transaction rolled
+/// back and can be tried again as it was.
+fn contended(e: &anyhow::Error) -> Option<GivenUp> {
+    e.chain().find_map(|cause| {
+        let db = cause.downcast_ref::<crate::db::Error>()?.as_db_error()?;
+        let deadlock = match db.code().code() {
+            "40P01" => true,
+            "55P03" => false,
+            _ => return None,
+        };
+        Some(GivenUp { deadlock, waiting: db.where_().map(str::to_string) })
     })
+}
+
+/// What a person reads when the schema's work gave up waiting for a lock
+/// for [`CONTENDED_FOR`]. Every table and row lock it takes is one another
+/// session of the database holds (the advisory lock, taken first and
+/// waited on as long as it takes, keeps every other schema pass out), so
+/// what holds it is the install's own work or something else connected to
+/// the database.
+fn gave_up_waiting(given_up: &GivenUp) -> String {
+    let how = if given_up.deadlock {
+        "and the last try met a transaction in a deadlock, which the database ended by cancelling the schema's side".to_string()
+    } else {
+        format!("each try waiting at most {LOCK_WAIT} for each lock")
+    };
+    let waiting = given_up.waiting.as_deref().map(|at| format!(" The database says it was waiting {at}.")).unwrap_or_default();
+    format!(
+        "the schema's changes gave up after trying for {}s to lock what they change (a table, or rows of one), \
+         {how}: another session of this database held a lock they needed.{waiting} That session is this \
+         install's own work (a run, a trigger being set up, a request another copy of weft is serving) or \
+         anything else connected to the database, never another copy's schema changes, which wait their turn. \
+         The transaction that gave up was rolled back whole, so running it again (restarting this copy, or the \
+         release command) starts it over. If it keeps happening, look for the transaction that stays open while it waits: \
+         SELECT pid, xact_start, state, left(query, 200) FROM pg_stat_activity WHERE datname = current_database() \
+         AND xact_start IS NOT NULL ORDER BY xact_start;",
+        CONTENDED_FOR.as_secs()
+    )
 }
 
 /// Whether the database already holds everything `groups` and `migrations`
@@ -1591,6 +1637,28 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename], backfill
                     && old_by.get(&column).is_none_or(|was| !column_parts(&was.body).not_null)
             })
     };
+    // A key (a primary key, a unique) whose columns are all added in this
+    // plan and each fill every row with a value of its own (an identity,
+    // or a sequence's `nextval` default): no row can break it, so it
+    // arrives in the expand part, after its columns, rather than waiting
+    // for the contract. What runs between the two (the stored documents'
+    // carry, which walks a table by its primary key) can then lean on it.
+    let keys_itself = |thing: &Thing| {
+        thing.kind == "constraint"
+            && ["PRIMARY KEY (", "UNIQUE ("].iter().any(|opening| {
+                thing.body.strip_prefix(opening).and_then(|rest| rest.strip_suffix(')')).is_some_and(|columns| {
+                    columns.split(',').map(str::trim).all(|column| {
+                        let column = ("column".to_string(), thing.table.clone(), column.to_string());
+                        !old_by.contains_key(&column)
+                            && new_by.get(&column).is_some_and(|now| {
+                                let parts = column_parts(&now.body);
+                                parts.identity.is_some() || parts.default.as_deref().is_some_and(|d| d.starts_with("nextval("))
+                            })
+                    })
+                })
+            })
+    };
+    let mut keyed_in_expand: Vec<Planned> = Vec::new();
     let mut created: std::collections::HashSet<&str> = Default::default();
     // Types first: a column or a table may be made of a type added in the
     // same plan, and things otherwise come in name order of their kind.
@@ -1631,6 +1699,9 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename], backfill
         match old_by.get(&key(thing)) {
             None => match replaced.get(&key(thing)) {
                 Some(was) => plan.push(Planned { owner: owner_of(thing), part: Part::Expand, stmt: replaced_function(was, thing) }),
+                None if old_tables.contains(thing.table.as_str()) && keys_itself(thing) => {
+                    keyed_in_expand.push(Planned { owner: owner_of(thing), part: Part::Expand, stmt: added_whole(thing) })
+                }
                 None => {
                     let backfill = backfills.iter().find(|b| b.table == thing.table && b.column == thing.name);
                     plan.extend(added(thing, backfill).into_iter().map(|(part, stmt)| Planned { owner: owner_of(thing), part, stmt }))
@@ -1642,6 +1713,7 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename], backfill
             Some(_) => {}
         }
     }
+    plan.extend(keyed_in_expand);
     // A table that has gone entirely: one DROP TABLE, rather than a DROP
     // COLUMN for each of its columns.
     let new_tables: std::collections::HashSet<&str> =
@@ -3394,6 +3466,31 @@ mod tests {
     /// tightens in the contract part: a NOT NULL column with no default is
     /// added nullable first and made NOT NULL after, and a new table arrives
     /// whole, its key with it.
+    /// A key on a column the same change adds, filled from a sequence or
+    /// an identity, can refuse no row, so it comes in the expand part,
+    /// after its column; a key on a column already there still waits for
+    /// the contract.
+    #[test]
+    fn a_key_on_a_column_that_fills_itself_comes_with_the_column() {
+        use super::{plan_migration, Part, Thing};
+        let t = |table: &str, kind: &str, name: &str, body: &str| Thing { kind: kind.into(), table: table.into(), name: name.into(), body: body.into() };
+        let owner = t("b", "column", "owner", "text null=NO default=-");
+        let old = vec![owner.clone()];
+        let new = vec![
+            owner,
+            t("b", "column", "id", "bigint null=NO default=nextval('b_id_seq'::regclass)"),
+            t("b", "constraint", "b_pkey", "PRIMARY KEY (id)"),
+            t("b", "constraint", "b_owner_key", "UNIQUE (owner)"),
+        ];
+        let plan: Vec<(Part, String)> = plan_migration(&old, &new, &[], &[]).unwrap().into_iter().map(|p| (p.part, p.stmt)).collect();
+        let of = |part: Part| plan.iter().filter(|(p, _)| *p == part).map(|(_, s)| s.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            of(Part::Expand),
+            ["ALTER TABLE b ADD COLUMN id bigserial NOT NULL;", "ALTER TABLE b ADD CONSTRAINT b_pkey PRIMARY KEY (id);"]
+        );
+        assert_eq!(of(Part::Contract), ["ALTER TABLE b ADD CONSTRAINT b_owner_key UNIQUE (owner);"]);
+    }
+
     #[test]
     fn a_plan_splits_into_what_adds_and_what_drops_or_tightens() {
         use super::{plan_migration, Part, Thing};
@@ -3430,6 +3527,23 @@ mod tests {
     #[test]
     fn a_whole_identifier_is_replaced_never_part_of_one() {
         assert_eq!(super::replace_ident("old_member_id, member_id)", "member_id", "instance_id"), "old_member_id, instance_id)");
+    }
+
+    #[test]
+    fn giving_up_a_lock_says_how_long_it_tried_and_where_it_waited() {
+        use super::{gave_up_waiting, GivenUp, CONTENDED_FOR, LOCK_WAIT};
+        let timed_out = gave_up_waiting(&GivenUp { deadlock: false, waiting: None });
+        assert!(timed_out.contains(&format!("trying for {}s", CONTENDED_FOR.as_secs())), "{timed_out}");
+        assert!(timed_out.contains(&format!("at most {LOCK_WAIT} for each lock")), "{timed_out}");
+        assert!(!timed_out.contains("The database says"), "{timed_out}");
+        assert!(timed_out.contains("pg_stat_activity"), "{timed_out}");
+
+        let deadlocked =
+            gave_up_waiting(&GivenUp { deadlock: true, waiting: Some("while updating tuple (0,5) in relation \"run\"".into()) });
+        assert!(deadlocked.contains("deadlock"), "{deadlocked}");
+        assert!(!deadlocked.contains(&format!("at most {LOCK_WAIT}")), "{deadlocked}");
+        assert!(deadlocked.contains("The database says it was waiting while updating tuple (0,5) in relation \"run\"."), "{deadlocked}");
+        assert!(!deadlocked.contains('\u{2014}') && !timed_out.contains('\u{2014}'));
     }
 
     // Layer-1 tests for the pure parts: the fingerprint, and which migrations

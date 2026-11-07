@@ -7,10 +7,10 @@ use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
 use weft::node::NodeOutput;
-use weft::storage::{KeepTtl, StorageScope};
+use weft::storage::{StorageScope};
 use weft::{Access, RunContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
-use super::fal::{merge_params, run_queued, video_url};
+use super::fal::{merge_params, run_queued, Queued, video_url};
 
 #[derive(NodeManifest)]
 pub struct FalGenerateVideoNode;
@@ -36,16 +36,15 @@ impl Node for FalGenerateVideoNode {
         merge_params(&mut payload, params.as_ref());
 
         let http = ctx.client(&account).await?;
+        let mut job = ctx.keep(Queued::default()).await?;
         let answer =
-            run_queued(&ctx, &account, &http, &model, &payload, "fal: generate the video").await?;
+            run_queued(&mut job, &account, &http, &model, &payload, "fal: generate the video").await?;
 
         let url = video_url(&answer).node_err("fal answered no video for this generation")?;
         let ty = ctx.output_type("video")?;
         let stored = ctx
             .storage(StorageScope::Run)
-            // The generated video is the run's product: keep it past the
-            // run (default 30-day access-bumped TTL).
-            .internalize(&Value::String(url.to_string()), &ty, Some(KeepTtl::Default))
+            .internalize(&Value::String(url.to_string()), &ty, None)
             .await?;
         ctx.pulse_downstream(NodeOutput::new().set("video", stored)).await
     }

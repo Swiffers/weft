@@ -85,16 +85,25 @@ pub fn connection_failed(e: &anyhow::Error) -> bool {
     e.chain().filter_map(|cause| cause.downcast_ref::<reqwest::Error>()).any(failed_on_the_way)
 }
 
-/// [`connection_failed`] for one request's error.
+/// [`connection_failed`] for one request's error. A request the install
+/// did not answer within its time limit ([`NoAnswerInTime`]) is one: its
+/// error carries the request's own.
 fn failed_on_the_way(cause: &reqwest::Error) -> bool {
     cause.status().is_none()
         && !tls_failure(cause)
         && (cause.is_connect() || cause.is_timeout() || cause.is_request() || cause.is_body() || cause.is_decode())
 }
 
-/// Whether the connection was never made: refused, or not made in time.
+/// Whether the connection was never made: refused, or not made in time
+/// ([`CONNECT_TIMEOUT`], which reqwest reports as a connect error).
 fn no_connection(cause: &reqwest::Error) -> bool {
-    !tls_failure(cause) && (cause.is_connect() || cause.is_timeout())
+    !tls_failure(cause) && cause.is_connect()
+}
+
+/// Whether the connection was made and the answer did not come whole
+/// within the request's time limit.
+fn not_answered_in_time(cause: &reqwest::Error) -> bool {
+    cause.is_timeout() && !cause.is_connect()
 }
 
 /// Whether `cause` is TLS refusing the other end, which is how rustls
@@ -165,6 +174,48 @@ impl std::error::Error for InstallUnreachable {
     }
 }
 
+/// In an error's chain when the install was reached and its answer did not
+/// come whole within the request's time limit ([`ANSWER_WITHIN`], or a
+/// long-poll's hold and [`HELD_MARGIN`]): the copy of the install serving
+/// it may have stopped while a gateway in front of it holds the connection
+/// (Cloud Run holds one up to an hour). Nothing said no, so a request that
+/// is safe to send again is looked at again
+/// (`crate::commands::ensure::look_again_after`).
+#[derive(Debug)]
+pub struct NoAnswerInTime {
+    pub limit: std::time::Duration,
+    pub cause: reqwest::Error,
+}
+
+impl std::fmt::Display for NoAnswerInTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the install did not answer within {} (the copy of it serving the request may have stopped)",
+            crate::progress::elapsed_text(self.limit.as_secs())
+        )
+    }
+}
+
+impl std::error::Error for NoAnswerInTime {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+/// How long the install may take to answer an ordinary request whole. It
+/// answers one in moments, and in well under a minute when it starts from
+/// nothing (its service and its database waking); a database too busy to
+/// take the request is answered at once with a `503` the client waits out
+/// on its own ([`busy_answer`]). A request past this is one its serving
+/// copy stopped answering.
+pub const ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// What a long-poll, which the install holds open up to the hold it was
+/// asked for before it answers, gets on top of that hold: its own start
+/// and its answer's way back.
+pub const HELD_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How long making a connection to the install may take before the
 /// request fails as unreachable. An install answers a connection in well
 /// under a second on this machine and in a few seconds on a cloud that
@@ -186,6 +237,10 @@ pub struct DispatcherClient {
     /// that is how a command outlives one instance token.
     bearer: Option<Arc<RwLock<String>>>,
     http: reqwest::Client,
+    /// How long a request may take to be answered whole: [`ANSWER_WITHIN`]
+    /// unless set otherwise ([`Self::waiting_up_to`],
+    /// [`Self::waiting_on_its_work`]).
+    answer_within: Option<std::time::Duration>,
 }
 
 impl DispatcherClient {
@@ -193,12 +248,43 @@ impl DispatcherClient {
         // The one connection setup every request to the install uses,
         // live-update streams included.
         // A connection whose path died fails within a minute or so
-        // (`notice_dead_connections`); a request's whole length has no
-        // limit, since some verbs wait as long as the person's own work runs.
+        // (`notice_dead_connections`); a request whose answer does not
+        // come within its time limit fails too (`answer_within`), which
+        // catches a copy that stopped behind a gateway holding the
+        // connection open.
         let http = weft_core::net::notice_dead_connections(weft_core::net::http_client().connect_timeout(CONNECT_TIMEOUT))
             .build()
             .expect("an HTTP client with only timeouts set always builds");
-        Self { base: base.into(), target: None, bearer: operator_key.map(|key| Arc::new(RwLock::new(key))), http }
+        Self {
+            base: base.into(),
+            target: None,
+            bearer: operator_key.map(|key| Arc::new(RwLock::new(key))),
+            http,
+            answer_within: Some(ANSWER_WITHIN),
+        }
+    }
+
+    /// The same client, for a long-poll the install holds open up to
+    /// `hold` before it answers: each request may take that and
+    /// [`HELD_MARGIN`].
+    pub fn waiting_up_to(&self, hold: std::time::Duration) -> Self {
+        Self { answer_within: Some(hold + HELD_MARGIN), ..self.clone() }
+    }
+
+    /// The same client, for a request the install answers only once its
+    /// own work is done, however long that takes (an infra copy booting, a
+    /// frontend's service made, a call about connections that reaches an
+    /// outside service through the broker, which the install sends again
+    /// for as long as the broker's database turns it away): no time limit.
+    pub fn waiting_on_its_work(&self) -> Self {
+        Self { answer_within: None, ..self.clone() }
+    }
+
+    /// The same client, its requests held to `limit`: for a test, whose
+    /// install that never answers must not take minutes to say so.
+    #[cfg(test)]
+    pub(crate) fn answering_within(&self, limit: std::time::Duration) -> Self {
+        Self { answer_within: Some(limit), ..self.clone() }
     }
 
     /// The install's address, as requests are sent to it.
@@ -255,7 +341,9 @@ impl DispatcherClient {
     ) -> anyhow::Result<impl futures::Stream<Item = anyhow::Result<eventsource_stream::Event>> + use<>> {
         use eventsource_stream::{EventStreamError, Eventsource};
         use futures::StreamExt;
-        let resp = self.check(self.send(reqwest::Method::GET, path, None).await?).await?;
+        // A stream goes on for as long as what it follows: no time limit.
+        let streaming = self.waiting_on_its_work();
+        let resp = streaming.check(streaming.send(reqwest::Method::GET, path, None).await?).await?;
         let url = resp.url().clone();
         Ok(resp.bytes_stream().eventsource().map(move |event| {
             event.map_err(|e| match e {
@@ -276,18 +364,51 @@ impl DispatcherClient {
     /// plain sleep, so Ctrl+C stops the command at once: nothing in this
     /// path catches it, and a verb that does catch it (`tokio::signal::ctrl_c`
     /// in a `select!`) drops this request, sleep and all.
+    ///
+    /// A read the platform answered for a copy of the install that stopped
+    /// ([`send_once_more`]) is sent once more, and a line on stderr says
+    /// so: the platform sends it to another copy. A request sent with a
+    /// safe method is a read; one with a body that only reads says so
+    /// ([`Self::send_reading`]).
     async fn send(
         &self,
         method: reqwest::Method,
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> anyhow::Result<reqwest::Response> {
+        self.send_as(Sent::of(&method), method, path, body).await
+    }
+
+    /// [`Self::send`] of a request that only reads, whatever its method: a
+    /// question too large for a URL (`weft status`'s hashes) is a POST.
+    async fn send_reading(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.send_as(Sent::Read, method, path, body).await
+    }
+
+    async fn send_as(
+        &self,
+        sent: Sent,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> anyhow::Result<reqwest::Response> {
         let started = std::time::Instant::now();
         let mut waits = 0u32;
+        let mut sent_again = false;
         loop {
             let resp = self.send_once(method.clone(), path, body).await?;
             let from_install = resp.headers().contains_key(weft_core::install::INSTALL_ANSWER_HEADER);
             let status = resp.status();
+            if send_once_more(sent, status, from_install, sent_again) {
+                sent_again = true;
+                eprintln!("warning: {}; asking it once more", platform_failure_text(status));
+                continue;
+            }
             if !busy_answer(status, from_install) {
                 return Ok(resp);
             }
@@ -295,7 +416,7 @@ impl DispatcherClient {
             // The answer's own words say why; one that cannot be read
             // still says the install is busy, by its status.
             let body = resp.text().await.unwrap_or_default();
-            say_busy(&failure_text(status, content_type.as_deref(), &body), started.elapsed());
+            say_busy(&failure_text(status, from_install, content_type.as_deref(), &body), started.elapsed());
             tokio::time::sleep(busy_wait(waits, jitter())).await;
             waits = waits.saturating_add(1);
         }
@@ -310,6 +431,9 @@ impl DispatcherClient {
     ) -> anyhow::Result<reqwest::Response> {
         let url = format!("{}{}", self.base, path);
         let mut builder = self.http.request(method.clone(), &url);
+        if let Some(limit) = self.answer_within {
+            builder = builder.timeout(limit);
+        }
         if let Some(key) = self.current_bearer()? {
             builder = builder.bearer_auth(key);
         }
@@ -332,6 +456,9 @@ impl DispatcherClient {
     fn failed(&self, cause: reqwest::Error, doing: String) -> anyhow::Error {
         if no_connection(&cause) {
             return anyhow::Error::new(InstallUnreachable { url: self.base.clone(), target: self.target.clone(), cause }).context(doing);
+        }
+        if let Some(limit) = self.answer_within.filter(|_| not_answered_in_time(&cause)) {
+            return anyhow::Error::new(NoAnswerInTime { limit, cause }).context(doing);
         }
         anyhow::Error::new(cause).context(doing)
     }
@@ -383,7 +510,7 @@ impl DispatcherClient {
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
         let body = self.text(resp).await.with_context(|| format!("read the body of a {status} answer"))?;
-        let message = failure_text(status, content_type.as_deref(), &body);
+        let message = failure_text(status, from_install, content_type.as_deref(), &body);
         Err(anyhow::Error::new(Refused { status, message, from_install, marked }))
     }
 
@@ -449,6 +576,25 @@ impl DispatcherClient {
         Ok(Some(self.answer(resp).await?))
     }
 
+    /// POST of a question that only reads (a body too large or too
+    /// structured for a URL), answering JSON. It is sent again like any
+    /// read the platform lost ([`send_once_more`]); any failure is an
+    /// error.
+    pub async fn ask_json(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let resp = self.send_reading(reqwest::Method::POST, path, Some(body)).await?;
+        self.answer(resp).await
+    }
+
+    /// [`Self::ask_json`], `None` on a 404 carrying the `x-weft-not-found`
+    /// marker, as [`Self::get_json_if_found`].
+    pub async fn ask_json_if_found(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<Option<serde_json::Value>> {
+        let resp = self.send_reading(reqwest::Method::POST, path, Some(body)).await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND && resp.headers().contains_key("x-weft-not-found") {
+            return Ok(None);
+        }
+        Ok(Some(self.answer(resp).await?))
+    }
+
     /// POST answering JSON, `None` when the install says the resource is
     /// gone (a 404 carrying the `x-weft-not-found` marker): for a step of a
     /// removal, whose retry after a finished one must land on success.
@@ -483,16 +629,6 @@ impl DispatcherClient {
     pub async fn delete_json(&self, path: &str) -> anyhow::Result<serde_json::Value> {
         let resp = self.send(reqwest::Method::DELETE, path, None).await?;
         self.answer(resp).await
-    }
-
-    /// POST with a JSON body, handing back the status and the body
-    /// text whatever the status: for a caller that reads a structured
-    /// refusal (the run endpoint's 422 carries a JSON `Refusal`) and
-    /// treats every other failure as `check` would.
-    pub async fn post_json_status(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<(u16, String)> {
-        let resp = self.send(reqwest::Method::POST, path, Some(body)).await?;
-        let status = resp.status();
-        Ok((status.as_u16(), self.text(resp).await?))
     }
 
     /// POST with a JSON body, handing back the success status and the
@@ -557,7 +693,8 @@ const BUSY_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(4);
 /// Every other answer is the answer, shown with its words, the platform's
 /// `503` among them: it may be the install down for good, and waiting on
 /// one that never lifts would leave the command saying "busy" forever. A
-/// caller that knows its request is safe to send again and that the
+/// read the platform answered so is sent once more ([`send_once_more`]),
+/// and a caller that knows its request is safe to send again and that the
 /// install may be starting up reads the rest itself
 /// (`crate::commands::ensure::look_again_after`).
 // SYNC: busy_answer <-> crates/weft-core/src/install.rs (asks_again), extension-vscode/src/dispatcher.ts (worthTryingAgain)
@@ -566,6 +703,55 @@ pub(crate) fn busy_answer(status: reqwest::StatusCode, from_install: bool) -> bo
         reqwest::StatusCode::TOO_MANY_REQUESTS => !from_install,
         _ => weft_core::install::asks_again(status.as_u16(), from_install),
     }
+}
+
+/// Whether an answer with `status` is the platform in front of the install
+/// saying the copy of it that should serve the request is not there: a
+/// 502, 503 or 504 the install did not give itself (`from_install`
+/// false). The copy stopped, or is starting; the same request may get
+/// through on another one.
+// SYNC: platform_lost_the_copy <-> extension-vscode/src/dispatcher.ts (worthTryingAgain)
+pub(crate) fn platform_lost_the_copy(status: reqwest::StatusCode, from_install: bool) -> bool {
+    !from_install
+        && matches!(status, reqwest::StatusCode::BAD_GATEWAY | reqwest::StatusCode::SERVICE_UNAVAILABLE | reqwest::StatusCode::GATEWAY_TIMEOUT)
+}
+
+/// What sending a request again does on the install.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sent {
+    /// Nothing: it only reads.
+    Read,
+    /// It may change something there.
+    Write,
+}
+
+impl Sent {
+    /// A request sent with `method`: a safe method only reads.
+    pub(crate) fn of(method: &reqwest::Method) -> Self {
+        if method.is_safe() { Sent::Read } else { Sent::Write }
+    }
+}
+
+/// Whether a request that is `sent` and answered `status` is sent once
+/// more: a read (which changes nothing on the install however often it
+/// is sent) the platform answered because the copy serving it stopped
+/// ([`platform_lost_the_copy`]), not `sent_again` already. Once, so an
+/// install that is down for good is said at once rather than waited on: a
+/// caller that knows the install may be starting up looks again itself
+/// (`crate::commands::ensure::look_again_after`).
+pub(crate) fn send_once_more(sent: Sent, status: reqwest::StatusCode, from_install: bool, sent_again: bool) -> bool {
+    sent == Sent::Read && !sent_again && platform_lost_the_copy(status, from_install)
+}
+
+/// What an answer the platform gave for a copy of the install that stopped
+/// ([`platform_lost_the_copy`]) means, and what raises the limit it most
+/// often ran into.
+pub(crate) fn platform_failure_text(status: reqwest::StatusCode) -> String {
+    format!(
+        "the install's address answered {status}, but weft did not write it: the platform in front of it did, which happens \
+         when the copy serving the request stopped mid-request, most often because it ran out of memory (its log says \
+         `Memory limit of ... exceeded`); raise it with the `WEFT_DISPATCHER_MEMORY` repository variable (docs/src/running/cloud.md)"
+    )
 }
 
 /// How long to wait before asking a busy install again, after `waits`
@@ -627,11 +813,16 @@ fn warn_once_on_version_note(resp: &reqwest::Response) {
     WARNED.call_once(|| eprintln!("warning: {note}"));
 }
 
-/// The error a failed answer turns into. An HTML page did not come from
-/// weft (which answers in text or JSON) but from something in front of it,
-/// a load balancer or a proxy, so it is named with its title rather than
-/// printed whole. Any other body is the refusal weft wrote.
-fn failure_text(status: reqwest::StatusCode, content_type: Option<&str>, body: &str) -> String {
+/// The error a failed answer turns into. The platform answering for a
+/// copy of the install that stopped says so and what to do
+/// ([`platform_failure_text`]). An HTML page did not come from weft (which
+/// answers in text or JSON) but from something in front of it, a load
+/// balancer or a proxy, so it is named with its title rather than printed
+/// whole. Any other body is the refusal weft wrote.
+fn failure_text(status: reqwest::StatusCode, from_install: bool, content_type: Option<&str>, body: &str) -> String {
+    if platform_lost_the_copy(status, from_install) {
+        return platform_failure_text(status);
+    }
     let html = content_type.is_some_and(|t| t.trim_start().to_ascii_lowercase().starts_with("text/html"));
     if html {
         let title = html_title(body).map(|t| format!(" (\"{t}\")")).unwrap_or_default();
@@ -683,6 +874,9 @@ pub(crate) mod fake {
         Answers(&'static [&'static str]),
         /// Read the request, then reset the connection without a word.
         Reset,
+        /// Read the request, then hold the connection open and never
+        /// answer: a copy that stopped behind a gateway holding it.
+        Hold,
     }
 
     /// The address of a stand-in install doing `then` to every request
@@ -692,6 +886,7 @@ pub(crate) mod fake {
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
             let mut answered = 0usize;
+            let mut held = Vec::new();
             loop {
                 let Ok((mut conn, _)) = listener.accept().await else { return };
                 let mut request = vec![0u8; 64 * 1024];
@@ -703,6 +898,13 @@ pub(crate) mod fake {
                 answered += 1;
                 match then {
                     Then::Answer(raw) => {
+                        // Said closed, as it is: a client that took the
+                        // connection for kept alive would send its next
+                        // request down it as it closes, and meet a reset.
+                        let raw = match raw.split_once("\r\n") {
+                            Some((status, rest)) => format!("{status}\r\nconnection: close\r\n{rest}"),
+                            None => raw.to_string(),
+                        };
                         let _ = conn.write_all(raw.as_bytes()).await;
                         let _ = conn.shutdown().await;
                     }
@@ -710,6 +912,7 @@ pub(crate) mod fake {
                         #[allow(deprecated)]
                         conn.set_linger(Some(std::time::Duration::ZERO)).unwrap();
                     }
+                    Then::Hold => held.push(conn),
                     Then::Answers(_) => unreachable!("a script was resolved to its answer above"),
                 }
             }
@@ -739,8 +942,8 @@ mod tests {
     use futures::StreamExt;
     use super::fake::{closed, install, Then};
     use super::{
-        busy_answer, busy_line, busy_wait, connection_failed, failure_text, is_loopback_address, refusal, refusal_text, DispatcherClient,
-        InstallUnreachable, BUSY_WAIT_MAX,
+        busy_answer, busy_line, busy_wait, connection_failed, failure_text, is_loopback_address, platform_failure_text, platform_lost_the_copy,
+        refusal, refusal_text, send_once_more, DispatcherClient, Sent, InstallUnreachable, BUSY_WAIT_MAX,
     };
     use reqwest::StatusCode;
 
@@ -823,8 +1026,75 @@ mod tests {
         assert_eq!(format!("{e:#}"), "quota exceeded", "the install's 500 is the answer, in its own words");
 
         let platform_down = DispatcherClient::new(install(Then::Answers(&[PLATFORM_DOWN, ANSWERED])).await, None);
-        let e = platform_down.get_json("/install").await.unwrap_err();
-        assert_eq!(refusal(&e).map(|r| r.status()), Some(StatusCode::SERVICE_UNAVAILABLE), "the platform's 503 is the answer: {e:#}");
+        let e = platform_down.post_json("/projects", &serde_json::json!({})).await.unwrap_err();
+        assert_eq!(refusal(&e).map(|r| r.status()), Some(StatusCode::SERVICE_UNAVAILABLE), "the platform's 503 to a write is the answer: {e:#}");
+    }
+
+    /// Only the platform's 502, 503 or 504 says the copy serving the
+    /// request is gone; the install's own, and any other status, never.
+    #[test]
+    fn only_the_platforms_gateway_failure_is_a_lost_copy() {
+        for status in [StatusCode::BAD_GATEWAY, StatusCode::SERVICE_UNAVAILABLE, StatusCode::GATEWAY_TIMEOUT] {
+            assert!(platform_lost_the_copy(status, false), "{status}");
+            assert!(!platform_lost_the_copy(status, true), "the install's own {status}");
+        }
+        for status in [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS, StatusCode::INTERNAL_SERVER_ERROR, StatusCode::NOT_FOUND] {
+            assert!(!platform_lost_the_copy(status, false), "{status}");
+        }
+    }
+
+    /// A read the platform answered for a lost copy is sent once more, and
+    /// only once; a write never is, nor anything the install answered.
+    #[test]
+    fn a_read_the_platform_lost_is_sent_once_more() {
+        use reqwest::Method;
+        assert!(send_once_more(Sent::of(&Method::GET), StatusCode::SERVICE_UNAVAILABLE, false, false));
+        assert!(send_once_more(Sent::of(&Method::GET), StatusCode::BAD_GATEWAY, false, false));
+        assert!(!send_once_more(Sent::of(&Method::GET), StatusCode::SERVICE_UNAVAILABLE, false, true), "already sent again");
+        assert!(!send_once_more(Sent::of(&Method::GET), StatusCode::SERVICE_UNAVAILABLE, true, false), "the install's own 503");
+        assert!(!send_once_more(Sent::of(&Method::GET), StatusCode::INTERNAL_SERVER_ERROR, false, false));
+        for write in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            assert!(!send_once_more(Sent::of(&write), StatusCode::SERVICE_UNAVAILABLE, false, false), "{write}");
+        }
+        // A question too large for a URL is a POST that only reads.
+        assert!(send_once_more(Sent::Read, StatusCode::SERVICE_UNAVAILABLE, false, false));
+    }
+
+    /// The platform's answer for a lost copy says weft did not write it,
+    /// why it happens, and what raises the limit.
+    #[test]
+    fn a_lost_copy_says_what_happened_and_what_raises_the_limit() {
+        assert_eq!(
+            platform_failure_text(StatusCode::SERVICE_UNAVAILABLE),
+            "the install's address answered 503 Service Unavailable, but weft did not write it: the platform in front of it \
+             did, which happens when the copy serving the request stopped mid-request, most often because it ran out of \
+             memory (its log says `Memory limit of ... exceeded`); raise it with the `WEFT_DISPATCHER_MEMORY` repository \
+             variable (docs/src/running/cloud.md)"
+        );
+        assert_eq!(
+            failure_text(StatusCode::BAD_GATEWAY, false, Some("text/html"), "<html><title>Bad Gateway</title></html>"),
+            platform_failure_text(StatusCode::BAD_GATEWAY),
+            "said over the platform's own page"
+        );
+    }
+
+    /// A read the platform answered for a lost copy goes through on the
+    /// next copy, a POST that only reads too; one lost twice fails saying
+    /// what the platform's answer means.
+    #[tokio::test]
+    async fn a_read_is_sent_once_more_after_a_lost_copy() {
+        const LOST: &str = "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 11\r\n\r\nunavailable";
+        const ANSWERED: &str = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 7\r\n\r\n{\"a\":1}";
+        let once = DispatcherClient::new(install(Then::Answers(&[LOST, ANSWERED])).await, None);
+        assert_eq!(once.get_json("/install").await.unwrap(), serde_json::json!({ "a": 1 }));
+        let asked = DispatcherClient::new(install(Then::Answers(&[LOST, ANSWERED])).await, None);
+        assert_eq!(asked.ask_json("/access/lookup", &serde_json::json!({})).await.unwrap(), serde_json::json!({ "a": 1 }));
+
+        let twice = DispatcherClient::new(install(Then::Answers(&[LOST, LOST, ANSWERED])).await, None);
+        let e = twice.get_json("/install").await.unwrap_err();
+        assert_eq!(refusal(&e).map(|r| r.status()), Some(StatusCode::SERVICE_UNAVAILABLE), "{e:#}");
+        assert!(refusal(&e).is_some_and(|r| !r.is_the_installs()));
+        assert_eq!(e.to_string(), platform_failure_text(StatusCode::SERVICE_UNAVAILABLE));
     }
 
     fn unreachable(e: &anyhow::Error) -> bool {
@@ -854,8 +1124,25 @@ mod tests {
         );
         let e = cut.get_json("/install").await.unwrap_err();
         assert!(connection_failed(&e) && !unreachable(&e), "cut halfway through the answer: {e:#}");
-        let e = cut.post_json_status("/run", &serde_json::json!({})).await.unwrap_err();
-        assert!(connection_failed(&e), "a status read never swallows its body: {e:#}");
+    }
+
+    /// A request the install took and never answered fails once its time
+    /// limit is up, as a request that failed on its way (the install was
+    /// reached, so never as unreachable), saying how long it waited; a
+    /// long-poll's limit is its hold and the margin.
+    #[tokio::test]
+    async fn a_request_never_answered_fails_on_its_way_once_its_limit_is_up() {
+        let held = DispatcherClient::new(install(Then::Hold).await, None).answering_within(std::time::Duration::from_millis(200));
+        let e = held.get_json("/install").await.unwrap_err();
+        assert!(connection_failed(&e) && !unreachable(&e), "{e:#}");
+        let no_answer = e.chain().find_map(|cause| cause.downcast_ref::<super::NoAnswerInTime>()).expect("no answer in time");
+        assert_eq!(no_answer.limit, std::time::Duration::from_millis(200));
+        assert!(format!("{e:#}").contains("the install did not answer within"), "{e:#}");
+        let client = DispatcherClient::new(closed(), None);
+        assert_eq!(client.answer_within, Some(super::ANSWER_WITHIN));
+        let polling = client.waiting_up_to(std::time::Duration::from_secs(25));
+        assert_eq!(polling.answer_within, Some(std::time::Duration::from_secs(25) + super::HELD_MARGIN));
+        assert_eq!(polling.waiting_on_its_work().answer_within, None);
     }
 
     /// A status the install answered is a refusal carrying it, never a
@@ -927,18 +1214,23 @@ mod tests {
         let length_required = reqwest::StatusCode::LENGTH_REQUIRED;
         let page = "<!DOCTYPE html><html><head><TITLE>Error 411 (Length Required)!!1</TITLE><style>body{}</style></head><body><p>long page</p></body></html>";
         assert_eq!(
-            failure_text(length_required, Some("text/html; charset=UTF-8"), page),
+            failure_text(length_required, false, Some("text/html; charset=UTF-8"), page),
             "the install's address answered 411 Length Required with an HTML page (\"Error 411 (Length Required)!!1\"), \
              which comes from something in front of weft, not from weft itself"
         );
         assert_eq!(
-            failure_text(reqwest::StatusCode::BAD_GATEWAY, Some("text/html"), "<html><title>\n </title>oops</html>"),
-            "the install's address answered 502 Bad Gateway with an HTML page, which comes from something in front of weft, not from weft itself"
+            failure_text(reqwest::StatusCode::FORBIDDEN, false, Some("text/html"), "<html><title>\n </title>oops</html>"),
+            "the install's address answered 403 Forbidden with an HTML page, which comes from something in front of weft, not from weft itself"
         );
         assert_eq!(
-            failure_text(reqwest::StatusCode::CONFLICT, Some("text/plain; charset=utf-8"), "project is already activating"),
+            failure_text(reqwest::StatusCode::CONFLICT, true, Some("text/plain; charset=utf-8"), "project is already activating"),
             "project is already activating"
         );
-        assert_eq!(failure_text(reqwest::StatusCode::NOT_FOUND, None, ""), "dispatcher returned 404 Not Found");
+        assert_eq!(failure_text(reqwest::StatusCode::NOT_FOUND, true, None, ""), "dispatcher returned 404 Not Found");
+        assert_eq!(
+            failure_text(reqwest::StatusCode::BAD_GATEWAY, true, None, "the store did not answer"),
+            "the store did not answer",
+            "the install's own 502 is its own words"
+        );
     }
 }

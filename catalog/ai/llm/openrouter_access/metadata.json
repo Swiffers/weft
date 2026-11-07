@@ -16,11 +16,22 @@
     "doors": ["shared", "own"],
     "acquisition": {
       "kind": "static",
-      "fields": [
+      "ways": [
         {
-          "name": "key",
-          "label": "API key",
-          "placeholder": "sk-or-..."
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "sk-or-..."
+            }
+          ],
+          "guide": {
+            "link": "https://openrouter.ai/keys",
+            "steps": [
+              "Open openrouter.ai/keys and create an API key.",
+              "Paste it below and name the connection."
+            ]
+          }
         }
       ]
     },
@@ -45,21 +56,12 @@
     "verification": {
       "rung": "reports_validity",
       "cost": "free"
-    },
-    "ownPage": {
-      "guide": {
-        "link": "https://openrouter.ai/keys",
-        "steps": [
-          "Open openrouter.ai/keys and create an API key.",
-          "Paste it below and name the connection."
-        ]
-      }
     }
   },
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[openrouter]",
       "widget": {
         "kind": "access"
       },
@@ -69,7 +71,7 @@
   "outputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[openrouter]",
       "description": "Wire into OpenRouter Model nodes' `access` input."
     }
   ]

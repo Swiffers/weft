@@ -22,6 +22,9 @@ pub mod caller_token;
 pub mod door_fire;
 pub mod casing;
 pub mod comma_list;
+// What a program carries for the text of a file it names: a marker
+// naming the stored content, put back by the worker that reads it.
+pub mod content;
 #[cfg(feature = "runtime")]
 pub mod cancellation;
 #[cfg(feature = "runtime")]
@@ -204,7 +207,7 @@ pub use reqwest;
 #[cfg(feature = "runtime")]
 pub use bus::{
     BusCursor, BusEntry, BusEntryKind, BusHandle, BusInner, BusLookupError, BusOptions,
-    BusRegistry, CursorError, RegisterError, SendError, WaitError,
+    BusRegistry, RegisterError, SendError,
 };
 #[cfg(feature = "runtime")]
 pub use liveness::{
@@ -216,7 +219,7 @@ pub use generator::{Generator, StreamEnd, TryNext};
 pub use cancellation::CancellationFlag;
 #[cfg(feature = "runtime")]
 pub use context::{
-    ContextHandle, EndpointHandle, EndpointMethod, RunContext, Phase, ValueBag,
+    ContextHandle, EndpointHandle, EndpointMethod, Kept, PausePoint, RunContext, Phase, ValueBag,
     StorageHandle,
 };
 pub use access::spec::{AccessSpec, AppRegistration};
@@ -251,7 +254,7 @@ pub use node_test::{
 #[cfg(feature = "runtime")]
 pub use primitive::RunSnapshot;
 pub use primitive::{
-    AwaitedEntry, AwaitedEntryKind, KickedNode, SignalAuth, SignalRouting, SignalSpec,
+    KickedNode, RecordedWait, SignalAuth, SignalRouting, SignalSpec,
     SignalSurface, SuspensionInfo,
 };
 pub use project::{

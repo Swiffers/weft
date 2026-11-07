@@ -33,9 +33,11 @@ fn builder(pool: &Pool, images: Arc<FakeImageBuilder>) -> VersionBuilder {
 fn builder_on(pool: &Pool, images: Arc<dyn ImageBuilder>) -> VersionBuilder {
     VersionBuilder {
         images,
+        // The fake builds images, as a cloud does.
+        install: weft_core::install::InstallKind::Cloud,
         pool: pool.clone(),
         prunes: Default::default(),
-        blobs: weft_dispatcher::build::blob_cache::BlobCache::in_temp_dir(),
+        blobs: weft_dispatcher::build::blob_cache::BlobCache::in_temp_dir(false),
     }
 }
 
@@ -202,6 +204,30 @@ async fn present_images_are_skipped_without_the_gate(pool: Pool) {
     assert!(matches!(asked, VersionBuild::Ready { .. }), "nothing to wait on");
     assert!(fake.starts().is_empty());
     assert_eq!(gate.begun.load(Ordering::SeqCst), 0);
+}
+
+/// The standard worker the install made ready as it was set up is in the
+/// store with no build of it on the ledger: the first stock project runs
+/// on it, recorded as built, instead of building it again. Any other
+/// worker found that way is built again.
+#[weft_db_macros::test]
+async fn the_ready_standard_worker_is_used_without_a_build(pool: Pool) {
+    setup(&pool).await;
+    let fake = Arc::new(FakeImageBuilder::new());
+    let standard = weft_dispatcher::build::prune::standard_worker_ref(fake.as_ref()).unwrap();
+    let other = "fake.registry/weft-worker:unrecorded";
+    fake.set_image_exists(&standard);
+    fake.set_image_exists(other);
+    let builder = builder(&pool, fake.clone());
+    let gate = gate();
+    let asked = ask(&builder, &pool, uuid::Uuid::new_v4(), "standard", &[image(ImageKind::Worker, &standard)], gate.clone()).await.unwrap();
+    assert!(matches!(asked, VersionBuild::Ready { .. }), "the standard worker is there");
+    assert!(fake.starts().is_empty());
+    assert_eq!(gate.begun.load(Ordering::SeqCst), 0);
+    assert_eq!(status_of(&pool, &standard).await, "succeeded", "recorded as built");
+
+    waiting_on(ask(&builder, &pool, uuid::Uuid::new_v4(), "unrecorded", &[image(ImageKind::Worker, other)], gate).await.unwrap());
+    assert_eq!(fake.starts().len(), 1, "a worker nothing here built is built again");
 }
 
 /// A stale image is started once, and the request answers with
@@ -1469,4 +1495,42 @@ async fn a_lapsed_claim_is_never_passed_to_a_waiting_version(pool: Pool) {
     let versions: i64 = pool.scalar("SELECT count(*) FROM version_build", &[]).await.unwrap();
     assert_eq!(versions, 0, "no version written down");
     assert_eq!(status_of(&pool, image_ref).await, "cancelled", "what it started is stopped");
+}
+
+/// A program with triggers, registered under a hash, records each
+/// trigger's cut as its registration walked it, read back as walked; the
+/// same program registered again records nothing twice; and the cuts go
+/// with the project.
+#[weft_db_macros::test]
+async fn a_registration_records_its_triggers_cuts(pool: Pool) {
+    setup(&pool).await;
+    let id = uuid::Uuid::new_v4();
+    let projects = project_store(&pool, &[]).await;
+    let node = |id: &str, trigger: bool, input: bool| serde_json::json!({
+        "id": id, "nodeType": if trigger { "Cron" } else { "Debug" }, "label": null, "config": {}, "position": { "x": 0.0, "y": 0.0 },
+        "inputs": if input { serde_json::json!([{ "name": "data", "portType": "String", "required": true }]) } else { serde_json::json!([]) },
+        "outputs": [{ "name": "out", "portType": "String", "required": false }],
+        "features": if trigger { serde_json::json!({ "isTrigger": true }) } else { serde_json::json!({}) },
+        "scope": [], "groupBoundary": null, "requiresInfra": false, "images": []
+    });
+    let program: weft_core::ProjectDefinition = serde_json::from_value(serde_json::json!({
+        "id": id, "name": "p", "description": null,
+        "nodes": [node("tick", true, false), node("seen", false, true), node("tock", true, false)],
+        "edges": [{ "id": "e", "source": "tick", "sourceHandle": "out", "target": "seen", "targetHandle": "data" }],
+        "groups": [], "createdAt": "1970-01-01T00:00:00Z", "updatedAt": "1970-01-01T00:00:00Z"
+    }))
+    .unwrap();
+    let walked = weft_core::run_spec::trigger_cuts(&program);
+    assert_eq!(walked.len(), 2);
+    for _ in 0..2 {
+        projects
+            .register_with_hashes(program.clone(), "p", "", TENANT, Some("bin"), Some("def-1"), Some("infra"), None, None, None, None, None)
+            .await
+            .unwrap();
+    }
+    assert_eq!(projects.trigger_cuts(id, "def-1").await.unwrap(), Some(walked));
+    assert_eq!(projects.trigger_cuts(id, "def-2").await.unwrap(), None, "no such version, no cuts");
+    projects.remove(id).await.unwrap();
+    let left: i64 = pool.scalar("SELECT count(*) FROM program_trigger_cut WHERE project_id = $1", &[&id]).await.unwrap();
+    assert_eq!(left, 0, "the cuts go with the project");
 }

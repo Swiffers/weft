@@ -18,6 +18,7 @@ use axum::{
 use weft_broker_client::lifecycle_command::{InfraCommandSignal, INFRA_COMMAND_CHANNEL, ISSUED_WAKE};
 use weft_broker_client::protocol::*;
 use weft_task_store::db::{self, Client as _, Row};
+use weft_task_store::stopping::Deadline;
 use weft_task_store::tasks::DedupOutcome;
 use weft_task_store::TaskKind;
 
@@ -67,8 +68,9 @@ pub(crate) async fn require_worker_drives(
 /// `ctx.tag_run`: write the `run_tag` rows, synchronously, so
 /// they exist by the time the node's call returns (a following
 /// `stop_tagged` anchors on them). The run's own `RunTagged` is on
-/// record already: its worker writes it before any call that names the
-/// run. Only the worker driving the run tags it.
+/// record already (for an unrecorded run, its birth): its worker writes
+/// it before any call that names the run. Only the worker driving the
+/// run tags it.
 pub async fn run_tag(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
@@ -182,9 +184,12 @@ pub(crate) fn unix_now_secs() -> u64 {
 
 /// When a held call's wait of `wait_ms` ends: as long as the caller asks
 /// (it is held on a line, which has no idle timeout), and forever for a
-/// wait past what the clock holds.
-pub(crate) fn held_until(wait_ms: u64) -> tokio::time::Instant {
-    weft_core::deadline::after(tokio::time::Instant::now(), Duration::from_millis(wait_ms))
+/// wait past what the clock holds; or as soon as this copy is stopping,
+/// answering what the wait running out answers, so the caller asks again
+/// on a copy that runs. Every held call waits through this.
+pub(crate) fn held_until(state: &BrokerState, wait_ms: u64) -> Deadline {
+    Deadline::at(weft_core::deadline::after(tokio::time::Instant::now(), Duration::from_millis(wait_ms)))
+        .or_stop(&state.stopping)
 }
 
 // ---------- Tasks ----------
@@ -401,6 +406,17 @@ pub async fn task_enqueue_dedup(
                 "a program call's asker is the run that sends it".into(),
             ));
         }
+        // The key names the call's step in the asking run, and the install
+        // names what the call makes after it
+        // (`weft_core::program::program_call_id`): a key of another run's
+        // would reach what that run's calls made.
+        // SYNC: the step's spelling <-> crates/weft-engine/src/context.rs (program_call)
+        if !req.spec.dedup_key.as_deref().is_some_and(|key| key.starts_with(&format!("program_call/{run_id}/"))) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "a program call is keyed to its step in the asking run (program_call/<run>/...)".into(),
+            ));
+        }
         if let Some(target) = payload.project {
             // The worker is pinned to its own project, so the scope check
             // every other resource goes through would refuse a sibling:
@@ -450,11 +466,10 @@ pub async fn task_wait_terminal(
     Json(req): Json<TaskWaitTerminalRequest>,
 ) -> Resp<TaskWaitTerminalResponse> {
     require_task_owned_by(&state, &caller, req.task_id).await?;
-    let outcome = state
-        .tasks
-        .wait_for_terminal(req.task_id, Duration::from_millis(req.wait_ms))
-        .await
-        .map_err(|e| unavailable_or_internal(e.context("wait for the task to end")))?;
+    let outcome =
+        weft_task_store::terminal::wait_for_terminal_before(&state.pool, &state.signals, req.task_id, held_until(&state, req.wait_ms))
+            .await
+            .map_err(|e| unavailable_or_internal(e.context("wait for the task to end")))?;
     Ok(Json(TaskWaitTerminalResponse::from_outcome(outcome)))
 }
 
@@ -613,18 +628,28 @@ pub async fn infra_endpoint_url(
         (StatusCode::NOT_FOUND, format!("{}: the run's project is no longer registered", req.infra))
     })?;
     require_declared_infra(&declared, &req.infra)?;
-    let stored = state
+    // An endpoint inside another node's endpoint is read through to where
+    // that one answers now; the one it lives inside is held to the same
+    // rules as the handle the run asked with.
+    let allowed = |inner: &weft_core::infra::InfraHandle| {
+        if inner.instance().is_some() && inner.instance() != run.instance.as_ref() {
+            return Err(format!("{inner} belongs to another instance than the run asking for it"));
+        }
+        require_declared_infra(&declared, inner).map_err(|(_, why)| why)
+    };
+    let reached = state
         .infra
-        .endpoint(run.project, req.infra.place(), instance, req.infra.endpoint())
+        .reach(run.project, req.infra.place(), instance, req.infra.endpoint(), allowed)
         .await
         .map_err(|e| unavailable_or_internal(e.context("read the infra endpoint")))?;
     // A public endpoint hangs off the address the open internet reaches
     // now (a quick tunnel's moves when it is opened again), read only for
     // an endpoint that has one.
-    let address = match stored {
+    let address = match reached {
         None => None,
-        Some(weft_task_store::StoredEndpoint { url, public_path: None }) => Some(weft_core::infra::EndpointAddress { url, public_url: None }),
-        Some(weft_task_store::StoredEndpoint { url, public_path: Some(path) }) => {
+        Some(weft_task_store::Reached::Unreachable(why)) => return Err((StatusCode::CONFLICT, format!("{}: {why}", req.infra))),
+        Some(weft_task_store::Reached::At { url, public_path: None }) => Some(weft_core::infra::EndpointAddress { url, public_url: None }),
+        Some(weft_task_store::Reached::At { url, public_path: Some(path) }) => {
             let base = state.front_door().await.map_err(|e| unavailable_or_internal(e.context("read the install's outside address")))?;
             Some(weft_core::infra::EndpointAddress { url, public_url: Some(weft_core::infra::public_url(&base, &path)) })
         }
@@ -787,16 +812,37 @@ pub async fn resolve_connection(
         .instance
         .clone()
         .map(|instance| weft_core::instance::InstanceScope { project_id: owner.project, instance });
-    let resolved = weft_access_store::resolve_for_worker(
-        &state.pool,
-        &tenant,
-        weft_access_store::GrantUser::of(for_instance.as_ref()),
-        connection_id,
-        &req.service,
-        &req.required_permissions,
-        &req.required_values,
-    )
-    .await
+    let user = weft_access_store::GrantUser::of(for_instance.as_ref());
+    let resolved = match req.stale.as_deref() {
+        // A renewal (`ctx.renew`): the values the firing was handed stopped working.
+        Some(stale) => {
+            weft_access_store::renew_for_worker(
+                &state.pool,
+                state.install,
+                &tenant,
+                user,
+                connection_id,
+                &req.service,
+                &req.required_permissions,
+                &req.required_values,
+                stale,
+            )
+            .await
+        }
+        None => {
+            weft_access_store::resolve_for_worker(
+                &state.pool,
+                state.install,
+                &tenant,
+                user,
+                connection_id,
+                &req.service,
+                &req.required_permissions,
+                &req.required_values,
+            )
+            .await
+        }
+    }
     .map_err(|e| match e.downcast_ref::<weft_access_store::AccessError>() {
         // The store's own words name no place to fix it from; a node does.
         Some(weft_access_store::AccessError::NotFound) => (
@@ -815,6 +861,7 @@ pub async fn resolve_connection(
             owner: resolved.owner,
             keep_until_unix: Some(resolved.fresh_until.map_or(i64::MAX, |at| at.timestamp())),
             published_by: resolved.published_by,
+            way: resolved.way,
         },
         weft_core::CredentialOwner::Platform => {
             // The row's service (already matched against the request)
@@ -850,6 +897,7 @@ pub async fn resolve_connection(
                         // Leased per firing: never kept.
                         keep_until_unix: None,
                         published_by: resolved.published_by,
+                        way: resolved.way,
                     }
                 }
                 crate::credential::KeyResolution::NotConfigured => {
@@ -1221,7 +1269,7 @@ pub async fn supervisor_claim_command(
     // own ticks): the answer then says so, and the process takes ownership
     // at once instead of on its next tick. Only after a wake, so a
     // supervisor woken by a command it cannot take yet does not spin.
-    let deadline = held_until(req.wait_ms);
+    let deadline = held_until(&state, req.wait_ms);
     let mut heard = state.signals.subscribe();
     let mut woken_once = false;
     let cancel_heard = |channel: &str, payload: &str| {
@@ -1258,7 +1306,7 @@ pub async fn supervisor_claim_command(
             return Ok(Json(SupervisorClaim::UnownedWork));
         }
         let woken = heard
-            .woken_before(deadline, |channel, payload| ISSUED_WAKE.hears(channel, payload) || cancel_heard(channel, payload))
+            .woken_before(deadline.clone(), |channel, payload| ISSUED_WAKE.hears(channel, payload) || cancel_heard(channel, payload))
             .await
             .map_err(internal)?;
         if !woken {
@@ -1781,7 +1829,7 @@ pub async fn infra_wait_apply(
     }
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
-    let deadline = held_until(req.wait_ms);
+    let deadline = held_until(&state, req.wait_ms);
     let mut heard = state.signals.subscribe();
     loop {
         let answer = apply_command_state(&state, &req).await?;
@@ -1789,7 +1837,7 @@ pub async fn infra_wait_apply(
             return Ok(Json(answer));
         }
         let woken = heard
-            .woken_before(deadline, |channel, payload| {
+            .woken_before(deadline.clone(), |channel, payload| {
                 channel == INFRA_COMMAND_CHANNEL
                     && InfraCommandSignal::parse(payload) == Some(InfraCommandSignal::Done { id: req.command_id })
             })

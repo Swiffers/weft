@@ -33,7 +33,9 @@ concurrency:
 jobs:
   deploy:
     # A named release: `ubuntu-latest` moves to a new one on GitHub's
-    # schedule, under a workflow that worked the day before.
+    # schedule, under a workflow that worked the day before. The same as
+    # the install workflow's, whose CLI this job downloads and runs.
+    # SYNC: runs-on <-> .github/workflows/install-gcp.yml (runs-on, store the weft CLI in the install)
     runs-on: ubuntu-24.04
     env:
       # What happens to the runs going when the deploy replaces what they
@@ -54,10 +56,11 @@ jobs:
       # so an install upgraded since `weft target export` is followed here
       # with no setting to change. The CLI below is that weft's own (it
       # reads the project's nodes from this source), so what it sends is
-      # what the install expects. weft's release of that CLI is downloaded
-      # (waited for while it is still being built), otherwise it is built
-      # here from a cache that keeps the dependencies between runs, so a
-      # newer weft compiles only what changed in it.
+      # what the install expects. It is downloaded from the install itself,
+      # which stores the CLI its install workflow used, else from weft's
+      # release of that source (waited for while it is still being built),
+      # otherwise it is built here from a cache that keeps the dependencies
+      # between runs, so a newer weft compiles only what changed in it.
       - name: ask the install which weft it runs
         id: source
         run: |
@@ -82,7 +85,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if .weft/scripts/release-cli.sh .weft "$RUNNER_TEMP/weft"; then
+          if .weft/scripts/release-cli.sh .weft "$RUNNER_TEMP/weft" "${{ vars.WEFT_PUBLIC_URL }}"; then
             echo "$RUNNER_TEMP/weft" >> "$GITHUB_PATH"
             echo "found=yes" >> "$GITHUB_OUTPUT"
           else
@@ -113,7 +116,8 @@ jobs:
       # only the triggers that are on and behind it: taken down with what
       # arrives meanwhile held, their paused runs moved onto the new
       # build, and back on once the old version is done (this log names the
-      # runs it waits for meanwhile, each time they change). Neither turns
+      # runs it waits for meanwhile, each time they change, and says every
+      # 30 seconds that it is still going). Neither turns
       # anything on, so on a first deploy they leave the version ready for
       # `weft infra start --on <target>` and `weft activate --on <target>`,
       # run once by hand; a trigger or infra someone took down stays down.
@@ -185,7 +189,17 @@ jobs:
           rm "$RUNNER_TEMP/front-env.yaml"
           # The address weft recorded for it, the same shape as the
           # install's own (Cloud Run's main `status.url` is another one).
-          url=$(weft frontend ls --on ${{ vars.WEFT_TARGET }} --json | jq -r --arg name "${{ vars.WEFT_FRONTEND_NAME }}" '.[] | select(.name == $name) | .url')
+          # A failing weft prints its one error line and exits non-zero:
+          # checked before jq reads it, so the step fails with weft's reason.
+          if ! frontends=$(weft frontend ls --on ${{ vars.WEFT_TARGET }} --json); then
+            echo "$frontends" >&2
+            exit 1
+          fi
+          url=$(jq -r --arg name "${{ vars.WEFT_FRONTEND_NAME }}" '.[] | select(.name == $name) | .url // empty' <<<"$frontends")
+          if [ -z "$url" ]; then
+            echo "::error::the install lists no frontend named ${{ vars.WEFT_FRONTEND_NAME }} with an address; run \`weft target export ${{ vars.WEFT_TARGET }} --github\` again"
+            exit 1
+          fi
           echo "frontend: $url" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # The frontend now calls with the token this deploy gave it (named by

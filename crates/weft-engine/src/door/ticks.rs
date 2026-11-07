@@ -192,6 +192,23 @@ mod tests {
         weft_core::signal::limits::window(crate::now_unix() as i64).0
     }
 
+    /// Every tick carries the worker's memory note as the guard holds it
+    /// then: the lease row a tick writes holds it, though the worker
+    /// crossed before that row was ever written.
+    #[tokio::test]
+    async fn a_tick_carries_the_memory_note() {
+        let broker = FakeDoorBroker::new(Vec::new());
+        let memory = Arc::new(crate::busy::MemoryGuard::default());
+        let door = door_with_memory(broker.clone(), memory.clone());
+        memory.sample(Some(crate::busy::Memory { used: 950, limit: 1000 }), 12);
+        door.tick(None, false).await.unwrap();
+        memory.sample(Some(crate::busy::Memory { used: 100, limit: 1000 }), 13);
+        door.tick(None, false).await.unwrap();
+        let carried: Vec<_> = ticks(&broker).into_iter().map(|tick| tick.memory_full).collect();
+        let note = weft_broker_client::protocol::MemoryNote { used_bytes: 950, limit_bytes: 1000, at_unix: 12 };
+        assert_eq!(carried, [Some(note), None]);
+    }
+
     /// A call keeps the door ticking every second while its run goes; once
     /// it ends, one tick says so with the latest counts, and then nothing.
     #[tokio::test(start_paused = true)]
@@ -332,7 +349,7 @@ mod tests {
 
         // Meanwhile another copy ran the minute's one run.
         let minute = the_minute();
-        let ran = weft_broker_client::protocol::DoorCount { key: "e:t1".into(), hits: 1 };
+        let ran = weft_broker_client::protocol::DoorCount { key: "e:t1".into(), hits: 1, reason: None };
         *broker.heard.lock().unwrap() = (vec![ran], 2);
         *broker.tick_takes.lock().unwrap() = secs(2.0);
         let asked = Instant::now();

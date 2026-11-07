@@ -44,6 +44,7 @@ pub fn routes() -> Router<Arc<BrokerState>> {
         // The listener's serving surface.
         .route("/v1/access/listener-resolve", post(listener_resolve))
         .route("/v1/access/subscription/ensure", post(subscription_ensure))
+        .route("/v1/access/subscription/check", post(subscription_check))
         .route("/v1/access/subscription/drop", post(subscription_drop))
         // The receive surface the dispatcher forwards raw pushes to.
         .route("/v1/events/verify", post(events_verify))
@@ -108,6 +109,7 @@ async fn listener_resolve(
     let access_id = parse_access_id(&req.access_id)?;
     let source = weft_access_store::resolve_event_source(
         &state.pool,
+        state.install,
         &req.tenant,
         weft_access_store::GrantUser::of(req.for_instance.as_ref()),
         access_id,
@@ -148,6 +150,7 @@ async fn subscription_ensure(
     let ensured = weft_access_store::ensure_subscription(
         &state.pool,
         &state.lock_pool,
+        state.install,
         &weft_access_store::EnsureSubscription {
             for_instance: req.for_instance,
             tenant: req.tenant,
@@ -168,6 +171,39 @@ async fn subscription_ensure(
     }))
 }
 
+/// POST /v1/access/subscription/check: whether
+/// `/v1/access/subscription/ensure` could subscribe this signal on this
+/// install (`weft_access_store::check_subscription`), subscribing nothing:
+/// a refusal names the fix, as the subscribe would. Asked before anything
+/// is taken down for the signal to come back on.
+async fn subscription_check(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<SubscriptionEnsureRequest>,
+) -> Result<Json<Value>, ApiError> {
+    listener_only(&caller)?;
+    let access_id = parse_access_id(&req.access_id)?;
+    let (service, topic) = (req.service.clone(), req.topic.clone());
+    let receiver = || async { receiver_url(&state, &service, &topic).await };
+    weft_access_store::check_subscription(
+        &state.pool,
+        state.install,
+        &weft_access_store::EnsureSubscription {
+            for_instance: req.for_instance,
+            tenant: req.tenant,
+            service: req.service,
+            topic: req.topic,
+            access_id,
+            signal_token: req.signal_token,
+            params: req.params,
+        },
+        receiver,
+    )
+    .await
+    .map_err(crate::handlers::store_err)?;
+    Ok(Json(Value::Null))
+}
+
 /// POST /v1/access/subscription/drop: stop (at the provider) and
 /// forget every subscription serving this signal.
 async fn subscription_drop(
@@ -177,7 +213,7 @@ async fn subscription_drop(
 ) -> Result<Json<Value>, ApiError> {
     listener_only(&caller)?;
     let dropped =
-        weft_access_store::drop_subscriptions_for_signal(&state.pool, &state.lock_pool, &req.tenant, &req.signal_token)
+        weft_access_store::drop_subscriptions_for_signal(&state.pool, &state.lock_pool, state.install, &req.tenant, &req.signal_token)
             .await
             .map_err(crate::handlers::store_err)?;
     Ok(Json(serde_json::json!({ "dropped": dropped })))

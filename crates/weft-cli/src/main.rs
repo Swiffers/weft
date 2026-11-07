@@ -175,15 +175,16 @@ enum Cmd {
     },
     /// Run node self-tests. Without a target: every package. Without
     /// --tier: the basic + fake tiers (compiled + run locally, no
-    /// install needed). With a package name or node type: just that
-    /// scope. `--tier live` adds the live tier: real credentials
-    /// through the production access path, as a test run in the
-    /// install; it can spend money, so it confirms first (persist
-    /// "don't ask again" when prompted, or pass --yes).
+    /// install needed). With package names or node types: just those
+    /// (one build for all of them). `--tier live` adds the live tier:
+    /// real credentials through the production access path, as a test
+    /// run in the install; it can spend money, so it confirms first
+    /// (persist "don't ask again" when prompted, or pass --yes).
     #[command(name = "test-node")]
     TestNode {
-        /// A package name or a node type; absent = every package.
-        target: Option<String>,
+        /// Package names or node types (several allowed); none = every
+        /// package.
+        targets: Vec<String>,
         /// Run only the test with this name.
         #[arg(long)]
         test: Option<String>,
@@ -205,8 +206,9 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
         /// Run tests concurrently: bare `--parallel` runs everything at
-        /// once, `--parallel N` caps in-flight tests at N. Applies to
-        /// the local tiers and to live runs alike.
+        /// once, `--parallel N` runs up to N packages side by side, each
+        /// with up to N of its tests in flight, and up to N live tests at
+        /// once.
         #[arg(long, num_args = 0..=1, default_missing_value = "0", value_name = "N")]
         parallel: Option<usize>,
     },
@@ -267,7 +269,9 @@ enum Cmd {
         /// Start the cut at this node, optionally handing it inputs as
         /// node='{"port": value}': a handed port takes that value, and no
         /// wire into it runs. Repeatable; with --seed an unchanged start is
-        /// reused like any other node.
+        /// reused like any other node. Inside a loop's body too: started
+        /// and ended there, the part runs once, inside iteration 0, and
+        /// you hand it what the loop would have.
         #[arg(long, value_name = "node[=json]")]
         from: Vec<String>,
         /// Run only this node and what it needs (repeatable: several
@@ -319,7 +323,8 @@ enum Cmd {
         check: bool,
         /// Clear a saved setting before applying explicit flags: from,
         /// emit, target, before, group, feed, fire, instance, keeping
-        /// (what `--durable` or `--fast` saved), keep_for or hold_secs.
+        /// (what `--durable` or `--fast` saved), keep_for, hold_secs or
+        /// pause_after_secs.
         /// Repeatable.
         #[arg(long, value_name = "field")]
         clear: Vec<String>,
@@ -342,12 +347,20 @@ enum Cmd {
         #[arg(long, value_name = "duration")]
         keep_for: Option<weft_core::run_settings::KeepFor>,
         /// How long, in seconds, a wait holds the run's worker while the
-        /// run cannot pause (a bus between its nodes is open), counted from
-        /// the last time anything moved in the run; then the waiting call
-        /// fails. 0 fails such a wait at once; at most 30 days. Unset, the
-        /// fired trigger's `holdSecs`, else 60.
+        /// run cannot pause, counted from the last time anything moved in
+        /// the run; then the waiting call fails. With its caller on the
+        /// line (a `--fire` of a route) the wait holds for as long as the
+        /// caller stays instead. 0 fails such a wait at once; at most 30
+        /// days. Unset, the fired trigger's `holdSecs`, else 60.
         #[arg(long, value_name = "seconds")]
         hold_secs: Option<u32>,
+        /// How long, in seconds, the run stays on its worker before it
+        /// pauses, once every node it runs waits and its next move comes
+        /// from outside; an answer that arrives meanwhile goes straight
+        /// into the waiting node. 0 pauses at once; at most an hour.
+        /// Unset, the fired trigger's `pauseAfterSecs`, else 10.
+        #[arg(long, value_name = "seconds")]
+        pause_after_secs: Option<u32>,
     },
     /// Record this folder's files as a version under its head, with no
     /// run and no build: a point to branch back to.
@@ -505,7 +518,8 @@ enum Cmd {
     ///
     /// The run is named by its id or the start of it; the node the way
     /// `weft run --from` takes it (`render`, `one.render`). A node inside
-    /// a loop runs once per iteration and is refused: name the loop.
+    /// a loop runs once per iteration and is refused: name the loop. In a
+    /// run of part of that loop's body it ran once, and is read.
     NodeState { run_id: String, node: String },
     /// Prepare and save trigger settings without listening for events.
     Bake {
@@ -534,8 +548,17 @@ enum Cmd {
     /// they were down, paced at half each trigger's own limits so new
     /// arrivals still get through; `--held drop` deletes the held events
     /// and cancels the runs paused on them.
+    ///
+    /// It says which triggers on it leaves behind the build it used (they
+    /// fire older code or an older cut until `weft resync`).
     Activate {
         project: Option<String>,
+        /// Turn the triggers on with the build the install has registered,
+        /// building nothing from this folder (what `weft activate
+        /// <project-id>` does): for a script, such as a deploy's exit
+        /// trap, that must not move the project onto the folder's code.
+        #[arg(long, conflicts_with = "project")]
+        no_build: bool,
         /// What happens to the work the triggers held while they were down.
         #[arg(long, value_name = "run|drop", default_value = "run")]
         held: weft_core::ReleaseHeld,
@@ -1439,6 +1462,18 @@ enum InfraAction {
         #[arg(long, value_name = "id")]
         instance: Option<weft_core::instance::InstanceId>,
     },
+    /// Give a disk volume an older weft named without the install
+    /// (`wi-<node>-<hash>-<disk>`) to the install this command acts on.
+    /// For when a start refuses it because weft cannot tell whose data
+    /// it holds: two installs ran that infra on it, or it has no install
+    /// label. That install's next start of the infra copies the volume
+    /// into its own and removes it; every other install that ran it
+    /// starts that disk empty. A local install only.
+    TakeDisk {
+        /// The volume, as the refusal named it.
+        #[arg(value_name = "volume")]
+        volume: String,
+    },
     /// Print the current lifecycle state of each infra node.
     Status,
     /// Cancel in-flight infra work: halt claimed lifecycle commands
@@ -1822,6 +1857,7 @@ enum InfraRequest {
     Show(commands::infra_card::ShowArgs),
     Press(commands::infra_card::PressArgs),
     Rebake { node: String, instance: Option<weft_core::instance::InstanceId> },
+    TakeDisk { volume: String },
 }
 
 impl InfraAction {
@@ -1832,6 +1868,7 @@ impl InfraAction {
             InfraRequest::Show(args) => commands::infra_card::run_show(ctx, args).await,
             InfraRequest::Press(args) => commands::infra_card::run_press(ctx, args).await,
             InfraRequest::Rebake { node, instance } => commands::infra_card::run_rebake(ctx, &node, instance.as_ref()).await,
+            InfraRequest::TakeDisk { volume } => commands::infra_take_disk::run(ctx, &volume).await,
         }
     }
 
@@ -1869,6 +1906,7 @@ impl InfraAction {
                 return Ok(InfraRequest::Press(commands::infra_card::PressArgs { node, action, instance }));
             }
             InfraAction::Rebake { node, instance } => return Ok(InfraRequest::Rebake { node, instance }),
+            InfraAction::TakeDisk { volume } => return Ok(InfraRequest::TakeDisk { volume }),
         };
         Ok(InfraRequest::Lifecycle(verb, opts))
     }
@@ -2105,11 +2143,11 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
         Cmd::Options { node, field, search } => {
             commands::options::run(ctx, &node, &field, search.as_deref()).await
         }
-        Cmd::TestNode { target, test, tiers, key, connection, yes, parallel } => {
+        Cmd::TestNode { targets, test, tiers, key, connection, yes, parallel } => {
             commands::test_node::run(
                 ctx,
                 commands::test_node::TestNodeArgs {
-                    target,
+                    targets,
                     test,
                     tiers,
                     key,
@@ -2121,7 +2159,7 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
             .await
         }
         Cmd::NodeTestHash { target } => commands::test_node::hash(ctx, target),
-        Cmd::Run { spec, detach, referenced, seed, seed_until, seed_before, root, from, target, before, group, feed, fire, emit, instance, save, check, clear, durable, fast, keep_for, hold_secs } => {
+        Cmd::Run { spec, detach, referenced, seed, seed_until, seed_before, root, from, target, before, group, feed, fire, emit, instance, save, check, clear, durable, fast, keep_for, hold_secs, pause_after_secs } => {
             return commands::run::run(
                 ctx,
                 commands::run::RunArgs {
@@ -2132,7 +2170,7 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
                     seed_until,
                     seed_before,
                     root,
-                    flags: weft_core::run_flags::RunFlags { from, target, before, group, feed, fire, emit, instance, clear, durable, fast, keep_for, hold_secs },
+                    flags: weft_core::run_flags::RunFlags { from, target, before, group, feed, fire, emit, instance, clear, durable, fast, keep_for, hold_secs, pause_after_secs },
                     save,
                     check,
                 },
@@ -2165,8 +2203,8 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
         Cmd::Bake { project, referenced, scope } => {
             commands::bake::run(ctx, project, node_set(referenced), scope.try_into()?).await
         }
-        Cmd::Activate { project, held, port, scope } => {
-            commands::activate::run(ctx, project, held, port, scope.try_into()?).await
+        Cmd::Activate { project, no_build, held, port, scope } => {
+            commands::activate::run(ctx, project, no_build, held, port, scope.try_into()?).await
         }
         Cmd::Deactivate { project, take_down, scope } => {
             commands::deactivate::run(ctx, project, take_down.into(), scope.try_into()?).await

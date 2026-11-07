@@ -17,8 +17,20 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 
-/// The default ceiling on the cache's bytes.
+/// The ceiling on the cache's bytes on a disk of the replica's own.
 pub const DEFAULT_CAP_BYTES: u64 = 1 << 30;
+/// The ceiling where the replica's files take its memory
+/// (`Placement::files_take_memory`): a cache of [`DEFAULT_CAP_BYTES`] there
+/// would outgrow the whole replica, which runs out of memory on a build
+/// like any other allocation. On Cloud Run the cache shares the in-memory
+/// volume a build writes to, which is sized as a quarter of the
+/// dispatcher's memory for builds plus this cap, so the cache never eats
+/// into a build's quarter.
+// SYNC: IN_MEMORY_CAP_BYTES <-> deploy/terraform/gcp/serverless.tf (the `build` volume's size_limit)
+pub const IN_MEMORY_CAP_BYTES: u64 = 64 << 20;
+// That volume (a quarter of the memory plus this cap) leaves at least half
+// of the least memory a role is given (512Mi) to the replica itself.
+const _: () = assert!((512 << 20) / 4 + IN_MEMORY_CAP_BYTES <= (512 << 20) / 2);
 
 #[derive(Debug, Clone)]
 pub struct BlobCache {
@@ -31,9 +43,12 @@ impl BlobCache {
         Self { dir, cap_bytes }
     }
 
-    /// Next to the build working directories (the system temp dir).
-    pub fn in_temp_dir() -> Self {
-        Self::new(std::env::temp_dir().join("weft-blob-cache"), DEFAULT_CAP_BYTES)
+    /// Next to the build working directories (the system temp dir), sized
+    /// for where the replica runs: [`IN_MEMORY_CAP_BYTES`] when its files
+    /// take its memory, else [`DEFAULT_CAP_BYTES`].
+    pub fn in_temp_dir(files_take_memory: bool) -> Self {
+        let cap = if files_take_memory { IN_MEMORY_CAP_BYTES } else { DEFAULT_CAP_BYTES };
+        Self::new(std::env::temp_dir().join("weft-blob-cache"), cap)
     }
 
     fn tenant_dir(&self, tenant: &str) -> Result<PathBuf> {
@@ -254,6 +269,14 @@ mod tests {
         assert_eq!(got(&keep, "t", "b"), None);
         assert!(got(&keep, "t", "a").is_some());
         assert!(got(&keep, "t", "c").is_some());
+    }
+
+    /// A replica whose files take its memory keeps a cache a small share of
+    /// any role's memory, never the gigabyte a disk of its own takes.
+    #[test]
+    fn a_replica_whose_files_take_its_memory_keeps_a_small_cache() {
+        assert_eq!(BlobCache::in_temp_dir(true).largest_kept(), IN_MEMORY_CAP_BYTES / 10);
+        assert_eq!(BlobCache::in_temp_dir(false).largest_kept(), DEFAULT_CAP_BYTES / 10);
     }
 
     /// A blob over a tenth of the cap is never kept, so one big file

@@ -12,7 +12,7 @@ use weft_core::program::project::ProjectCall;
 use weft_core::program::ProgramCallOutcome;
 use weft_core::projects::{
     DeclareRequest, GoingRun, ProjectDrift, ProjectRemoved, ProjectRunsSummary, ProjectStatusResponse, ProjectSummary, QuiesceRequest, Quiesced,
-    StatusQuery,
+    StatusRequest,
 };
 use weft_core::ProjectDefinition;
 use weft_task_store::db::Client as _;
@@ -47,15 +47,24 @@ pub(crate) async fn program_call(
     match call {
         ProjectCall::List => answered(&list(state, actor).await?),
         ProjectCall::Get => answered(&get(state, actor, project).await.map_err(StatusError::into_parts)?),
-        ProjectCall::Declare { request } => answered(&declare(state, actor, request).await?),
-        ProjectCall::Status { query } => answered(&status(state, actor, project, query).await.map_err(StatusError::into_parts)?),
+        ProjectCall::Declare { name, id } => {
+            // Unset, the project takes the call's own id, the same each
+            // time the call is carried again under its key.
+            let id = match (id, actor) {
+                (Some(id), _) => *id,
+                (None, Actor::Program { call, .. }) => *call,
+                (None, Actor::Operator { .. }) => return Err((StatusCode::BAD_REQUEST, "a declare by hand names its project's id".into())),
+            };
+            answered(&declare(state, actor, &DeclareRequest { id, name: name.clone() }).await?)
+        }
+        ProjectCall::Status { request } => answered(&status(state, actor, project, request).await.map_err(StatusError::into_parts)?),
         ProjectCall::CancelBuild => answered(&cancel_build(state, actor, project).await?),
         ProjectCall::Quiesce { request } => answered(&quiesce(state, actor, project, request).await.map_err(StatusError::into_parts)?),
         ProjectCall::Remove { force } => answered(&remove(state, actor, project, *force).await.map_err(StatusError::into_parts)?),
         // One look that waits for nothing: the program parks on a timer
         // between looks, so no task of the dispatcher's is held open.
         ProjectCall::Follow { task } => {
-            answered(&follow(state, actor, project, *task, std::time::Duration::ZERO).await.map_err(StatusError::into_parts)?)
+            answered(&follow(state, actor, project, *task, weft_task_store::stopping::Deadline::at(tokio::time::Instant::now())).await.map_err(StatusError::into_parts)?)
         }
     }
 }
@@ -199,14 +208,14 @@ pub(crate) async fn get(state: &DispatcherState, actor: &Actor, id: uuid::Uuid) 
 
 /// Aggregate view for `weft status`: registration, listener state,
 /// per-node infra state, each trigger's state, a rollup of recent runs,
-/// drift (against the hashes the query names, else the registered
+/// drift (against the hashes the request names, else the registered
 /// build's), and the verbs valid right now. One answer, no stitching
 /// required by a client.
 pub(crate) async fn status(
     state: &DispatcherState,
     actor: &Actor,
     id: uuid::Uuid,
-    query: &StatusQuery,
+    request: &StatusRequest,
 ) -> Result<ProjectStatusResponse, StatusError> {
     // The marked gate: a client asking about a project it has not
     // registered yet (a brand-new `weft run`) reads the marker as "not
@@ -221,27 +230,27 @@ pub(crate) async fn status(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("get project: {e}")))?
         .ok_or(StatusError::NotMyProject)?;
-    let project = state
-        .projects
-        .project(id)
+    let registered = state
+        .registered(id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e:#}")))?
         // A registered project missing its definition is a real
         // inconsistency, NOT "no such project": Other (no marker), so
         // the CLI bubbles it loudly instead of skipping the gate.
         .ok_or((StatusCode::NOT_FOUND, "project definition missing".to_string()))?;
+    let project = &registered.program;
     let listener_running = crate::listener::project_is_listening(&state.pg_pool, id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("listener status: {e}")))?;
 
     let internal = |what: &'static str| move |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}"));
     let binary_hash = state.projects.running_binary_hash(id).await.map_err(internal("running_binary_hash"))?;
-    let definition_hash = state.projects.running_definition_hash(id).await.map_err(internal("running_definition_hash"))?;
-    let desired = Desired::of_query(state, id, &project, query, binary_hash.as_deref(), definition_hash.as_deref()).await?;
-    let snapshot = gather_action_snapshot(state, id, &project, &desired).await?;
-    let (infra, instance_infra) = infra_entries(&project, &snapshot.infra, &snapshot.activations, &desired);
-    let waiting = crate::api::signal::waiting_fires(&state.pg_pool, id).await.map_err(internal("waiting fires"))?;
-    let held = crate::store::postgres::held_by_activation(&state.pg_pool, id).await.map_err(internal("held work"))?;
+    let definition_hash = registered.definition_hash.clone();
+    let cuts = state.trigger_cuts(id, &registered).await.map_err(crate::api::project::cuts_refused)?;
+    let desired = Desired::registered(state, id, &registered, binary_hash.as_deref()).await?.requested_by(request);
+    let snapshot = gather_action_snapshot(state, id, project, &desired).await?;
+    let (infra, instance_infra) = infra_entries(project, &cuts, &snapshot.infra, &snapshot.activations, &desired);
+    let traffic = crate::api::project::TriggerTraffic::of(&state.pg_pool, id, crate::lease::now_unix()).await.map_err(internal("trigger traffic"))?;
     let has_infra = snapshot.has_infra;
     let has_triggers = snapshot.has_triggers;
     let infra_rollup = snapshot.infra_rollup.clone();
@@ -294,6 +303,11 @@ pub(crate) async fn status(
         running,
     };
 
+    // The registered build's orphans, and the copies of places the source
+    // the caller compiled has no more.
+    let orphaned_infra = snapshot.orphaned_infra
+        || infra.iter().any(|entry| entry.orphaned)
+        || instance_infra.iter().any(|entry| entry.orphaned);
     let drift = ProjectDrift {
         infra_drift: infra.iter().any(|entry| entry.behind) || instance_infra.iter().any(|entry| entry.behind),
         binary_drift: desired.binary_drifts(binary_hash.as_deref()),
@@ -335,13 +349,13 @@ pub(crate) async fn status(
             })
             .collect(),
         address: project_address(state, id).await,
-        orphaned_infra: snapshot.orphaned_infra,
+        orphaned_infra,
         infra_rollup,
         infra_busy: snapshot.infra_busy,
         drift,
         available_actions,
         instance_infra,
-        triggers: trigger_entries(&project, &snapshot.activations, &held, &waiting, &desired, binary_hash.as_deref(), crate::lease::now_unix()),
+        triggers: trigger_entries(project, &cuts, &snapshot.activations, &traffic, &desired, binary_hash.as_deref(), crate::lease::now_unix()),
         instances,
         limited: limited_entries(state, id)
             .await
@@ -529,10 +543,10 @@ pub(crate) async fn remove(state: &DispatcherState, actor: &Actor, id: uuid::Uui
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     state.builder.prunes.request(state, None);
-    // Reclaim the project's instance-specific stored data through the ONE hook.
-    // The default frees the project's `project/`-scoped runtime files; a reclaimer
-    // that also stores project content elsewhere (a versioned project-editing
-    // history) extends it. `shared/`-scoped runtime files are the owner's and are
+    // Reclaim the project's stored data through the ONE hook. The default
+    // frees the project's `project/`- and `instance/`-scoped runtime files; a
+    // reclaimer that also stores project content elsewhere (a versioned
+    // project-editing history) extends it. `shared/`-scoped runtime files are the owner's and are
     // deliberately NOT touched (they outlive the project). MUST run before the
     // project row is dropped: a row-cascade would otherwise erase the bookkeeping
     // this reclaim reads, stranding bytes. A failure aborts the rm (a retry
@@ -610,11 +624,11 @@ pub(crate) async fn follow(
     actor: &Actor,
     id: uuid::Uuid,
     task: uuid::Uuid,
-    look: std::time::Duration,
+    look: weft_task_store::stopping::Deadline,
 ) -> Result<Following, StatusError> {
     actor.may_act_on(state, id).await?;
     let internal = |what: &str, e: String| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e}"));
-    let outcome = weft_task_store::terminal::wait_for_terminal_in_project(&state.pg_pool, &state.signals, task, id, look)
+    let outcome = weft_task_store::terminal::wait_for_terminal_in_project_before(&state.pg_pool, &state.signals, task, id, look)
         .await
         .map_err(|e| internal("follow the task", format!("{e:#}")))?
         .ok_or((StatusCode::NOT_FOUND, format!("project {id} has no task {task} to follow")))?;
@@ -626,16 +640,38 @@ pub(crate) async fn follow(
             .map_err(|e| internal("read the task", e.to_string()))?;
         Ok::<_, StatusError>(kind.as_deref().and_then(weft_task_store::TaskKind::parse))
     };
-    let activate = Some(weft_task_store::TaskKind::Activate);
+    use weft_task_store::TaskKind;
     match outcome.status {
-        weft_core::task::TaskStatus::Pending | weft_core::task::TaskStatus::Claimed => Ok(Following::Going(match kind().await? == activate {
-            true => crate::task_kinds::activate::progress(state, id, task).await.map_err(|e| internal("read where the activation is", format!("{e:#}")))?,
-            false => weft_task_store::tasks::progress(&state.pg_pool, task).await.map_err(|e| internal("read where the task is", format!("{e:#}")))?,
-        })),
-        weft_core::task::TaskStatus::Complete if kind().await? == activate => {
-            Ok(Following::Done(crate::task_kinds::activate::followed(outcome.result).map_err(|(status, why)| StatusError::Other(status, why))?))
+        weft_core::task::TaskStatus::Pending | weft_core::task::TaskStatus::Claimed => {
+            let said = || async {
+                weft_task_store::tasks::progress(&state.pg_pool, task).await.map_err(|e| internal("read where the task is", format!("{e:#}")))
+            };
+            let turning_on = || async {
+                crate::task_kinds::activate::progress(state, id, task).await.map_err(|e| internal("read where the activation is", format!("{e:#}")))
+            };
+            Ok(Following::Going(match kind().await? {
+                Some(TaskKind::Activate) => turning_on().await?.map(serde_json::to_value).transpose().map_err(|e| internal("where the activation is", e.to_string()))?,
+                // What the resync's task said, with the activation it
+                // drives now: the bring-back of an owner can take minutes.
+                Some(TaskKind::Resync) => {
+                    let progress: weft_core::deactivation::ResyncProgress = match said().await? {
+                        Some(said) => serde_json::from_value(said).map_err(|e| internal("read where the resync is", e.to_string()))?,
+                        None => Default::default(),
+                    };
+                    let going = weft_core::deactivation::ResyncGoing { progress, turning_on: turning_on().await? };
+                    Some(serde_json::to_value(going).map_err(|e| internal("where the resync is", e.to_string()))?)
+                }
+                _ => said().await?,
+            }))
         }
-        weft_core::task::TaskStatus::Complete => Ok(Following::Done(outcome.result.unwrap_or(serde_json::Value::Null))),
+        weft_core::task::TaskStatus::Complete => {
+            let ended = match kind().await? {
+                Some(TaskKind::Activate) => crate::task_kinds::activate::followed(outcome.result),
+                Some(TaskKind::StartRun) => crate::task_kinds::start_run::followed(outcome.result),
+                _ => Ok(outcome.result.unwrap_or(serde_json::Value::Null)),
+            };
+            Ok(Following::Done(ended.map_err(|(status, why)| StatusError::Other(status, why))?))
+        }
         weft_core::task::TaskStatus::Failed => {
             let error = outcome.error.unwrap_or_else(|| "it ended without saying why".into());
             if kind().await? != Some(weft_task_store::TaskKind::Resync) {
@@ -675,7 +711,7 @@ mod tests {
     #[test]
     fn a_program_cannot_remove_its_own_project() {
         let (own, other) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
-        let program = Actor::Program { tenant: TenantId::local(), project: own, run: uuid::Uuid::now_v7() };
+        let program = Actor::Program { tenant: TenantId::local(), project: own, run: uuid::Uuid::now_v7(), call: uuid::Uuid::now_v7() };
         let (status, why) = refuse_own_removal(&program, own).unwrap_err().into_parts();
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(why.contains("cannot remove its own project"), "{why}");

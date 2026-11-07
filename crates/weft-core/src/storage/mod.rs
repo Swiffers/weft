@@ -161,6 +161,56 @@ pub fn check_wire_value(node: &str, port: &str, value: &Value) -> Result<(), Str
 #[cfg(feature = "runtime")]
 pub type ByteStream = futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>>;
 
+/// A stored file on its way out as a request body, streamed out of
+/// storage and never held in memory (`StorageHandle::body`): the bytes,
+/// with the file's record beside them, whose size is the body's length.
+/// Sent whole with `access::client::StoredBodyExt::stored_body`, or as a
+/// part of a form with `access::client::Multipart::stored`.
+#[cfg(feature = "runtime")]
+pub struct StoredBody {
+    meta: StoredFileMeta,
+    stream: ByteStream,
+}
+
+#[cfg(feature = "runtime")]
+impl StoredBody {
+    pub(crate) fn new(meta: StoredFileMeta, stream: ByteStream) -> Self {
+        Self { meta, stream }
+    }
+
+    /// The body's length in bytes, from the file's record: known before
+    /// a byte is read.
+    pub fn len(&self) -> u64 {
+        self.meta.size_bytes
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The file's type, as its record states it.
+    pub fn mime_type(&self) -> &str {
+        &self.meta.mime_type
+    }
+
+    /// The file's name, as its record states it.
+    pub fn filename(&self) -> &str {
+        &self.meta.filename
+    }
+
+    /// The bytes, for a body the client libraries here do not frame.
+    pub fn into_stream(self) -> ByteStream {
+        self.stream
+    }
+}
+
+#[cfg(feature = "runtime")]
+impl std::fmt::Debug for StoredBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredBody").field("meta", &self.meta).finish_non_exhaustive()
+    }
+}
+
 /// Wrap a fully-buffered payload as a one-chunk [`ByteStream`].
 #[cfg(feature = "runtime")]
 pub fn bytes_stream(bytes: bytes::Bytes) -> ByteStream {
@@ -253,18 +303,24 @@ pub fn is_content_hash(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Derive a filename from a URL's last path segment, sans query and
-/// fragment. Falls back to `download.bin` when the URL has no usable
-/// path (ends in `/`, or is bare host). Used by the storage
-/// put-from-url capability when the caller gives no explicit name.
+/// The name a URL's path ends on (`talk.mp4` in
+/// `https://cdn.example.com/v/talk.mp4?sig=1`), past its scheme and host
+/// and without its query or fragment, or `None` when the path names
+/// nothing (a bare host, a path ending in `/`).
+pub fn name_in_url(url: &str) -> Option<&str> {
+    let address = url.split(['?', '#']).next().unwrap_or(url);
+    // Past the scheme, so the host is never taken for the file.
+    let address = address.split_once("://").map_or(address, |(_, rest)| rest);
+    let (_, path) = address.split_once('/')?;
+    path.trim_end_matches('/').rsplit('/').next().filter(|name| !name.is_empty())
+}
+
+/// Derive a filename from a URL's last path segment ([`name_in_url`]),
+/// `download.bin` when its path names nothing. Used by the storage
+/// put-from-url capability when the caller gives no explicit name; a
+/// caller with a better fallback of its own uses [`name_in_url`].
 pub fn filename_from_url(url: &str) -> String {
-    let no_query = url.split(['?', '#']).next().unwrap_or(url);
-    let last = no_query.trim_end_matches('/').rsplit('/').next().unwrap_or("");
-    if last.is_empty() {
-        "download.bin".to_string()
-    } else {
-        last.to_string()
-    }
+    name_in_url(url).unwrap_or("download.bin").to_string()
 }
 
 /// The filename a response names for itself, out of its
@@ -340,22 +396,26 @@ pub async fn collect_stream(mut stream: ByteStream) -> std::io::Result<bytes::By
     Ok(bytes::Bytes::from(buf))
 }
 
-/// Which key-prefix wall a storage handle operates inside. One box
-/// per tenant; the scope picks the prefix, the caller's verified
-/// identity picks the values inside it (its own run / project).
+/// Where a file is stored, which is how long it lives. A scope never
+/// says who may read a file: any run of any project of the tenant reads
+/// any file for as long as it exists. The scope picks the prefix, the
+/// caller's verified identity picks the values inside it (its own run /
+/// project). A deadline (a keep with a time, [`KeepTtl`]) deletes a file
+/// in any scope when it arrives; its owner being deleted deletes it too,
+/// whichever comes first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StorageScope {
-    /// `run/<run_id>/`: walled to a single run, swept on terminate
-    /// unless kept. The default.
+    /// `run/<run_id>/`: deleted with its run, when the run's record is
+    /// deleted (its keep time running out, `weft clean`, `weft rm`), never
+    /// at the run's end. The default.
     #[default]
     Run,
-    /// `project/<project_id>/`: outlives runs, shared across the
-    /// project's runs, wiped by `weft clean` / `weft rm`.
+    /// `project/<project_id>/`: deleted with its project (`weft rm`).
     Project,
-    /// `shared/<name>/`: tenant-scoped shared space. Projects that
-    /// name the same `name` meet in the same prefix; first use by a
-    /// project auto-grants it. Opt-in by naming.
+    /// `shared/<name>/`: a space the tenant's projects meet in by naming
+    /// the same `name`. It belongs to no run or project, so it is deleted
+    /// only by hand or at its deadline.
     Shared { name: String },
     /// `asset/<sha256>`: the project's PUBLISHED ASSETS, named by content, the storage
     /// copies of files the source references via `@asset`. Current source
@@ -364,11 +424,9 @@ pub enum StorageScope {
     /// scope like project scope; the worker data path refuses writes to it.
     Asset,
     /// `instance/<project_id>/<instance>/`: one instance's files in this
-    /// project, living until deleted. `of` names the instance; absent, the
-    /// run's own instance (an error in a run for no instance). Any run of
-    /// the project may name any instance (the program is the author's
-    /// code); another project never reaches them, even for the same
-    /// instance id.
+    /// project. They are deleted by hand (forgetting the instance, `weft
+    /// files rm`), at their deadline, or with the project they live in. `of` names the instance; absent, the run's own
+    /// instance (an error in a run for no instance).
     Instance {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         of: Option<crate::instance::InstanceId>,
@@ -386,12 +444,25 @@ impl StorageScope {
     pub fn instance_of(instance: crate::instance::InstanceId) -> Self {
         StorageScope::Instance { of: Some(instance) }
     }
+
+    /// The scope a node's `scope` setting names, as a program writes it:
+    /// `run`, `project`, or `instance` (the run's own). The one reading of
+    /// those words, for the nodes that offer the setting; `None` for any
+    /// other word.
+    pub fn named(word: &str) -> Option<Self> {
+        match word {
+            "run" => Some(StorageScope::Run),
+            "project" => Some(StorageScope::Project),
+            "instance" => Some(StorageScope::instance()),
+            _ => None,
+        }
+    }
 }
 
-/// How long a stored file lives, in any scope but the asset one. Every
-/// access bumps the expiry back to now + TTL, so actively-used files
-/// never expire. On a run file, keeping it at all is also what
-/// makes it survive the end of its run. `Default` resolves to
+/// A file's deadline, in any scope but the asset one: it is deleted when
+/// the deadline arrives, or with its owner (its run, its project) if that
+/// comes first. Every access bumps the deadline back to now + TTL, so
+/// actively-used files never reach it. `Default` resolves to
 /// [`DEFAULT_KEEP_TTL_SECS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -400,7 +471,7 @@ pub enum KeepTtl {
     Default,
     /// now + this many seconds, access-bumped.
     Secs { secs: u64 },
-    /// Never expires; explicit `weft files rm` / `weft clean` only.
+    /// No deadline: the file lives as long as its scope says.
     Never,
 }
 
@@ -439,13 +510,10 @@ pub struct StoredFileMeta {
     #[serde(rename = "sizeBytes")]
     pub size_bytes: u64,
     pub filename: String,
-    /// True iff this run-scoped file is flagged to survive the
-    /// terminate sweep. Always false in the other scopes, which outlive
-    /// runs without a flag (their lifetime is `keep_ttl_secs`).
-    pub keep: bool,
-    /// Unix seconds at which this file expires, renewed on access. `None`
-    /// = no expiry (a file stored with no lifetime outside the run
-    /// scope, a current source asset, `KeepTtl::Never`).
+    /// Unix seconds at which this file's deadline arrives, renewed on
+    /// access. `None` = no deadline (it lives as long as its scope says:
+    /// a current source asset, a file stored with no lifetime,
+    /// `KeepTtl::Never`).
     #[serde(rename = "expiresAtUnix")]
     pub expires_at_unix: Option<i64>,
     /// The file's TTL in seconds, so an access can recompute
@@ -472,8 +540,8 @@ fn first_file_version() -> u64 {
 /// concrete `__weft_<kind>__` marker (see `to_value`). The ONLY thing
 /// that flows on edges / into the journal for a stored file. Carries
 /// NO url: byte access always goes through an authenticated fetch (or
-/// an expiring link a node deliberately asks for, `internal_link` /
-/// `external_link`). The
+/// an expiring link a node deliberately asks for, `internal_link`,
+/// `container_link` or `external_link`). The
 /// concrete kind (Image/Video/Audio/Blob) is derived from `mime_type`.
 // SYNC: StoredFile <-> packages/weft-graph/src/protocol.ts FileValueWire
 //       (per-kind markers __weft_image__/video/audio/blob, parseFileValue)
@@ -776,8 +844,8 @@ pub struct IdentityLookupResponse {
 
 /// A link to a stored file: where to fetch it, and whether the open
 /// internet can (a provider handed a link it cannot open gets the bytes
-/// in its request instead). What `StorageHandle::internal_link` and
-/// `external_link` answer.
+/// in its request instead). What `StorageHandle::internal_link`,
+/// `container_link` and `external_link` answer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileLink {
     pub url: String,
@@ -799,6 +867,13 @@ pub enum LinkReach {
     /// Node code inside the install: straight to storage, at the address
     /// a worker reaches it by, never through a tunnel.
     Internal,
+    /// A project's own container (an infra unit's): at the address the
+    /// install's containers reach it by, never through a tunnel. On a
+    /// local install that is the install's internal port as a container
+    /// reaches it, through the files door there (a container's own
+    /// `127.0.0.1` is itself); on an install whose store every container
+    /// reaches at the workers' address (a cloud one), the `Internal` link.
+    Container,
     /// Anything outside the install's containers (a browser, an app, an
     /// outside service): the project's visitor address, else weft's
     /// tunnel, else the install's own address (`public: false`); on a
@@ -1144,8 +1219,8 @@ pub struct DownloadUrlResponse {
     pub url: String,
 }
 
-/// `POST /v1/storage/keep`: extend a run-scoped file's lifetime past the
-/// run that created it.
+/// `POST /v1/storage/keep`: set a file's deadline (or clear it with
+/// [`KeepTtl::Never`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeepRequest {
     pub key: String,
@@ -1206,7 +1281,7 @@ pub struct WipePrefixResponse {
 // The admin upload surface: the dispatcher drives the same multipart upload
 // contract as a worker, on behalf of a tenant's editor session (a file-drop
 // config field). Editor uploads are always PROJECT-scoped (there is no
-// run at edit time, and project files persist without a keep flag), so
+// run at edit time), so
 // `begin` names the project explicitly; every later verb is key-addressed and
 // carries only the acting tenant (the key itself names project + tenant, and
 // the broker re-checks they match).
@@ -1295,11 +1370,7 @@ pub struct FileImportBeginRequest {
 impl FileImportBeginRequest {
     /// The begin that copies the file `meta` describes.
     pub fn of(meta: &StoredFileMeta) -> Self {
-        let keep = match (meta.keep_ttl_secs, meta.keep) {
-            (Some(secs), _) => Some(KeepTtl::Secs { secs }),
-            (None, true) => Some(KeepTtl::Never),
-            (None, false) => None,
-        };
+        let keep = meta.keep_ttl_secs.map(|secs| KeepTtl::Secs { secs });
         Self {
             key: meta.key.clone(),
             version: meta.version,
@@ -1358,22 +1429,19 @@ pub struct FilesRemoved {
     pub removed: u64,
 }
 
-/// `POST /v1/storage/admin/sweep-run`: terminate-sweep one run's un-kept
-/// run files (crashed uploads reaped; completed files stamped to expire
-/// after the post-run linger).
+/// `POST /v1/storage/admin/delete-run-files`: delete every file of the
+/// runs of one tenant whose records were deleted (their run-scoped files go
+/// with them), a page of them at once.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SweepRunRequest {
+pub struct RunFilesRequest {
     pub tenant: String,
-    pub run_id: String,
+    pub run_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SweepRunResponse {
-    /// Rows removed outright (crashed/abandoned uploads under the run).
-    pub swept: u64,
-    /// Completed un-kept files stamped with the post-run linger expiry
-    /// (deleted by the expiry sweep once it passes).
-    pub lingering: u64,
+pub struct RunFilesResponse {
+    /// The files deleted.
+    pub deleted: u64,
 }
 
 /// The media type a byte prefix announces itself as, from its signature
@@ -1918,7 +1986,20 @@ mod tests {
         assert_eq!(filename_from_url("https://x.com/a/b/clip.ogg?token=1"), "clip.ogg");
         assert_eq!(filename_from_url("https://x.com/a/b/clip.ogg#frag"), "clip.ogg");
         assert_eq!(filename_from_url("https://x.com/dir/"), "dir");
-        assert_eq!(filename_from_url("https://x.com"), "x.com");
+    }
+
+    /// A bare host names no file: the host is never taken for one, with
+    /// or without a trailing slash, a query or a port, and the caller's
+    /// fallback (or `download.bin`) stands in.
+    #[test]
+    fn a_url_naming_no_file_falls_back() {
+        assert_eq!(filename_from_url("https://example.com"), "download.bin");
+        assert_eq!(filename_from_url("https://example.com/"), "download.bin");
+        assert_eq!(filename_from_url("https://example.com:8443?x=a/b.png"), "download.bin");
+        assert_eq!(name_in_url("https://example.com/v/talk.mp4?sig=a/b"), Some("talk.mp4"));
+        assert_eq!(name_in_url("example.com/v/talk.mp4"), Some("talk.mp4"), "no scheme, same answer");
+        assert_eq!(name_in_url("example.com"), None);
+        assert_eq!(name_in_url("https://example.com").unwrap_or("recording.mp4"), "recording.mp4");
     }
 
     #[test]
@@ -2320,6 +2401,10 @@ mod tests {
         // No lifetime named: the value's own default is asked for.
         let bare: LinkRequest = serde_json::from_value(json!({"key": "k", "reach": "internal"})).unwrap();
         assert_eq!((bare.ttl_secs, bare.reach), (None, LinkReach::Internal));
+        let container = LinkRequest { key: "k".into(), ttl_secs: None, reach: LinkReach::Container };
+        let v = serde_json::to_value(&container).unwrap();
+        assert_eq!(v, json!({"key": "k", "reach": "container"}));
+        assert_eq!(serde_json::from_value::<LinkRequest>(v).unwrap().reach, LinkReach::Container);
         assert_eq!(
             serde_json::to_value(FileLink { url: "https://x/f".into(), public: false }).unwrap(),
             json!({"url": "https://x/f", "public": false})
@@ -2368,13 +2453,10 @@ mod tests {
         );
         assert_eq!(serde_json::to_value(WipePrefixResponse { wiped: 2 }).unwrap(), json!({"wiped": 2}));
         assert_eq!(
-            serde_json::to_value(SweepRunRequest { tenant: "t1".into(), run_id: "c1".into() }).unwrap(),
-            json!({"tenant": "t1", "run_id": "c1"})
+            serde_json::to_value(RunFilesRequest { tenant: "t1".into(), run_ids: vec!["c1".into()] }).unwrap(),
+            json!({"tenant": "t1", "run_ids": ["c1"]})
         );
-        assert_eq!(
-            serde_json::to_value(SweepRunResponse { swept: 1, lingering: 2 }).unwrap(),
-            json!({"swept": 1, "lingering": 2})
-        );
+        assert_eq!(serde_json::to_value(RunFilesResponse { deleted: 1 }).unwrap(), json!({"deleted": 1}));
     }
 
     #[test]
@@ -2413,7 +2495,6 @@ mod tests {
             mime_type: "video/mp4".into(),
             size_bytes: 5,
             filename: "v.mp4".into(),
-            keep: true,
             expires_at_unix: Some(1_700_000_000),
             keep_ttl_secs: Some(86_400),
             created_at_unix: 1_600_000_000,

@@ -187,8 +187,8 @@ pub struct DispatcherSettings<'a> {
     pub tokens: Arc<dyn weft_platform_traits::IdentityTokens>,
     /// See `DispatcherState::booking`.
     pub booking: Option<weft_task_store::drain::Booking>,
-    /// See `DispatcherState::aside`.
-    pub aside: weft_task_store::aside::StepAside,
+    /// See `DispatcherState::stopping`.
+    pub stopping: weft_task_store::stopping::Stopping,
 }
 
 /// Build the dispatcher state.
@@ -210,13 +210,14 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         holder_news,
         tokens,
         booking,
-        aside,
+        stopping,
     } = settings;
     for channel in DISPATCHER_CHANNELS {
         signals.require(channel)?;
     }
     info!("dispatcher replica: {replica}");
     let store = Arc::new(PostgresStore::from_pool(pool.clone()));
+    let programs = store.programs().clone();
     let projects: crate::ProjectStore = Arc::new(crate::PostgresProjectStore::new(pool.clone()));
     let activations: crate::activation_store::ActivationStore =
         Arc::new(crate::activation_store::PostgresActivationStore::new(pool.clone()));
@@ -231,9 +232,10 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
     let addresses = config.role_addresses(config.roles.of(CoreRole::Dispatcher).vantage());
     let builder = Arc::new(crate::build::VersionBuilder {
         images,
+        install: config.install_kind(),
         pool: pool.clone(),
         prunes: Default::default(),
-        blobs: crate::build::blob_cache::BlobCache::in_temp_dir(),
+        blobs: crate::build::blob_cache::BlobCache::in_temp_dir(config.roles.of(CoreRole::Dispatcher).files_take_memory()),
     });
     // Every peer this client talks to (the broker and listener roles, an
     // infra unit's `/live` and `/action`, a worker) answers in place; a
@@ -301,7 +303,8 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
             weft_broker_client::TokenSource::role(tokens, replica.clone(), CoreRole::Dispatcher),
         ),
         http,
-        programs: Arc::new(weft_core::content_cache::ContentCache::new(64)),
+        programs,
+        trigger_cuts: crate::state::trigger_cuts_cache(),
         held,
         project_ports: match &config.platform {
             weft_platform_traits::config::PlatformConfig::Local(local) => {
@@ -310,7 +313,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
             weft_platform_traits::config::PlatformConfig::Gcp(_) => None,
         },
         booking,
-        aside,
+        stopping,
     })
 }
 
@@ -362,6 +365,7 @@ pub fn task_registry() -> crate::task_executor::TaskRegistry {
         TaskKind::RemovalWait => Arc::new(crate::task_kinds::RemovalWaitExecutor),
         TaskKind::MaintenanceLift => Arc::new(crate::task_kinds::MaintenanceLiftExecutor),
         TaskKind::Activate => Arc::new(crate::task_kinds::ActivateExecutor),
+        TaskKind::StartRun => Arc::new(crate::task_kinds::StartRunExecutor),
     })
 }
 
@@ -380,7 +384,7 @@ pub fn drain_loops(state: &DispatcherState, registry: crate::task_executor::Task
     // again when its earliest claim lapses. Every other hold that lapses
     // unannounced is the `lapses` loop's.
     let mut loops = vec![
-        weft_task_store::dispatcher_picker_loop(picker_store, state.clone(), registry, state.replica.clone(), state.aside.clone()),
+        weft_task_store::dispatcher_picker_loop(picker_store, state.clone(), registry, state.replica.clone(), state.stopping.clone()),
         crate::delivery::drain_loop(state.clone()),
         crate::lifecycle_claimer::drain_loop(state.clone()),
         crate::lapses::drain_loop(state.clone()),

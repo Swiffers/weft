@@ -129,33 +129,29 @@ pub async fn list_displays(
         if !token.covers_project(&summary.id) {
             continue;
         }
-        let Some(project) = state
-            .projects
-            .project(summary.id)
+        let Some(crate::state::Registered { program: project, .. }) = state
+            .registered(summary.id)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e:#}")))?
         else {
             // Listed a moment ago, gone now (a wipe raced this read).
             continue;
         };
-        for (node, kind, address) in &displays_of(&project) {
+        for (node, per_instance, kind, address) in &displays_of(&project) {
             if !token_reaches_display(&token, &summary.id, address) {
                 continue;
             }
             // An instance token lists its instance's own copies alone.
-            if token.instance.is_some() && node.per_instance.is_none() {
+            if token.instance.is_some() && per_instance.is_none() {
                 continue;
             }
             let status = match kind {
                 DisplayKind::Infra => {
-                    let copy = weft_core::instance::copy_owner(node.per_instance, token.instance.as_ref());
+                    let copy = weft_core::instance::copy_owner(*per_instance, token.instance.as_ref());
                     let row = crate::infra_node::get(&state.pg_pool, summary.id, address, copy)
                         .await
                         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node lookup: {e}")))?;
-                    // SYNC: never-started copy word <-> catalog/instances/instance_infra_status/mod.rs run,
-                    // tangle/*/.*/skills/weft-consumers/SKILL.md (displays row, status list),
-                    // tangle/*/.*/skills/weft-frontend/SKILL.md (start button)
-                    Some(row.map_or("none", |row| row.status.as_str()))
+                    Some(copy_status(row.as_ref()))
                 }
                 DisplayKind::Trigger => None,
             };
@@ -171,6 +167,15 @@ pub async fn list_displays(
         }
     }
     Ok(Json(out))
+}
+
+/// Where the copy `row` behind an infra display stands, as the listing
+/// says it: the row's status, or `none` when the copy was never started.
+fn copy_status(row: Option<&crate::infra_node::InfraNodeRow>) -> &'static str {
+    // SYNC: never-started copy word <-> catalog/instances/instance_infra_status/mod.rs run,
+    // tangle/*/.*/skills/weft-consumers/SKILL.md (displays row, status list),
+    // tangle/*/.*/skills/weft-frontend/SKILL.md (start button)
+    row.map_or("none", |row| row.status.as_str())
 }
 
 /// `GET /signal-token/displays/{project_id}/{node}`, where `{node}` is
@@ -225,29 +230,33 @@ pub async fn press_display(
         DisplayKind::Infra => Ok(Json(
             crate::api::infra::press_live(&state, id, &address, copy.as_ref(), &body.kind, &body.payload).await?,
         )),
-        // Named the way the CALLER named it: they asked for
-        // `bridge.whatsapp`, so hearing about some other spelling of
-        // that node would send them looking for a thing they never
-        // wrote.
-        DisplayKind::Trigger => Err((
-            StatusCode::BAD_REQUEST,
-            format!("'{address}' is a trigger, and a trigger's display is read-only"),
-        )),
+        DisplayKind::Trigger => Err(trigger_press_refused(&address)),
     }
 }
 
+/// The refusal a press on the trigger display at `address` gets. Named
+/// the way the CALLER named it: they asked for `bridge.whatsapp`, so
+/// hearing about some other spelling of that node would send them looking
+/// for a thing they never wrote.
+fn trigger_press_refused(address: &str) -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, format!("'{address}' is a trigger, and a trigger's display is read-only"))
+}
+
 /// Every display of a project, as the deciders on this surface read
-/// it: the node, what serves its panel, and the address a person
-/// writes to name it.
+/// it: the node, whether it exists once per instance at that place (a
+/// node inside a file included twice can be at one site and not the
+/// other), what serves its panel, and the address a person writes to
+/// name it.
 ///
 /// Built ONCE per request and passed down. Each decider used to build
 /// its own, which made one listing cost a project walk per display per
 /// grant, on a door meant to be polled.
 type Displays<'a> =
-    Vec<(&'a weft_core::project::NodeDefinition, DisplayKind, String)>;
+    Vec<(&'a weft_core::project::NodeDefinition, Option<weft_core::instance::PerInstance>, DisplayKind, String)>;
 
 /// The display `address` names, if a person could have written that
-/// address for one: the node behind it and what serves its panel.
+/// address for one: the node behind it, whether it is per instance
+/// there, and what serves its panel.
 ///
 /// THE lookup on this surface. The door asks it of the name in its
 /// path and mint asks it of the name being granted, so no spelling can
@@ -260,8 +269,8 @@ type Displays<'a> =
 fn display_at<'a>(
     displays: &Displays<'a>,
     address: &str,
-) -> Option<(&'a weft_core::project::NodeDefinition, DisplayKind)> {
-    displays.iter().find(|(_, _, addr)| addr == address).map(|(node, kind, _)| (*node, *kind))
+) -> Option<(&'a weft_core::project::NodeDefinition, Option<weft_core::instance::PerInstance>, DisplayKind)> {
+    displays.iter().find(|(_, _, _, addr)| addr == address).map(|(node, per_instance, kind, _)| (*node, *per_instance, *kind))
 }
 
 /// THE question both display doors ask: may this token reach the
@@ -316,7 +325,7 @@ fn display_for_token<'a>(
     project_id: &uuid::Uuid,
     project: &'a weft_core::project::ProjectDefinition,
     address: &str,
-) -> Option<(&'a weft_core::project::NodeDefinition, DisplayKind)> {
+) -> Option<(&'a weft_core::project::NodeDefinition, Option<weft_core::instance::PerInstance>, DisplayKind)> {
     let found = display_at(&displays_of(project), address)?;
     token_reaches_display(token, project_id, address).then_some(found)
 }
@@ -342,7 +351,7 @@ fn displays_of(project: &weft_core::project::ProjectDefinition) -> Displays<'_> 
             let node = *by_id.get(place.id.as_str())?;
             let kind = display_kind(node)?;
             let address = weft_core::project::address_of(project, &place.id, &place.path);
-            Some((node, kind, address))
+            Some((node, node.per_instance_at(&place.path), kind, address))
         })
         .collect()
 }
@@ -409,10 +418,10 @@ pub(crate) async fn canonical_display_grants(
             return Err((StatusCode::NOT_FOUND, format!("no such project: {project_id}")));
         }
         let project = state
-            .projects
-            .project(project_id)
+            .registered(project_id)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e:#}")))?
+            .map(|registered| registered.program)
             .ok_or((
                 StatusCode::CONFLICT,
                 format!("project {project_id} was removed while this token was being minted"),
@@ -431,7 +440,7 @@ pub(crate) async fn canonical_display_grants(
                     if available.is_empty() {
                         "none".to_string()
                     } else {
-                        available.iter().map(|(_, _, a)| a.clone()).collect::<Vec<_>>().join(", ")
+                        available.iter().map(|(_, _, _, a)| a.clone()).collect::<Vec<_>>().join(", ")
                     }
                 ),
             ));
@@ -544,16 +553,15 @@ async fn resolve(
         return Err(not_found());
     }
     let project = state
-        .projects
-        .project(id)
+        .registered(id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e:#}")))?
+        .map(|registered| registered.program)
         .ok_or_else(not_found)?;
-    let (node, kind) = display_for_token(&token, &id, &project, address).ok_or_else(not_found)?;
+    let (_, per_instance, kind) = display_for_token(&token, &id, &project, address).ok_or_else(not_found)?;
     // Whose copy the token reads: an instance token reads its instance's copy
-    // of a node that exists once per instance, and the shared one of any
-    // other node; any other token reads the shared copies.
-    let per_instance = node.per_instance;
+    // of a node that exists once per instance at this place, and the shared
+    // one of any other; any other token reads the shared copies.
     // An instance token reaches its instance's own copies alone: a shared
     // node's display (the shared bridge's pairing code) is the author's.
     if token.instance.is_some() && per_instance.is_none() {
@@ -681,7 +689,7 @@ mod scope_tests {
         let p = project_with_include();
         let t = token(&[display_grant(&project_a(), "test.whatsapp")], false);
         assert!(reaches(&t, &project_a(), &p, "test.whatsapp"));
-        let addresses: Vec<String> = displays_of(&p).into_iter().map(|(_, _, a)| a).collect();
+        let addresses: Vec<String> = displays_of(&p).into_iter().map(|(_, _, _, a)| a).collect();
         assert_eq!(addresses, vec!["test.whatsapp".to_string()]);
     }
 
@@ -725,10 +733,10 @@ mod scope_tests {
         // a grant for one says nothing about the other.
         let p = project_with_two_sites();
         let displays = displays_of(&p);
-        let names: Vec<String> = displays.iter().map(|(_, _, a)| a.clone()).collect();
+        let names: Vec<String> = displays.iter().map(|(_, _, _, a)| a.clone()).collect();
         assert_eq!(names, vec!["one.whatsapp".to_string(), "two.whatsapp".to_string()]);
         for asked in &names {
-            let (node, kind) = super::display_at(&displays, asked).expect("each name is a display");
+            let (node, _, kind) = super::display_at(&displays, asked).expect("each name is a display");
             assert_eq!((node.id.as_str(), kind), ("Bridge.whatsapp", super::DisplayKind::Trigger));
         }
         let t = token(&[display_grant(&project_a(), "one.whatsapp")], false);
@@ -746,7 +754,7 @@ mod scope_tests {
         // nobody could be granted by.
         let p = project_with_include();
         let displays = displays_of(&p);
-        let (node, kind) = super::display_at(&displays, "test.whatsapp").expect("the name they write finds it");
+        let (node, _, kind) = super::display_at(&displays, "test.whatsapp").expect("the name they write finds it");
         assert_eq!(node.id, "Test.whatsapp");
         assert_eq!(kind, super::DisplayKind::Trigger);
         for not_a_name in ["Test.whatsapp", "", "whatsapp"] {
@@ -894,5 +902,60 @@ mod display_kind_tests {
     #[test]
     fn an_ordinary_node_has_none() {
         assert_eq!(display_kind(&node(false, None, false)), None);
+    }
+
+    /// Copy `ada` of the infra node `panel`, standing at `status`, serving
+    /// its display on the endpoint `http`.
+    fn ada_copy(status: crate::infra_node::InfraNodeStatus) -> crate::infra_node::InfraNodeRow {
+        crate::infra_node::InfraNodeRow {
+            project_id: uuid::Uuid::nil(),
+            node_id: "panel".into(),
+            instance: Some(weft_core::instance::InstanceId::new("ada").unwrap()),
+            copy_id: "c1".into(),
+            status,
+            failure_stage: None,
+            failure_message: None,
+            applied_spec_hash: None,
+            applied_at_unix: None,
+            endpoints: [("http".to_string(), weft_core::infra::EndpointRecord::Url("http://panel-ada:8080".into()))].into(),
+            public_paths: Default::default(),
+            doors: Default::default(),
+            keep_disks: Vec::new(),
+            units: Default::default(),
+            notes: Vec::new(),
+            waiting: None,
+            provisioning_since_unix: None,
+            source_hash: None,
+        }
+    }
+
+    /// An infra display says where the copy behind it stands: `running`
+    /// while it is up, and its display is read from it; `stopped` once it
+    /// stopped, and reading it is a 404 that names that state instead of
+    /// a failed connection; `none` once there is no copy at all.
+    #[test]
+    fn an_infra_display_says_where_its_copy_stands() {
+        use crate::infra_node::InfraNodeStatus;
+        let running = ada_copy(InfraNodeStatus::Running);
+        assert_eq!(copy_status(Some(&running)), "running");
+        assert_eq!(crate::api::infra::live_endpoint_of(&running, "panel", "http").unwrap(), weft_core::infra::EndpointRecord::Url("http://panel-ada:8080".into()));
+
+        let stopped = ada_copy(InfraNodeStatus::Stopped);
+        assert_eq!(copy_status(Some(&stopped)), "stopped");
+        let (status, why) = crate::api::infra::live_endpoint_of(&stopped, "panel", "http").unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(why, "infra node 'panel' is stopped, so it has nothing to show yet");
+
+        assert_eq!(copy_status(None), "none");
+    }
+
+    /// Pressing a trigger's display is refused with a 400 saying it is
+    /// read-only, naming the display the way the caller wrote it.
+    #[test]
+    fn a_press_on_a_trigger_display_is_refused_as_read_only() {
+        assert_eq!(display_kind(&node(false, None, true)), Some(DisplayKind::Trigger));
+        let (status, why) = trigger_press_refused("one.door");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(why, "'one.door' is a trigger, and a trigger's display is read-only");
     }
 }

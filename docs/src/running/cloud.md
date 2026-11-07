@@ -187,6 +187,20 @@ share of at least 6 and a dispatcher copy 5, and one whose share is smaller
 refuses to start, with a log line that names the numbers and these
 variables.
 
+If you want a role to have more memory, set `WEFT_DISPATCHER_MEMORY` (1Gi
+when unset), `WEFT_BROKER_MEMORY`, `WEFT_LISTENER_MEMORY` or
+`WEFT_SUPERVISOR_MEMORY` (512Mi each when unset), a whole number of `Mi` or
+`Gi` from 512Mi to 4Gi, or `WEFT_HOLDER_MEMORY` for each copy that holds a
+trigger's open connection (512Mi when unset, at least 512Mi). The install sets each one on every run, so a value you
+change by hand in the Cloud Run console is put back the next time the workflow
+runs. The dispatcher gets more because every version is compiled there, and on
+Cloud Run the files a build writes are held in memory, beside the programs the
+dispatcher keeps read (about 90 MiB at most). A build's files may take up to a
+quarter of the dispatcher's memory, with room kept beside them for the version
+files the dispatcher fetched before: a build that needs more fails with `No space
+left on device` and leaves the copy serving everything else, and raising
+`WEFT_DISPATCHER_MEMORY` raises that quarter with it.
+
 These are repository variables on your fork, like the ones above, so
 merging a new weft into the fork keeps them. After you change one, run the
 install workflow again.
@@ -212,7 +226,11 @@ run it right after weft's main moved and your fork caught up, the release
 for that source may still be building: the workflow waits for it rather
 than compiling the same thing, and says so in its log. When it does have to
 build, it keeps the compiled dependencies for the next run, so after an
-upgrade only what changed in weft compiles again.
+upgrade only what changed in weft compiles again. Among the images is the
+standard worker, which every project made only of the standard nodes runs on,
+so the first of them to run after an upgrade starts at once instead of
+waiting a few minutes for that build. It also keeps the CLI it used in your
+install, so your projects' deploys download it instead of compiling it.
 
 When it finishes, its last step (in the run's summary, and in its log for
 `gh run view <id> --log`) gives you the install's address, a Cloud Run
@@ -242,12 +260,28 @@ does, go and read [updating weft](cli.md#updating-weft).
 This works from an install of any age, however long ago you last ran the
 workflow.
 
-While the workflow rolls the new weft out, a copy of the old one that still
-has something open (the editor following a project, a worker's line to the
-broker) steps aside as soon as Cloud Run sends the requests to the new one: it
-finishes what it was answering, closes what it held open, and stops. The
-editor and the workers open again on the new copies by themselves, so the two never take work side
-by side.
+Once the new weft is rolled out, the workflow deletes the older revisions of
+each of weft's own services (the dispatcher, the broker, the listener and the
+supervisor), and that stops every copy of the old weft still running, even one
+the editor or a worker was holding a connection to. Each finishes what it was
+answering, closes what it held open and gives back the work it was in the
+middle of, all within the 10 seconds Cloud Run gives it, and the editor and the
+workers open again on the new copies by themselves. So the old weft and the new
+one never take work side by side. If a service's new revision is not ready, or
+does not get all of its requests (traffic you pinned or split by hand), that
+step stops with an error naming the service and deletes nothing. The holders
+are not on that list: they run in a worker pool, which moves every one of its
+copies onto its newest revision as soon as that revision is rolled out, so the
+old holders stop by themselves. That holds while the pool sends its copies to
+its latest revision, which is how the install sets it up. If you split its
+copies between revisions by hand, that split stays through every later
+update and the old holders keep running; send every copy to the latest
+revision again with `gcloud run worker-pools update-instance-split weft-holder
+--to-latest --region <your region>`.
+
+If you roll a revision out by hand, outside the workflow, the copies of the
+older revisions keep running until the next run of the workflow deletes them,
+or until you delete them yourself with `gcloud run revisions delete`.
 
 Once in a while, weft's database starts its history over, and a database an
 older weft built cannot come across (it last happened when executions were
@@ -622,7 +656,7 @@ weft connect --on prod
 
 If a run on prod reaches a node with nothing picked there, it is refused
 before it starts, and the message names the node and
-`weft connect --node <node>`; add `--on prod`. An instance's own connection (a
+`weft connect <node>`; add `--on prod`. An instance's own connection (a
 field written `@instance_filled`) lives in the install it was made on, so
 your customers connect through your frontend on prod, the same way they do
 locally.
@@ -683,9 +717,12 @@ frontend's token, with the install's address, to a file only you can read.
 Put those in the frontend's environment.
 
 `weft ci add` writes `.github/workflows/deploy.yml`, a workflow you run by
-hand from the Actions tab. It takes the weft CLI the release built from the
-source your install runs (waiting for it while that release is still
-building, or building it when the release has none), deploys
+hand from the Actions tab. It takes the weft CLI built from the source your
+install runs: first the one the install workflow stored in your install
+(signed in with `WEFT_OPERATOR_KEY`, its sha256 checked), which is how a fork
+gets its own CLI without compiling it, then the one weft's release built
+(waiting for it while that release is still building), and it compiles the
+CLI only when neither has one. Then it deploys
 the program with `weft infra upgrade --all` then `weft resync --all`, then
 builds `front/` with Docker and deploys it to the repository's service. If
 you run `weft ci add` again, it replaces the file only if you have not edited
@@ -848,7 +885,7 @@ keeps asking until the install answers, and Ctrl+C stops it. If
   one. If it stays that way, the holders' logs say why.
 - **A run on prod is refused with "has no ... connection picked on this
   install"**: the node was connected on your machine, not on prod. Run the
-  `weft connect --node <node>` it names, with `--on prod`.
+  `weft connect <node>` it names, with `--on prod`.
 - **An image build fails**: the error quotes the builder's log, with the
   `cargo` or `apt` line that failed. Fix what it names and deploy again;
   only what changed rebuilds.

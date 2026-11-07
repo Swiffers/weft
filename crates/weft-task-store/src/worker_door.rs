@@ -68,6 +68,63 @@ pub const LEASES_KEPT_SECS: i64 = 3600;
 /// reads the refusals of this minute and the one before.
 pub const COUNTS_KEPT_SECS: i64 = 180;
 
+/// A worker's memory note: its memory is nearly full (`weft_engine::busy`),
+/// since the reading it crossed the line at. Kept on its own lease row
+/// while it lasts and taken off once the memory has room again: every
+/// tick that writes the row carries it (`weft_door_tick`), and a crossing
+/// tells it at once to a row already there ([`keep_memory_state`]). So a
+/// note on a worker that went away says it went away full: the lost-run
+/// sweep copies it onto each run it takes from that worker
+/// (`run.lost_memory_full_at`), and the worker that claims the run reads
+/// it with its claim (`weft_journal::record::Claimed`) and says the worker
+/// ran out of memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryNote {
+    /// How many bytes it used, and of how many, when it crossed.
+    pub used_bytes: u64,
+    pub limit_bytes: u64,
+    /// When it crossed (unix seconds, on the worker's own clock).
+    pub at_unix: u64,
+}
+
+/// Keep the memory state of worker `replica` of `project` on its lease
+/// row, when it has one: `full` while its memory is nearly full, `None`
+/// (the note taken off) once it has room again. A worker whose row is not
+/// written yet, or was dropped while it slept ([`LEASES_KEPT_SECS`]),
+/// keeps it nowhere here: the tick that writes its row carries it.
+pub async fn keep_memory_state(pool: &crate::db::Pool, replica: &str, project: uuid::Uuid, full: Option<&MemoryNote>) -> anyhow::Result<()> {
+    use crate::db::Client as _;
+    let (at, used, limit) = memory_columns(full)?;
+    pool.execute(
+        "UPDATE worker_lease SET memory_full_at = $3, memory_used = $4, memory_limit = $5 WHERE replica = $1 AND project_id = $2",
+        &[&replica, &project, &at, &used, &limit],
+    )
+    .await?;
+    Ok(())
+}
+
+/// A memory note's three lease columns (`memory_full_at`, `memory_used`,
+/// `memory_limit`), all NULL for none.
+pub fn memory_columns(full: Option<&MemoryNote>) -> anyhow::Result<(Option<i64>, Option<i64>, Option<i64>)> {
+    let bigint = |n: u64| i64::try_from(n).map_err(|_| anyhow::anyhow!("a memory note holds {n}, past what a BIGINT stores"));
+    Ok(match full {
+        Some(note) => (Some(bigint(note.at_unix)?), Some(bigint(note.used_bytes)?), Some(bigint(note.limit_bytes)?)),
+        None => (None, None, None),
+    })
+}
+
+/// The memory note a claim reads (`weft_journal::record::claim`), from
+/// the run's copy of the lease row of the worker it was lost by
+/// (`run.lost_memory_full_at`): its columns, all set or all NULL.
+pub fn memory_note_of(at: Option<i64>, used: Option<i64>, limit: Option<i64>) -> anyhow::Result<Option<MemoryNote>> {
+    let unsigned = |n: i64| u64::try_from(n).map_err(|_| anyhow::anyhow!("a stored memory note holds {n}"));
+    match (at, used, limit) {
+        (Some(at), Some(used), Some(limit)) => Ok(Some(MemoryNote { at_unix: unsigned(at)?, used_bytes: unsigned(used)?, limit_bytes: unsigned(limit)? })),
+        (None, None, None) => Ok(None),
+        partly => anyhow::bail!("a stored memory note is only partly there: {partly:?}"),
+    }
+}
+
 /// How many rows of each table one [`prune`] deletes at most.
 const PRUNE_BATCH: i64 = 1000;
 
@@ -87,6 +144,25 @@ pub async fn prune(pool: &crate::db::Pool, now: i64) -> anyhow::Result<()> {
         "DELETE FROM worker_lease WHERE replica IN \
          (SELECT replica FROM worker_lease WHERE leased_until_unix < $1 LIMIT $2 FOR UPDATE SKIP LOCKED)",
         &[&(now - LEASES_KEPT_SECS), &PRUNE_BATCH],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Count one fire or call of trigger `token` of `project` the install
+/// dropped itself, before any worker's door saw it (its trigger has no
+/// armed program), with `reason`: under `counter` (the dispatcher copy
+/// that dropped it), beside what the workers' doors count, so `weft
+/// status` reads both the same way. One statement; a drop is the path
+/// that pays for it.
+pub async fn count_drop(pool: &crate::db::Pool, project: uuid::Uuid, token: &str, counter: &str, reason: &str, now: i64) -> anyhow::Result<()> {
+    use crate::db::Client as _;
+    let (window_start, _) = weft_core::signal::limits::window(now);
+    pool.execute(
+        "INSERT INTO door_count (key, window_start, replica, project_id, hits, reason) VALUES ($1, $2, $3, $4, 1, $5) \
+         ON CONFLICT (key, window_start, replica) DO UPDATE SET hits = door_count.hits + 1, reason = EXCLUDED.reason \
+         WHERE door_count.project_id = EXCLUDED.project_id",
+        &[&weft_core::signal::limits::dropped_key(token), &window_start, &counter, &project, &weft_core::signal::limits::drop_reason(reason)],
     )
     .await?;
     Ok(())
@@ -115,7 +191,17 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             -- project's workers could not be reached for is tried again
             -- once a worker came alive after its tries stopped
             -- (`weft_dispatcher::delivery`).
-            alive_since BIGINT NOT NULL DEFAULT 0
+            alive_since BIGINT NOT NULL DEFAULT 0,
+            -- Its memory note while its memory is nearly full: when it
+            -- crossed the line (unix seconds, on its own clock), and how
+            -- many bytes it used of how many then (`weft_engine::busy`).
+            -- NULL while it has room. The lost-run sweep copies it onto
+            -- each run it takes from the worker once it went away
+            -- (`run.lost_memory_full_at`), to say the worker ran out of
+            -- memory.
+            memory_full_at BIGINT,
+            memory_used BIGINT,
+            memory_limit BIGINT
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_worker_lease_project ON worker_lease(project_id, leased_until_unix)"#,
         // SYNC: 'weft_lease_alive' <-> LEASE_ALIVE_CHANNEL
@@ -140,10 +226,10 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             FOR EACH ROW
             WHEN (OLD.leased_until_unix < EXTRACT(EPOCH FROM NOW())::BIGINT)
             EXECUTE FUNCTION worker_lease_alive_notify()"#,
-        // SYNC: door_count keys <-> crates/weft-core/src/signal/limits.rs (ran_key, failed_key)
+        // SYNC: door_count keys <-> crates/weft-core/src/signal/limits.rs (ran_key, failed_key, dropped_key)
         // What one worker counted at its door in one minute, per key
         // (`c:<token>:<caller>`, `e:<token>`, `refused:<token>:<limit>`,
-        // `ran:<token>`, `failed:<token>`):
+        // `ran:<token>`, `failed:<token>`, `dropped:<token>`):
         // its own total so far, replaced by each tick, under its project
         // (a copy hears only its own project's counts). UNLOGGED: a crash
         // loses a minute's counts, which only ever lets a few extra calls
@@ -154,11 +240,15 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             replica TEXT NOT NULL,
             project_id UUID NOT NULL,
             hits BIGINT NOT NULL,
+            -- The last reason the worker gave for the count, for a key
+            -- that keeps one (a dropped fire's); NULL for every other.
+            reason TEXT,
             PRIMARY KEY (key, window_start, replica)
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_door_count_window ON door_count(window_start)"#,
         // One tick of a worker: its lease renewed with what it drives
-        // now, its counts of the minute stored, and what the project's
+        // now and its memory note (NULLs while it has room), its counts of the minute stored (each with its reason, for
+        // a key that keeps one), and what the project's
         // other copies counted (keys are `<what>:<token>:...`; every key
         // but the refused-token ones, `t:-:<address>`, which each copy
         // bounds alone), with how many copies are alive; and, on a tick
@@ -168,20 +258,24 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
         // SYNC: the answer's shape <-> weft_broker_client::protocol::DoorTick
 concat!(        r#"CREATE OR REPLACE FUNCTION weft_door_tick(
                 p_replica TEXT, p_project UUID, p_tenant TEXT, p_binary_hash TEXT, p_leased_until BIGINT,
-                p_in_flight JSONB, p_window BIGINT, p_keys TEXT[], p_hits BIGINT[], p_shortens BOOLEAN
+                p_in_flight JSONB, p_window BIGINT, p_keys TEXT[], p_hits BIGINT[], p_reasons TEXT[], p_shortens BOOLEAN,
+                p_memory_full_at BIGINT, p_memory_used BIGINT, p_memory_limit BIGINT
             ) RETURNS JSONB AS $$
             BEGIN
-                INSERT INTO worker_lease (replica, project_id, tenant_id, binary_hash, leased_until_unix, in_flight, alive_since)
+                INSERT INTO worker_lease (replica, project_id, tenant_id, binary_hash, leased_until_unix, in_flight, alive_since,
+                                          memory_full_at, memory_used, memory_limit)
                     VALUES (p_replica, p_project, p_tenant, p_binary_hash, p_leased_until, p_in_flight,
-                            EXTRACT(EPOCH FROM NOW())::BIGINT)
+                            EXTRACT(EPOCH FROM NOW())::BIGINT, p_memory_full_at, p_memory_used, p_memory_limit)
                     ON CONFLICT (replica) DO UPDATE
                         SET leased_until_unix = EXCLUDED.leased_until_unix, in_flight = EXCLUDED.in_flight,
+                            memory_full_at = EXCLUDED.memory_full_at, memory_used = EXCLUDED.memory_used,
+                            memory_limit = EXCLUDED.memory_limit,
                             alive_since = CASE WHEN "#, worker_alive!("worker_lease"), r#"
                                                THEN worker_lease.alive_since ELSE EXCLUDED.alive_since END
                     WHERE worker_lease.project_id = EXCLUDED.project_id;
-                INSERT INTO door_count (key, window_start, replica, project_id, hits)
-                    SELECT k, p_window, p_replica, p_project, h FROM unnest(p_keys, p_hits) AS t(k, h)
-                    ON CONFLICT (key, window_start, replica) DO UPDATE SET hits = EXCLUDED.hits
+                INSERT INTO door_count (key, window_start, replica, project_id, hits, reason)
+                    SELECT k, p_window, p_replica, p_project, h, r FROM unnest(p_keys, p_hits, p_reasons) AS t(k, h, r)
+                    ON CONFLICT (key, window_start, replica) DO UPDATE SET hits = EXCLUDED.hits, reason = EXCLUDED.reason
                     WHERE door_count.project_id = EXCLUDED.project_id;
                 -- This tick's lease ends before the one the worker vouched
                 -- for last: the look at lapsed leases, booked for the
@@ -204,28 +298,6 @@ concat!(        r#"CREATE OR REPLACE FUNCTION weft_door_tick(
                                  AND "#, worker_alive!("l"), r#"));
             END;
             $$ LANGUAGE plpgsql"#),
-        // The tick as the previous release's brokers call it, which they
-        // do while an upgrade rolls out: the lease and the counts written
-        // as the tick above writes them, no lease shortened, and the other
-        // copies' counts of exactly the tokens they name (`p_tokens`,
-        // refused ones included), as that release answered. The release
-        // after this one drops it.
-        r#"CREATE OR REPLACE FUNCTION weft_door_tick(
-                p_replica TEXT, p_project UUID, p_tenant TEXT, p_binary_hash TEXT, p_leased_until BIGINT,
-                p_in_flight JSONB, p_window BIGINT, p_keys TEXT[], p_hits BIGINT[], p_tokens TEXT[]
-            ) RETURNS JSONB AS $$
-                SELECT jsonb_build_object(
-                    'others', COALESCE((
-                        SELECT jsonb_agg(jsonb_build_object('key', o.key, 'hits', o.hits))
-                        FROM (SELECT key, SUM(hits)::bigint AS hits FROM door_count
-                              WHERE window_start = p_window AND replica <> p_replica
-                                AND project_id = p_project
-                                AND split_part(key, ':', 2) = ANY(p_tokens)
-                              GROUP BY key) o), '[]'::jsonb),
-                    'copies', t.tick->'copies')
-                FROM (SELECT weft_door_tick(p_replica, p_project, p_tenant, p_binary_hash, p_leased_until,
-                                            p_in_flight, p_window, p_keys, p_hits, FALSE) AS tick) t
-            $$ LANGUAGE sql"#,
     ],
     seed: &[],
     data_steps: &[],

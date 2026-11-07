@@ -100,28 +100,10 @@ pub async fn connect_direct(
     door: &str,
     values: Value,
 ) -> Result<Connection> {
-    connect_direct_inner(disp, spec, door, values, false).await
-}
-
-/// Connect through a consent service's `ownPage.paste` section (a
-/// ready credential, no app): the store snapshots the spec's static
-/// paste variant.
-pub async fn connect_paste(disp: &Dispatcher, spec: Value, values: Value) -> Result<Connection> {
-    connect_direct_inner(disp, spec, "own", values, true).await
-}
-
-async fn connect_direct_inner(
-    disp: &Dispatcher,
-    spec: Value,
-    door: &str,
-    values: Value,
-    paste: bool,
-) -> Result<Connection> {
     let done: Value = disp
         .post_json(
             "/access/connect/direct",
-            &json!({ "spec": spec, "door": door, "values": values, "paste": paste,
-                     "projectId": null }),
+            &json!({ "spec": spec, "door": door, "values": values, "projectId": null }),
         )
         .await
         .context("connect_direct through the dispatcher")?;
@@ -139,12 +121,33 @@ async fn connect_direct_inner(
     })
 }
 
+/// Connect a new account for `node` through the terminal, the way a person
+/// does (`weft connect <node> --door own ...`, `args` after the node),
+/// which also picks it there, with `env` set on that command alone (what
+/// its `--set-env` reads); hand back a [`Connection`] owning the grant.
+pub async fn connect_with_cli(project: &Project, node: &str, args: &[&str], env: &[(&str, &str)]) -> Result<Connection> {
+    let mut all = vec!["connect", node];
+    all.extend_from_slice(args);
+    project.weft_with_env(&all, env).await?;
+    // The walkthrough prints for a person; what it picked is read back the
+    // way a script reads it.
+    let listed = project.weft(&["connect", node, "--list", "--json"]).await?;
+    let answer: Value = listed
+        .lines()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok().filter(|v| v.get("picked").is_some()))
+        .with_context(|| format!("`weft connect {node} --list` answered no pick: {listed}"))?;
+    let grant_id = answer["picked"].as_str().with_context(|| format!("`weft connect {node}` picked no connection: {listed}"))?.to_string();
+    let disp = project.dispatcher().clone();
+    crate::kept::grant_made(&disp, &grant_id)?;
+    Ok(Connection { handle: json!({ "id": grant_id }), grant_id, disp, finished: false })
+}
+
 /// Pick the connection `handle` names for the fixture's access node on
-/// the install, the way a person does (`weft connect --node <node>
+/// the install, the way a person does (`weft connect <node>
 /// --grant <id>`): the install keeps the pick, never the source.
 pub async fn set_account(project: &Project, node: &str, handle: &Value) -> Result<()> {
     let id = handle.get("id").and_then(Value::as_str).context("the handle names no connection id")?;
-    project.weft(&["connect", "--node", node, "--grant", id, "--json"]).await?;
+    project.weft(&["connect", node, "--grant", id, "--json"]).await?;
     Ok(())
 }
 

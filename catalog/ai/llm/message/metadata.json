@@ -1,7 +1,7 @@
 {
   "type": "ChatHistoryAppend",
   "label": "Chat Message",
-  "description": "Append one message to a conversation file (`historyFile`), in place: the same file LLM nodes read and add their turns to, so a conversation is built by chaining this node and LLM calls on one file. With no file in, it starts a new conversation file, kept past the run. For a tool result in an agent's tool loop: `role: \"tool\"`, the result on `text`, the call's `id` on `toolCallId`, the loop's carried file on `historyFile`; this node's `historyFile` output is the loop's next carry.",
+  "description": "Append one message to a conversation file (`historyFile`), in place: the same file LLM nodes read and add their turns to, so a conversation is built by chaining this node and LLM calls on one file. With no file in, it starts a new conversation file, stored with the run (KeepFile keeps it past that). For a tool result in an agent's tool loop: `role: \"tool\"`, the result on `text`, the call's `id` on `toolCallId`, the loop's carried file on `historyFile`; this node's `historyFile` output is the loop's next carry.",
   "tags": [
     "ai",
     "chat",
@@ -70,7 +70,7 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_equals",
+            "kind": "value",
             "field": "role",
             "equals": "tool"
           },
@@ -102,13 +102,9 @@
             "kind": "any",
             "of": [
               {
-                "kind": "config_in_set",
+                "kind": "value",
                 "field": "role",
-                "values": [
-                  "user",
-                  "assistant",
-                  "system"
-                ]
+                "oneOf": ["user", "assistant", "system"]
               },
               {
                 "kind": "all",
@@ -116,7 +112,7 @@
                   {
                     "kind": "not",
                     "of": {
-                      "kind": "config_present",
+                      "kind": "value",
                       "field": "role"
                     }
                   },

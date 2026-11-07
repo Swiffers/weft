@@ -6,9 +6,19 @@ output "registry" {
   value       = local.images_registry
 }
 
+output "files_bucket" {
+  description = "The bucket the install keeps its files in, where the install workflow stores the weft CLI it ran with (under install/cli/<tree>/) for a project's deploy to download."
+  value       = google_storage_bucket.files.name
+}
+
 output "url" {
   description = "The install's address: the dispatcher's own Cloud Run address, which answers with no domain at all."
   value       = local.role_urls["dispatcher"]
+}
+
+output "role_services" {
+  description = "The Cloud Run service of each of weft's roles, whose older revisions the install workflow deletes once the new one serves."
+  value       = [for role in local.serverless_roles : google_cloud_run_v2_service.role[role].name]
 }
 
 # SYNC: install_key_secret <-> crates/weft-core/src/signal_token.rs (INSTALL_KEY_SECRET),

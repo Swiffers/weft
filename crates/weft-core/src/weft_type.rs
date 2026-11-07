@@ -106,7 +106,8 @@ pub enum FileKind {
 
 impl FileKind {
     /// The on-wire sentinel key that tags a value of this kind.
-    // SYNC: FileKind::marker_key <-> packages/weft-graph/src/protocol.ts STORED_FILE_MARKER_TYPES
+    // SYNC: FileKind::marker_key <-> packages/weft-graph/src/protocol.ts STORED_FILE_MARKER_TYPES,
+    //       extension-browser/src/lib/chat-history.ts MARKERS
     pub fn marker_key(self) -> &'static str {
         match self {
             FileKind::Image => "__weft_image__",
@@ -699,6 +700,37 @@ enum CastDoor {
     Requested,
 }
 
+/// How much of what is wrong a walk of a value against a type reports.
+/// A yes-or-no question (a union probing its members, a runtime gate)
+/// asks for `First` and the walk stops at the first problem it meets,
+/// naming only that one; the message a person reads asks for `All`.
+/// A value that passes costs the same either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Report {
+    First,
+    All,
+}
+
+/// How many undeclared keys a record's refusal names before it counts
+/// the rest: the keys come from whoever sent the value, and a payload
+/// with thousands of them must not come back as a message as long.
+const UNKNOWN_KEYS_NAMED: usize = 20;
+
+/// `problems`, each said to sit under `label` (`field 'a': ...`,
+/// `item 2: ...`), so none reads as the problem of what holds it.
+fn under(label: std::fmt::Arguments<'_>, problems: Vec<std::string::String>) -> Vec<std::string::String> {
+    problems.into_iter().map(|problem| format!("{label}: {problem}")).collect()
+}
+
+/// What is wrong with a record value, from [`WeftType::walk_record`]:
+/// its `own` problems (undeclared keys, missing fields), which the
+/// caller labels with where the record sits, and its `fields`' problems,
+/// each already labelled by the visit that found it.
+struct RecordProblems {
+    own: Vec<std::string::String>,
+    fields: Vec<std::string::String>,
+}
+
 /// What a file control offers for a port: the file type it picks (and
 /// writes into `@asset(..., <Type>)`), and whether the port holds
 /// several files rather than one.
@@ -759,11 +791,19 @@ pub enum WeftType {
     Bus,
     /// Authorized ability to call a third party: the value an access
     /// node emits (`{"__weft_access__": {...}}`, see
-    /// `crate::access::Access`). One general type for both kinds
-    /// (metered + personal); never parameterized per service (wrong-
-    /// service wiring fails loud at runtime). Wired-only: the marker is
-    /// minted by an access node, never typed as a literal.
-    Access,
+    /// `crate::access::Access`), metered and personal alike. `Access[fal]`
+    /// (`Some("fal")`) is a connection to one service, named the way a
+    /// recipe names it; bare `Access` (`None`) is a connection to any
+    /// service. `Access[fal]` fits `Access[fal]` and bare `Access`, and
+    /// bare `Access` fits only bare `Access`, so a wire from one service
+    /// into a node taking another is refused at compile time. A node
+    /// taking several services writes a union
+    /// (`Access[openai] | Access[anthropic]`). The run-time floor is
+    /// `open_connection`, which holds the marker's service to the port's
+    /// type. Wired-only: the marker is minted by an access node, never
+    /// typed as a literal.
+    // SYNC: WeftType::Access <-> packages/weft-graph/src/protocol.ts WeftType 'access'
+    Access(Option<std::string::String>),
     /// A handle on one endpoint of an infra node: the value an infra
     /// node emits (`{"__weft_infra__": {...}}`, see
     /// `crate::infra::InfraHandle`) so other nodes reach that endpoint.
@@ -839,7 +879,7 @@ impl PartialEq for WeftType {
             (WeftType::JsonDict, WeftType::JsonDict) => true,
             (WeftType::Json, WeftType::Json) => true,
             (WeftType::Bus, WeftType::Bus) => true,
-            (WeftType::Access, WeftType::Access) => true,
+            (WeftType::Access(a), WeftType::Access(b)) => a == b,
             (WeftType::Infra, WeftType::Infra) => true,
             (WeftType::Generator(a), WeftType::Generator(b)) => a == b,
             (WeftType::Secret(a), WeftType::Secret(b)) => a == b,
@@ -1116,6 +1156,16 @@ impl WeftType {
         matches!(self.structural(), WeftType::Bus | WeftType::Generator(_))
     }
 
+    /// Whether every value of this type is a connection: `Access`,
+    /// `Access[x]`, or a union of those (`Access[openai] | Access[anthropic]`).
+    pub fn is_access(&self) -> bool {
+        match self.structural() {
+            WeftType::Access(_) => true,
+            WeftType::Union(members) => members.iter().all(WeftType::is_access),
+            _ => false,
+        }
+    }
+
     // SYNC: structural <-> packages/weft-graph/src/webview/lib/types/index.ts structural
     pub fn structural(&self) -> &WeftType {
         match self {
@@ -1147,7 +1197,7 @@ impl WeftType {
             WeftType::JsonDict
             | WeftType::Json
             | WeftType::Bus
-            | WeftType::Access
+            | WeftType::Access(_)
             | WeftType::Infra
             | WeftType::Generator(_)
             | WeftType::Secret(_)
@@ -1266,7 +1316,7 @@ impl WeftType {
             // Any JSON value is one, and none is more neutral than null.
             WeftType::Json
             | WeftType::Bus
-            | WeftType::Access
+            | WeftType::Access(_)
             | WeftType::Infra
             | WeftType::Generator(_)
             | WeftType::Secret(_)
@@ -1310,9 +1360,11 @@ impl WeftType {
             (src, WeftType::Json) => src.fits_json(),
             // A bus connects only to a bus; payloads are not type-checked.
             (WeftType::Bus, WeftType::Bus) => true,
-            // An access connects only to an access; the KIND/service is
-            // checked at runtime resolution, not by the type system.
-            (WeftType::Access, WeftType::Access) => true,
+            // An access connects only to an access: one of a service into
+            // that service or into any, and one of any service only into
+            // any (the open_connection floor holds what arrives to it).
+            // SYNC: access compatibility <-> packages/weft-graph/src/webview/lib/types/index.ts isCompatible
+            (WeftType::Access(source), WeftType::Access(target)) => target.is_none() || source == target,
             // An infra handle connects only to an infra handle; which
             // node it names is checked when it resolves.
             (WeftType::Infra, WeftType::Infra) => true,
@@ -1414,7 +1466,7 @@ impl WeftType {
             WeftType::Record { fields, .. } => fields.iter().all(|f| f.ty.fits_json()),
             WeftType::Named { body, .. } => body.fits_json(),
             WeftType::JsonDict | WeftType::Json | WeftType::TypeVar(_) => true,
-            WeftType::Bus | WeftType::Access | WeftType::Infra | WeftType::Generator(_) | WeftType::Secret(_) => false,
+            WeftType::Bus | WeftType::Access(_) | WeftType::Infra | WeftType::Generator(_) | WeftType::Secret(_) => false,
         }
     }
 
@@ -1432,7 +1484,7 @@ impl WeftType {
             | WeftType::JsonDict
             | WeftType::Json
             | WeftType::Bus
-            | WeftType::Access
+            | WeftType::Access(_)
             | WeftType::Infra
             | WeftType::TypeVar(_) => false,
         }
@@ -1510,7 +1562,7 @@ impl WeftType {
             // become one.
             (WeftType::Union(members), value) => {
                 let mut first_taker = None;
-                for member in members.iter().filter(|m| m.validate_value(value).is_ok()) {
+                for member in members.iter().filter(|m| m.accepts_runtime_value(value)) {
                     let mut found = Vec::new();
                     member.find_secret_places(value, at, &mut found);
                     if !found.iter().any(|(_, place)| *place == SecretPlace::Undeclared) {
@@ -1601,8 +1653,11 @@ impl WeftType {
                 if Self::detect_bus_type(obj).is_some() {
                     return WeftType::Bus;
                 }
-                if obj.contains_key(crate::access::ACCESS_MARKER_KEY) {
-                    return WeftType::Access;
+                // An access marker names its service, so the value is a
+                // connection to that one (one naming none is to any).
+                if let Some(payload) = obj.get(crate::access::ACCESS_MARKER_KEY) {
+                    let service = payload.get("service").and_then(serde_json::Value::as_str);
+                    return WeftType::Access(service.map(str::to_string));
                 }
                 if obj.contains_key(crate::infra::INFRA_MARKER_KEY) {
                     return WeftType::Infra;
@@ -1667,6 +1722,21 @@ impl WeftType {
             serde_json::Value::Array(items) => items.iter().any(Self::contains_bus_handle),
             serde_json::Value::Object(fields) => fields.values().any(Self::contains_bus_handle),
             _ => false,
+        }
+    }
+
+    /// The id of every bus whose marker `value` carries, on its own or
+    /// nested in a record or a list, each handed to `found`: the buses a
+    /// value hands on to whoever takes it.
+    pub fn buses_in<'a>(value: &'a serde_json::Value, found: &mut impl FnMut(&'a str)) {
+        if let Some(id) = Self::bus_marker_id(value) {
+            found(id);
+            return;
+        }
+        match value {
+            serde_json::Value::Array(items) => items.iter().for_each(|item| Self::buses_in(item, found)),
+            serde_json::Value::Object(fields) => fields.values().for_each(|field| Self::buses_in(field, found)),
+            _ => {}
         }
     }
 
@@ -1736,8 +1806,12 @@ impl WeftType {
     /// - a list or an object never becomes text here: one written where
     ///   text is wanted is a mistake far more often than a wish. The
     ///   Cast node, asked outright, does it ([`Self::cast_requested`]).
+    ///
+    /// A record names every problem it has at once, each one under the
+    /// field it sits in (`field 'a': missing required field 'x'`), joined
+    /// by `; ` the way [`Self::validate_value`] joins its own.
     pub fn cast_value(&self, value: &serde_json::Value) -> Result<serde_json::Value, std::string::String> {
-        self.cast_through(value, CastDoor::Literal)
+        self.cast_through(value, CastDoor::Literal, Report::All).map_err(|problems| problems.join("; "))
     }
 
     /// Cast a JSON value into this type the way the Cast node does: the
@@ -1746,17 +1820,29 @@ impl WeftType {
     /// [`Self::cast_allowed`] grants a program that asks for it and a
     /// written value never gets.
     pub fn cast_requested(&self, value: &serde_json::Value) -> Result<serde_json::Value, std::string::String> {
-        self.cast_through(value, CastDoor::Requested)
+        self.cast_through(value, CastDoor::Requested, Report::All).map_err(|problems| problems.join("; "))
     }
 
-    fn cast_through(&self, value: &serde_json::Value, door: CastDoor) -> Result<serde_json::Value, std::string::String> {
+    /// The cast behind [`Self::cast_value`] and [`Self::cast_requested`],
+    /// failing with every problem (`report` [`Report::All`]) or the first
+    /// one (a union trying its members), each carrying the field (and the
+    /// named type) it sits under.
+    fn cast_through(
+        &self,
+        value: &serde_json::Value,
+        door: CastDoor,
+        report: Report,
+    ) -> Result<serde_json::Value, Vec<std::string::String>> {
         use serde_json::Value;
         // Exact fit: hand it back untouched (preserves the written form).
         if Self::is_compatible(&Self::infer(value), self) {
             return Ok(value.clone());
         }
+        // Every refusal past this point but a record's or a named type's
+        // is one problem.
+        let refuse = |problem: std::string::String| Err(vec![problem]);
         if value.is_null() {
-            return Err("null has no cast".into());
+            return refuse("null has no cast".into());
         }
         // A file-valued type (a bare Image/Media/...) never converts: a
         // file value is a marker, not convertible data, and a marker of
@@ -1765,7 +1851,7 @@ impl WeftType {
         // claimed as an image) or no marker at all; each is named.
         // Containers and records HOLDING files recurse below.
         if self.is_file_valued() {
-            return Err(match Self::infer(value) {
+            return refuse(match Self::infer(value) {
                 found if found.is_file_valued() => format!("the value is a stored {found}, not {self}"),
                 _ => format!(
                     "no cast into {self}: a stored file is its marker object \
@@ -1775,39 +1861,41 @@ impl WeftType {
             });
         }
         if matches!(self.structural(), WeftType::Secret(_)) {
-            return Err(crate::secret::MADE_BY_A_NODE.to_string());
+            return refuse(crate::secret::MADE_BY_A_NODE.to_string());
         }
         if self.is_unresolved()
-            || matches!(self, WeftType::Bus | WeftType::Access | WeftType::Infra | WeftType::Generator(_))
+            || matches!(self, WeftType::Bus | WeftType::Access(_) | WeftType::Infra | WeftType::Generator(_))
         {
-            return Err(format!("no cast into {self}"));
+            return refuse(format!("no cast into {self}"));
         }
+        // A structural type written as text: parse it as JSON first.
+        let parse = |s: &str| {
+            serde_json::from_str::<Value>(s.trim()).map_err(|e| vec![format!("{s:?} is not valid JSON: {e}")])
+        };
         match self {
             WeftType::Primitive(WeftPrimitive::Number) => match value {
                 Value::String(s) => {
-                    let n: f64 = s.trim().parse().map_err(|_| {
-                        format!("{s:?} is not a number")
-                    })?;
+                    let n: f64 = s.trim().parse().map_err(|_| vec![format!("{s:?} is not a number")])?;
                     serde_json::Number::from_f64(n)
                         .map(Value::Number)
-                        .ok_or_else(|| format!("{n} is not finite"))
+                        .ok_or_else(|| vec![format!("{n} is not finite")])
                 }
                 Value::Bool(b) => Ok(Value::from(if *b { 1 } else { 0 })),
-                _ => Err(format!("no cast from {} into Number", Self::infer(value))),
+                _ => refuse(format!("no cast from {} into Number", Self::infer(value))),
             },
             WeftType::Primitive(WeftPrimitive::Boolean) => match value {
                 Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
                     "true" | "1" => Ok(Value::Bool(true)),
                     "false" | "0" => Ok(Value::Bool(false)),
-                    other => Err(format!("{other:?} is not a boolean")),
+                    other => refuse(format!("{other:?} is not a boolean")),
                 },
                 // Exactly 1/0; any other number is ambiguous, refused.
                 Value::Number(n) => match n.as_f64() {
                     Some(1.0) => Ok(Value::Bool(true)),
                     Some(0.0) => Ok(Value::Bool(false)),
-                    _ => Err(format!("{n} is not a boolean (only 1/0 cast)")),
+                    _ => refuse(format!("{n} is not a boolean (only 1/0 cast)")),
                 },
-                _ => Err(format!("no cast from {} into Boolean", Self::infer(value))),
+                _ => refuse(format!("no cast from {} into Boolean", Self::infer(value))),
             },
             WeftType::Primitive(WeftPrimitive::String) => match value {
                 Value::Number(n) => Ok(Value::String(n.to_string())),
@@ -1815,94 +1903,78 @@ impl WeftType {
                 Value::Array(_) | Value::Object(_) if door == CastDoor::Requested => {
                     Ok(Value::String(value.to_string()))
                 }
-                _ => Err(format!("no cast from {} into String", Self::infer(value))),
+                _ => refuse(format!("no cast from {} into String", Self::infer(value))),
             },
             WeftType::List(inner) => match value {
+                // Its entries share one type, so the first bad one stops it.
                 Value::Array(items) => items
                     .iter()
-                    .map(|v| inner.cast_through(v, door))
+                    .enumerate()
+                    .map(|(i, v)| {
+                        inner.cast_through(v, door, report).map_err(|problems| under(format_args!("item {i}"), problems))
+                    })
                     .collect::<Result<Vec<_>, _>>()
                     .map(Value::Array),
-                Value::String(s) => {
-                    let parsed: Value = serde_json::from_str(s.trim())
-                        .map_err(|e| format!("{s:?} is not valid JSON: {e}"))?;
-                    self.cast_through(&parsed, door)
-                }
-                _ => Err(format!("no cast from {} into {self}", Self::infer(value))),
+                Value::String(s) => self.cast_through(&parse(s)?, door, report),
+                _ => refuse(format!("no cast from {} into {self}", Self::infer(value))),
             },
             WeftType::Dict(v_ty) => match value {
                 Value::Object(map) => {
                     let mut out = serde_json::Map::new();
                     for (k, v) in map {
-                        out.insert(k.clone(), v_ty.cast_through(v, door)?);
+                        // The key is the sender's, so it is escaped.
+                        let cast = v_ty
+                            .cast_through(v, door, report)
+                            .map_err(|problems| under(format_args!("key '{}'", k.escape_debug()), problems))?;
+                        out.insert(k.clone(), cast);
                     }
                     Ok(Value::Object(out))
                 }
-                Value::String(s) => {
-                    let parsed: Value = serde_json::from_str(s.trim())
-                        .map_err(|e| format!("{s:?} is not valid JSON: {e}"))?;
-                    self.cast_through(&parsed, door)
-                }
-                _ => Err(format!("no cast from {} into {self}", Self::infer(value))),
+                Value::String(s) => self.cast_through(&parse(s)?, door, report),
+                _ => refuse(format!("no cast from {} into {self}", Self::infer(value))),
             },
             WeftType::JsonDict => match value {
-                Value::String(s) => {
-                    let parsed: Value = serde_json::from_str(s.trim())
-                        .map_err(|e| format!("{s:?} is not valid JSON: {e}"))?;
-                    match parsed {
-                        Value::Object(_) => Ok(parsed),
-                        other => Err(format!("expected a JSON object, got {}", Self::infer(&other))),
-                    }
-                }
-                _ => Err(format!("no cast from {} into JsonDict", Self::infer(value))),
+                Value::String(s) => match parse(s)? {
+                    parsed @ Value::Object(_) => Ok(parsed),
+                    other => refuse(format!("expected a JSON object, got {}", Self::infer(&other))),
+                },
+                _ => refuse(format!("no cast from {} into JsonDict", Self::infer(value))),
             },
             // A record casts field by field under its declared contract:
             // undeclared keys refused (dropped by an open record),
             // required fields demanded, an optional field's null kept as
-            // written. A string parses as JSON first.
+            // written, and every problem named at once, a field's own
+            // under its name. A string parses as JSON first.
             WeftType::Record { fields, open } => match value {
                 Value::Object(map) => {
-                    if !open {
-                        if let Some(unknown) =
-                            map.keys().find(|k| !fields.iter().any(|f| &f.name == *k))
-                        {
-                            return Err(format!("unknown field {unknown:?} (not declared on {self})"));
-                        }
-                    }
                     let mut out = serde_json::Map::new();
-                    for field in fields {
-                        match map.get(&field.name) {
-                            Some(Value::Null) | None if field.optional => {
-                                if map.contains_key(&field.name) {
-                                    out.insert(field.name.clone(), Value::Null);
-                                }
-                            }
-                            Some(v) => {
-                                let cast = field.ty.cast_through(v, door).map_err(|e| {
-                                    format!("field {:?}: {e}", field.name)
-                                })?;
-                                out.insert(field.name.clone(), cast);
-                            }
-                            None => {
-                                return Err(format!("missing required field {:?}", field.name))
-                            }
+                    let walked = self.walk_record(fields, *open, map, report, |field, v| {
+                        if field.optional && v.is_null() {
+                            out.insert(field.name.clone(), Value::Null);
+                            return Ok(());
                         }
+                        let cast = field
+                            .ty
+                            .cast_through(v, door, report)
+                            .map_err(|problems| under(format_args!("field '{}'", field.name), problems))?;
+                        out.insert(field.name.clone(), cast);
+                        Ok(())
+                    });
+                    match walked {
+                        Ok(()) => Ok(Value::Object(out)),
+                        Err(RecordProblems { own, fields }) => Err(own.into_iter().chain(fields).collect()),
                     }
-                    Ok(Value::Object(out))
                 }
-                Value::String(s) => {
-                    let parsed: Value = serde_json::from_str(s.trim())
-                        .map_err(|e| format!("{s:?} is not valid JSON: {e}"))?;
-                    self.cast_through(&parsed, door)
-                }
-                _ => Err(format!("no cast from {} into {self}", Self::infer(value))),
+                Value::String(s) => self.cast_through(&parse(s)?, door, report),
+                _ => refuse(format!("no cast from {} into {self}", Self::infer(value))),
             },
             // A named type casts through its body; the RESULT is a value
             // of the named type (nominal-ness lives in the type system,
-            // values carry no name tag).
+            // values carry no name tag). Each of the body's problems says
+            // which type it was held to.
             WeftType::Named { body, .. } => body
-                .cast_through(value, door)
-                .map_err(|e| format!("not a valid {self}: {e}")),
+                .cast_through(value, door, report)
+                .map_err(|problems| under(format_args!("not a valid {self}"), problems)),
             // Exact compatibility was tried above; now EVERY member's
             // cast. One success (or several agreeing) wins; members
             // disagreeing on the result is ambiguous and refused with
@@ -1918,7 +1990,7 @@ impl WeftType {
                 let readings = |door: CastDoor| -> Vec<(&WeftType, serde_json::Value)> {
                     members
                         .iter()
-                        .filter_map(|m| m.cast_through(value, door).ok().map(|v| (m, v)))
+                        .filter_map(|m| m.cast_through(value, door, Report::First).ok().map(|v| (m, v)))
                         .collect()
                 };
                 let mut successes = readings(CastDoor::Literal);
@@ -1926,7 +1998,7 @@ impl WeftType {
                     successes = readings(CastDoor::Requested);
                 }
                 match successes.as_slice() {
-                    [] => Err(format!("no member of {self} can cast {}", Self::infer(value))),
+                    [] => refuse(format!("no member of {self} can cast {}", Self::infer(value))),
                     [(_, v)] => Ok(v.clone()),
                     all => {
                         let (_, first) = &all[0];
@@ -1937,7 +2009,7 @@ impl WeftType {
                                 .iter()
                                 .map(|(m, v)| format!("{v} ({m})"))
                                 .collect();
-                            Err(format!(
+                            refuse(format!(
                                 "ambiguous cast into {self}: could be {}; write the value \
                                  in its exact type",
                                 readings.join(" or ")
@@ -1946,7 +2018,7 @@ impl WeftType {
                     }
                 }
             }
-            _ => Err(format!("no cast from {} into {self}", Self::infer(value))),
+            _ => refuse(format!("no cast from {} into {self}", Self::infer(value))),
         }
     }
 
@@ -2017,7 +2089,7 @@ impl WeftType {
         }
         let text_serializable = |t: &WeftType| {
             !t.references_file()
-                && !matches!(t, WeftType::Bus | WeftType::Access | WeftType::Infra | WeftType::Generator(_) | WeftType::Secret(_))
+                && !matches!(t, WeftType::Bus | WeftType::Access(_) | WeftType::Infra | WeftType::Generator(_) | WeftType::Secret(_))
         };
         let object_shaped = |t: &WeftType| {
             matches!(
@@ -2070,10 +2142,11 @@ impl WeftType {
     /// a file primitive demands its stored-file marker (a raw URL string
     /// is not a stored file). Unlike [`Self::cast_value`] this never
     /// converts: the value either already matches or the error says why
-    /// not.
+    /// not, every problem at once where each is its own fix (see
+    /// [`Self::validate_at`]), separated by `; `.
     pub fn validate_value(&self, value: &serde_json::Value) -> Result<(), std::string::String> {
         let mut path = std::string::String::new();
-        self.validate_at(value, &mut path)
+        self.validate_at(value, &mut path, Report::All).map_err(|problems| problems.join("; "))
     }
 
     /// Hold `value` to this type and hand back what flows on: the value
@@ -2144,7 +2217,7 @@ impl WeftType {
             (WeftType::Union(members), value) => {
                 let readings: Vec<(&WeftType, Value)> = members
                     .iter()
-                    .filter(|m| m.validate_value(&value).is_ok())
+                    .filter(|m| m.accepts_runtime_value(&value))
                     .map(|m| m.drop_undeclared(value.clone()).map(|v| (m, v)))
                     .collect::<Result<_, _>>()?;
                 match readings.as_slice() {
@@ -2165,18 +2238,27 @@ impl WeftType {
         })
     }
 
+    /// The problems `value` has against this type, each naming its path.
+    /// A record names all of its own (every undeclared key, every missing
+    /// field, every field whose value is wrong, at any depth): each is a
+    /// separate line to fix, and a person handed one at a time fixes,
+    /// reruns and meets the next. A list or a dict stops at its first bad
+    /// entry: its entries share one type, so one bad entry shows what is
+    /// wrong with the rest. With [`Report::First`] the walk stops at the
+    /// first problem of any kind and names only that one.
     fn validate_at(
         &self,
         value: &serde_json::Value,
         path: &mut std::string::String,
-    ) -> Result<(), std::string::String> {
+        report: Report,
+    ) -> Result<(), Vec<std::string::String>> {
         use serde_json::Value;
         use std::fmt::Write;
         let here = |path: &std::string::String| {
             if path.is_empty() { "value".to_string() } else { path.clone() }
         };
         let mismatch = |path: &std::string::String| {
-            Err(format!("{}: expected {self}, got {}", here(path), Self::infer(value)))
+            Err(vec![format!("{}: expected {self}, got {}", here(path), Self::infer(value))])
         };
         match self {
             WeftType::Primitive(p) => {
@@ -2201,7 +2283,7 @@ impl WeftType {
                     for (i, item) in items.iter().enumerate() {
                         let len = path.len();
                         let _ = write!(path, "[{i}]");
-                        inner.validate_at(item, path)?;
+                        inner.validate_at(item, path, report)?;
                         path.truncate(len);
                     }
                     Ok(())
@@ -2212,8 +2294,10 @@ impl WeftType {
                 Value::Object(map) => {
                     for (k, v) in map {
                         let len = path.len();
-                        let _ = write!(path, ".{k}");
-                        v_ty.validate_at(v, path)?;
+                        // The key is the sender's: escaped, so a quote or a
+                        // newline in it cannot break the line it lands in.
+                        let _ = write!(path, ".{}", k.escape_debug());
+                        v_ty.validate_at(v, path, report)?;
                         path.truncate(len);
                     }
                     Ok(())
@@ -2228,63 +2312,54 @@ impl WeftType {
             WeftType::Json => Ok(()),
             WeftType::Record { fields, open } => {
                 let Value::Object(map) = value else { return mismatch(path) };
-                if !open {
-                    if let Some(unknown) = map.keys().find(|k| !fields.iter().any(|f| &f.name == *k)) {
-                        return Err(format!(
-                            "{}: unknown field {unknown:?} (not declared on {self}; a type that \
-                             should ignore keys it does not declare ends with `..`)",
-                            here(path)
-                        ));
+                let walked = self.walk_record(fields, *open, map, report, |field, v| {
+                    // Optional fields may be absent or null. A required
+                    // nullable field must still be present; its value is
+                    // checked against the declared type here.
+                    if field.optional && v.is_null() {
+                        return Ok(());
                     }
-                }
-                for field in fields {
-                    match map.get(&field.name) {
-                        // Optional fields may be absent or null. A required
-                        // nullable field must still be present; its value
-                        // is checked against the declared type below.
-                        Some(Value::Null) | None if field.optional => {}
-                        Some(v) => {
-                            let len = path.len();
-                            let _ = write!(path, ".{}", field.name);
-                            field.ty.validate_at(v, path)?;
-                            path.truncate(len);
-                        }
-                        None => {
-                            return Err(format!(
-                                "{}: missing required field {:?}",
-                                here(path),
-                                field.name
-                            ))
-                        }
-                    }
-                }
-                Ok(())
+                    let len = path.len();
+                    let _ = write!(path, ".{}", field.name);
+                    let checked = field.ty.validate_at(v, path, report);
+                    path.truncate(len);
+                    checked
+                });
+                walked.map_err(|RecordProblems { own, fields }| {
+                    let here = here(path);
+                    own.into_iter().map(|problem| format!("{here}: {problem}")).chain(fields).collect()
+                })
             }
             WeftType::Union(members) => {
-                let mut member_errors = Vec::new();
-                for m in members {
-                    match m.validate_at(value, &mut path.clone()) {
-                        Ok(()) => return Ok(()),
-                        Err(e) => member_errors.push((m, e)),
-                    }
+                // Each member is only asked yes or no: a member that does
+                // not take the value stops at its first problem.
+                let probe = |m: &WeftType, path: &mut std::string::String| {
+                    let len = path.len();
+                    let taken = m.validate_at(value, path, Report::First).is_ok();
+                    path.truncate(len);
+                    taken
+                };
+                if members.iter().any(|m| probe(m, path)) {
+                    return Ok(());
                 }
-                // Report the DEEP error when exactly one member even
+                if report == Report::First {
+                    return mismatch(path);
+                }
+                // Report the DEEP problems when exactly one member even
                 // matches the value's outer JSON kind (an array against
                 // `String | List[Part]` can only have meant the list, so
-                // its field-level path is the useful message); otherwise
-                // the generic union mismatch.
-                let candidates: Vec<&(&WeftType, std::string::String)> = member_errors
-                    .iter()
-                    .filter(|(m, _)| m.shallow_matches(value))
-                    .collect();
-                match candidates.as_slice() {
-                    [(_, e)] => Err(e.clone()),
+                // its field-level paths are the useful message), walking
+                // that one member again for all of them; otherwise the
+                // generic union mismatch.
+                let mut candidates = members.iter().filter(|m| m.shallow_matches(value));
+                match (candidates.next(), candidates.next()) {
+                    (Some(only), None) => only.validate_at(value, path, Report::All),
                     _ => mismatch(path),
                 }
             }
             WeftType::Named { body, .. } => body
-                .validate_at(value, path)
-                .map_err(|e| format!("not a valid {self}: {e}")),
+                .validate_at(value, path, report)
+                .map_err(|problems| under(format_args!("not a valid {self}"), problems)),
             WeftType::Bus => {
                 if value.as_object().and_then(Self::detect_bus_type).is_some() {
                     Ok(())
@@ -2292,11 +2367,12 @@ impl WeftType {
                     mismatch(path)
                 }
             }
-            WeftType::Access => {
-                if value
-                    .as_object()
-                    .is_some_and(|o| o.contains_key(crate::access::ACCESS_MARKER_KEY))
-                {
+            // A marker, and when the type names a service, a marker of
+            // that service: a connection to another one is no `Access[x]`.
+            WeftType::Access(wanted) => {
+                let marker = value.as_object().and_then(|o| o.get(crate::access::ACCESS_MARKER_KEY));
+                let service = marker.and_then(|m| m.get("service")).and_then(serde_json::Value::as_str);
+                if marker.is_some() && wanted.as_deref().is_none_or(|wanted| service == Some(wanted)) {
                     Ok(())
                 } else {
                     mismatch(path)
@@ -2339,11 +2415,113 @@ impl WeftType {
         }
     }
 
+    /// Walk a record value: hand every field it holds to `visit`, and
+    /// note what its keys get wrong against `fields` (a key a closed
+    /// record does not declare, a required field absent; an optional one
+    /// may be absent, and `visit` decides what its null means).
+    /// [`Self::validate_at`] and [`Self::cast_through`] both hold a record
+    /// through here. A value that passes costs one look at its keys and
+    /// one per field; the problems are only spelled once one is found,
+    /// and with [`Report::First`] the walk stops at that one.
+    fn walk_record(
+        &self,
+        fields: &[RecordField],
+        open: bool,
+        map: &serde_json::Map<std::string::String, serde_json::Value>,
+        report: Report,
+        mut visit: impl FnMut(&RecordField, &serde_json::Value) -> Result<(), Vec<std::string::String>>,
+    ) -> Result<(), RecordProblems> {
+        let mut keys_wrong = !open && map.keys().any(|k| !fields.iter().any(|f| &f.name == k));
+        let stop = |own| Err(RecordProblems { own, fields: Vec::new() });
+        if keys_wrong && report == Report::First {
+            return stop(self.record_key_problems(fields, open, map, report));
+        }
+        let mut wrong = Vec::new();
+        for field in fields {
+            match map.get(&field.name) {
+                Some(v) => {
+                    if let Err(found) = visit(field, v) {
+                        if report == Report::First {
+                            return Err(RecordProblems { own: Vec::new(), fields: found });
+                        }
+                        wrong.extend(found);
+                    }
+                }
+                None if field.optional => {}
+                None if report == Report::First => {
+                    return stop(self.record_key_problems(fields, open, map, report));
+                }
+                None => keys_wrong = true,
+            }
+        }
+        if !keys_wrong && wrong.is_empty() {
+            return Ok(());
+        }
+        let own = if keys_wrong { self.record_key_problems(fields, open, map, report) } else { Vec::new() };
+        Err(RecordProblems { own, fields: wrong })
+    }
+
+    /// What `map`'s keys get wrong against a record's `fields`, spelled:
+    /// the keys a closed record does not declare (the first
+    /// [`UNKNOWN_KEYS_NAMED`], then how many more, each escaped since the
+    /// sender wrote it), then every required field absent. With
+    /// [`Report::First`], only the first of all that.
+    fn record_key_problems(
+        &self,
+        fields: &[RecordField],
+        open: bool,
+        map: &serde_json::Map<std::string::String, serde_json::Value>,
+        report: Report,
+    ) -> Vec<std::string::String> {
+        let named = match report {
+            Report::First => 1,
+            Report::All => UNKNOWN_KEYS_NAMED,
+        };
+        let fields_word = |n: usize| if n == 1 { "field" } else { "fields" };
+        let mut problems = Vec::new();
+        if !open {
+            let mut unknown = map.keys().filter(|k| !fields.iter().any(|f| &f.name == *k));
+            let shown: Vec<std::string::String> =
+                unknown.by_ref().take(named).map(|k| k.escape_debug().to_string()).collect();
+            if !shown.is_empty() {
+                let more = if report == Report::All { unknown.count() } else { 0 };
+                let spelled = if more == 0 {
+                    crate::comma_list::spell_list(&shown)
+                } else {
+                    let quoted: Vec<std::string::String> = shown.iter().map(|k| format!("'{k}'")).collect();
+                    format!("{} and {more} more", quoted.join(", "))
+                };
+                problems.push(format!(
+                    "unknown {} {spelled} (not declared on {self}, and a type that should ignore keys it \
+                     does not declare ends with `..`)",
+                    fields_word(shown.len() + more),
+                ));
+                if report == Report::First {
+                    return problems;
+                }
+            }
+        }
+        let missing: Vec<std::string::String> = fields
+            .iter()
+            .filter(|f| !f.optional && !map.contains_key(&f.name))
+            .take(if report == Report::First { 1 } else { usize::MAX })
+            .map(|f| f.name.clone())
+            .collect();
+        if !missing.is_empty() {
+            problems.push(format!(
+                "missing required {} {}",
+                fields_word(missing.len()),
+                crate::comma_list::spell_list(&missing)
+            ));
+        }
+        problems
+    }
+
     /// Does this DECLARED type accept `value` at run time? The one
     /// runtime gate semantics: the engine's output-type check and the
-    /// firing-input readiness check both route here, through
-    /// [`Self::validate_value`] (with [`Self::conform_value`] for the
-    /// emit, which also hands back what flows on).
+    /// firing-input readiness check both route here, through the walk
+    /// behind [`Self::validate_value`] (with [`Self::conform_value`] for
+    /// the emit, which also hands back what flows on).
     ///
     /// The declared type is the question and the value is only held
     /// against it: a `JsonDict` port takes any object, whatever keys it
@@ -2354,8 +2532,11 @@ impl WeftType {
     /// inference produces none. An unresolved leaf (a bare `T`, or one
     /// nested in a container or record) takes any value, and the shape
     /// around it is held as usual.
+    ///
+    /// Only the yes or no is wanted, so the walk stops at the first
+    /// problem and formats nothing else.
     pub fn accepts_runtime_value(&self, value: &serde_json::Value) -> bool {
-        self.validate_value(value).is_ok()
+        self.validate_at(value, &mut std::string::String::new(), Report::First).is_ok()
     }
 
     /// True when a `TypeVar` sits anywhere in this
@@ -2450,7 +2631,7 @@ impl WeftType {
             | WeftType::JsonDict
             | WeftType::Record { .. }
             | WeftType::Bus
-            | WeftType::Access
+            | WeftType::Access(_)
             | WeftType::Infra
             | WeftType::Generator(_)
             | WeftType::Secret(_) => value.is_object(),
@@ -2684,12 +2865,13 @@ fn parse_single_type(s: &str) -> Result<WeftType, std::string::String> {
         "JsonDict" => return Ok(WeftType::JsonDict),
         "Json" => return Ok(WeftType::Json),
         "Bus" => return Ok(WeftType::Bus),
-        "Access" => return Ok(WeftType::Access),
+        "Access" => return Ok(WeftType::Access(None)),
         "Infra" => return Ok(WeftType::Infra),
         _ => {}
     }
 
-    // Parameterized: List[T], Generator[T], Secret[T], Dict[String, V]
+    // Parameterized: List[T], Generator[T], Secret[T], Dict[String, V],
+    // and Access[service], which takes a service's name rather than a type.
     if let Some(bracket_pos) = s.find('[') {
         if !s.ends_with(']') {
             return Err(format!("`{s}` opens a `[` it never closes at its end"));
@@ -2701,6 +2883,17 @@ fn parse_single_type(s: &str) -> Result<WeftType, std::string::String> {
             "List" => Ok(WeftType::List(Box::new(WeftType::try_parse(inner)?))),
             "Generator" => Ok(WeftType::Generator(Box::new(WeftType::try_parse(inner)?))),
             "Secret" => Ok(WeftType::Secret(Box::new(WeftType::try_parse(inner)?))),
+            // SYNC: parse_single_type (Access arm) <-> packages/weft-graph/src/protocol.ts parseSingleType (Access arm)
+            "Access" => {
+                let service = inner.trim();
+                if !crate::node::is_valid_provider_name(service) {
+                    return Err(format!(
+                        "`{s}`: `Access[...]` takes a service's name (lowercase letters, digits and \
+                         underscores, like `Access[google_drive]`), and `{service}` is not one"
+                    ));
+                }
+                Ok(WeftType::Access(Some(service.to_string())))
+            }
             "Dict" => {
                 let parts = split_top_level(inner, ',');
                 let [key, value] = parts.as_slice() else {
@@ -2720,7 +2913,7 @@ fn parse_single_type(s: &str) -> Result<WeftType, std::string::String> {
                 }
                 Ok(WeftType::Dict(Box::new(value)))
             }
-            _ => Err(format!("`{name}[...]` is not a type; the types that take one are List, Generator, Secret and Dict")),
+            _ => Err(format!("`{name}[...]` is not a type; the types that take one are List, Generator, Secret, Dict and Access")),
         };
     }
 
@@ -2887,7 +3080,10 @@ impl WeftType {
             WeftType::JsonDict => out.push_str("JsonDict"),
             WeftType::Json => out.push_str("Json"),
             WeftType::Bus => out.push_str("Bus"),
-            WeftType::Access => out.push_str("Access"),
+            WeftType::Access(None) => out.push_str("Access"),
+            WeftType::Access(Some(service)) => {
+                let _ = write!(out, "Access[{service}]");
+            }
             WeftType::Infra => out.push_str("Infra"),
             WeftType::Generator(inner) => {
                 out.push_str("Generator[");

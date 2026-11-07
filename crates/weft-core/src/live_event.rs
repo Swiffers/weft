@@ -272,11 +272,21 @@ pub enum DispatcherEvent<V = ValueRef> {
         project_id: uuid::Uuid,
         at_unix: u64,
     },
-    NodeSuspended { run_id: RunId, node: String, frames: LoopFrames, token: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<RunId>, project_id: uuid::Uuid, at_unix: u64 },
+    /// `token`: the wait the firing paused on, `None` for a firing that
+    /// paused inside the run (a bus read, a stream pull, a yield) while
+    /// the whole run paused.
+    NodeSuspended { run_id: RunId, node: String, frames: LoopFrames, token: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<RunId>, project_id: uuid::Uuid, at_unix: u64 },
     /// `token`: the wait the firing resumed from, `None` for a resume no
     /// wait drove (a boundary fired again). How that wait ended is its
     /// [`Self::WaitEnded`].
     NodeResumed { run_id: RunId, node: String, frames: LoopFrames, token: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<RunId>, project_id: uuid::Uuid, at_unix: u64 },
+    /// The firing at `node` and `frames` registered a wait (`state.wait`)
+    /// that had not ended yet: from here it waits on `token`, whether its
+    /// worker holds the wait or the run pauses on it. Its own event for the
+    /// same reason as [`Self::WaitEnded`]: a held wait never suspends the
+    /// firing. A wait whose ending was on record before its registration
+    /// paints only its [`Self::WaitEnded`].
+    WaitStarted { run_id: RunId, node: String, frames: LoopFrames, token: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<RunId>, project_id: uuid::Uuid, at_unix: u64 },
     /// A wait of the firing at `node` and `frames` ended, the first ending
     /// on record: its answer, a person skipping it, or the run giving it
     /// up. Its own event because a wait the run holds in its worker never
@@ -429,6 +439,7 @@ pub enum DispatcherEvent<V = ValueRef> {
     /// multiple buses cleanly. `offset` is the bus-local position used
     /// to tiebreak same-second entries. `at_unix` is the journal's
     /// stamp so replay renders honest timestamps, not "now".
+    // SYNC: BusJoined <-> crates/weft-journal/src/events.rs BusJoined, packages/weft-graph/src/protocol.ts BusInspectorEvent 'joined', extension-vscode/src/runFollower.ts DispatcherEvent 'bus_joined'
     BusJoined {
         run_id: RunId,
         project_id: uuid::Uuid,
@@ -437,14 +448,17 @@ pub enum DispatcherEvent<V = ValueRef> {
         name: String,
         at_unix: u64,
     },
-    /// A bus participant dropped. Pairs with `BusJoined` for the same
-    /// `(bus_id, name)`.
+    /// A bus participant left, and how its body returned (`end`): the
+    /// inspector says it left, or left failed and why. Pairs with
+    /// `BusJoined` for the same `(bus_id, name)`.
+    // SYNC: BusLeft <-> crates/weft-journal/src/events.rs BusLeft, packages/weft-graph/src/protocol.ts BusInspectorEvent 'left', extension-vscode/src/runFollower.ts DispatcherEvent 'bus_left'
     BusLeft {
         run_id: RunId,
         project_id: uuid::Uuid,
         bus_id: String,
         offset: u64,
         name: String,
+        end: crate::bus::StreamEnd,
         at_unix: u64,
     },
     /// One journal-aggregation window of a bus's messages (one row per
@@ -637,6 +651,9 @@ impl<V> DispatcherEvent<V> {
             Self::NodeResumed { run_id, node, frames, token, inherited_from, project_id, at_unix } => {
                 DispatcherEvent::NodeResumed { run_id, node, frames, token, inherited_from, project_id, at_unix }
             }
+            Self::WaitStarted { run_id, node, frames, token, inherited_from, project_id, at_unix } => {
+                DispatcherEvent::WaitStarted { run_id, node, frames, token, inherited_from, project_id, at_unix }
+            }
             Self::NodeCancelled { run_id, node, frames, reason, inherited_from, project_id, at_unix } => {
                 DispatcherEvent::NodeCancelled { run_id, node, frames, reason, inherited_from, project_id, at_unix }
             }
@@ -678,7 +695,7 @@ impl<V> DispatcherEvent<V> {
             Self::InfraRecovered { project_id, node_id } => DispatcherEvent::InfraRecovered { project_id, node_id },
             Self::InfraTerminated { project_id, node_id } => DispatcherEvent::InfraTerminated { project_id, node_id },
             Self::BusJoined { run_id, project_id, bus_id, offset, name, at_unix } => DispatcherEvent::BusJoined { run_id, project_id, bus_id, offset, name, at_unix },
-            Self::BusLeft { run_id, project_id, bus_id, offset, name, at_unix } => DispatcherEvent::BusLeft { run_id, project_id, bus_id, offset, name, at_unix },
+            Self::BusLeft { run_id, project_id, bus_id, offset, name, end, at_unix } => DispatcherEvent::BusLeft { run_id, project_id, bus_id, offset, name, end, at_unix },
             Self::BusWindow { run_id, project_id, bus_id, first_offset, last_offset, messages, totals, at_unix } => {
                 DispatcherEvent::BusWindow { run_id, project_id, bus_id, first_offset, last_offset, messages, totals, at_unix }
             }
@@ -708,6 +725,7 @@ impl<V> DispatcherEvent<V> {
             | Self::NodeStarted { project_id, .. }
             | Self::NodeSuspended { project_id, .. }
             | Self::NodeResumed { project_id, .. }
+            | Self::WaitStarted { project_id, .. }
             | Self::WaitEnded { project_id, .. }
             | Self::NodeCancelled { project_id, .. }
             | Self::NodeCompleted { project_id, .. }
@@ -756,6 +774,7 @@ impl<V> DispatcherEvent<V> {
             Self::NodeStarted { node, frames, .. }
             | Self::NodeSuspended { node, frames, .. }
             | Self::NodeResumed { node, frames, .. }
+            | Self::WaitStarted { node, frames, .. }
             | Self::WaitEnded { node, frames, .. }
             | Self::NodeCancelled { node, frames, .. }
             | Self::NodeCompleted { node, frames, .. }
@@ -823,6 +842,7 @@ impl<V> DispatcherEvent<V> {
             | Self::NodeStarted { run_id, .. }
             | Self::NodeSuspended { run_id, .. }
             | Self::NodeResumed { run_id, .. }
+            | Self::WaitStarted { run_id, .. }
             | Self::WaitEnded { run_id, .. }
             | Self::NodeCancelled { run_id, .. }
             | Self::NodeCompleted { run_id, .. }

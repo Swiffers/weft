@@ -37,7 +37,7 @@ the language refuses to allow.
 |---|---|---|
 | `over: ["cards"]` | `[]` | Which inputs to iterate. Each has to be a `List[T]` or a `Generator[T]` |
 | `carry: ["total"]` | `[]` | Values threaded from one iteration to the next |
-| `parallel: true` | `false` | Launch every iteration at once, rather than one at a time |
+| `parallel: true` | `false` | Launch every iteration at once, rather than each once the one before it reaches the loop's edge |
 | `maxIters: 50` | no cap | A hard limit. `0` is legal and means no iterations |
 | `trimOnMismatch: false` | `true` | With several `over` lists of different lengths: trim to the shortest, or fail |
 
@@ -59,7 +59,9 @@ in its slot. If you declare it without `| Null`, the build stops with
 
 The list that comes out is built for every gathered port, even one that no
 iteration ever wrote, because a port that produces nothing at all would leave
-whatever is downstream waiting forever.
+whatever is downstream waiting forever. A port nothing inside the loop writes
+at all is refused when you build (`loop-output-unwritten`): it could only
+gather nulls.
 
 A carried value that an iteration does not write keeps what it had, as long as
 nothing broke: a branch not taken or a gate that said no is fine.
@@ -93,9 +95,19 @@ Both only appear if you did not declare a port of that name yourself. And
 
 ## One at a time, or all at once
 
-Sequential is the default. Each iteration finishes before the next launches,
-which is what makes `carry` possible: the next iteration reads the value the
-last one wrote.
+Sequential is the default. The next iteration launches once this one's values
+reach the loop's edge: its carried values, what it gathers, and its
+`self.done`. That is what makes `carry` possible: the next iteration reads the
+value the last one wrote. Nothing else holds the next iteration back, so a
+loop with no outputs launches its iterations back to back. If one item's work
+has to finish before the next item starts (a database write the next item
+reads), carry a value out of that work into the next iteration.
+
+A loop launches its iterations and does not own them. Work inside an
+iteration that does not feed the loop's edge keeps running after the loop has
+moved on, and after the loop has ended. That is what lets a loop start twenty
+agents, each holding a bus, gather the buses and exit, so the nodes after the
+loop can talk to every agent while they all keep running.
 
 `parallel: true` launches every iteration up front. Three things it refuses:
 
@@ -152,11 +164,54 @@ A trigger and an infra node are both refused inside a loop, with
 project, and infrastructure is provisioned once for the project, so a
 per-iteration one is not a thing.
 
-## Cutting a run inside one
+## Running part of its body
 
-You cannot start or end a run inside a loop. A run that reaches a loop takes
-the whole loop along, because a node inside a loop runs once per iteration,
-and starting or stopping at it would not say which iteration you mean. If you name a
-node inside a loop as a start or an end (`--from`, `--emit`, `--target`,
-`--before`), the run is refused: `cannot cut at 'grade.mark' inside loop
-'grade'; select the whole loop`.
+If you want to prove one stage of a loop's body without running the loop over
+every item, run that stage on its own. Every way of cutting a run (`--group`,
+`--from`, `--emit`, `--target`, `--before`, `--feed`) works inside a body,
+loops inside loops included. Say the loop `clips` runs a group `edit` on each
+item, reading the item and `self.index`, then `caption` and `upper` after it:
+
+```bash
+weft run --from 'clips.edit={"clip": "intro.mp4", "at": 0}' --target clips.upper
+```
+
+The part you pick runs once, as if it were the first time round: inside
+iteration `0` of each loop around it, so `weft runs`, `weft events` and the
+graph show its nodes at `#0`. Nothing of those loops runs: no other
+iteration, and nothing reaches the loop's outputs. A loop that sits wholly
+inside the part you picked runs normally, every iteration of it.
+
+What the loop would have handed the part (the item, `self.index`, a carried
+value) is a value from outside the run like any other: you hand it at the
+start, as `edit`'s `clip` and `at` above, or the run is refused before it
+starts, naming the input that would get nothing.
+
+What is refused is cutting a loop in half. A loop has two ends, its
+start (where its inputs go in) and its end (where its outputs come out), and
+a run holds both or neither. Ending the run inside the body with nothing
+started there reaches back to the loop's start for the item:
+
+```text
+the run holds loop 'clips''s start but not its end: include both to run the loop, or neither to run part of its body
+```
+
+Starting inside the body with no end there reaches the loop's outputs, which
+runs the loop whole, every iteration, around a start that cannot apply to
+all of them:
+
+```text
+'clips.edit' is inside loop 'clips', and the run holds both of the loop's ends, so it runs the loop
+whole: a run cannot start, stand in or stop inside a loop it runs whole. To run part of the loop's
+body, end the run inside the body too (--target a node in it), so the run holds neither end; to run
+the loop, start or end at the loop
+```
+
+In both cases you either start and end inside the body, or run the whole
+loop.
+
+A loop in a file you include at several places is one loop at all of them,
+so one run takes it the same way everywhere: whole at every place it holds
+it, or part of its body at every place. A run that holds all of it at one
+place and part of its body at another is refused, naming both; run them in
+two runs.

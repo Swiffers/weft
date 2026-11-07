@@ -60,15 +60,37 @@ pub fn validate_fire_bake(node: &str, program: &crate::project::hash::ProgramIde
     if bakes.iter().any(|bake| bake.program == *program && bake.captured.iter().any(|id| id == node)) {
         return Ok(());
     }
-    // A bake is per code, so ANY edit to the graph leaves the last one
-    // behind. That is the cause every single time somebody reads this,
-    // so it leads; the hashes are for the rare case where it is not.
-    let older = bakes.iter().filter(|bake| bake.captured.iter().any(|id| id == node))
-        .max_by_key(|bake| bake.at_unix)
+    // A bake is per program, so what moved since the last one leads: an
+    // edit to the graph, a node's code, or the worker built again from
+    // both unchanged, which an update of weft does to every program
+    // (its engine is part of every worker). The hashes are for the rare
+    // case where none of those reads right.
+    // A bake of this very program that left the trigger out (a setup of
+    // other triggers) means nothing moved: the trigger was never prepared
+    // here, whatever an older program's bake of it says.
+    let baked_here = bakes.iter().any(|bake| bake.program == *program);
+    let older = bakes
+        .iter()
+        .filter(|bake| !baked_here && bake.captured.iter().any(|id| id == node))
+        .max_by_key(|bake| bake.at_unix);
+    let moved = match older {
+        None => format!("trigger '{node}' has not been prepared for this program yet"),
+        Some(bake) if bake.program.definition_hash != program.definition_hash => {
+            format!("the graph changed since trigger '{node}' was last prepared, so its bake is stale")
+        }
+        Some(bake) if bake.program.implementations != program.implementations => {
+            format!("a node's code changed since trigger '{node}' was last prepared, so its bake is stale")
+        }
+        Some(_) => format!(
+            "the program's worker was built again since trigger '{node}' was last prepared, from the same graph and node code \
+             (an update of weft builds every program again), so its bake is stale"
+        ),
+    };
+    let hashes = older
         .map(|bake| format!(" (the last one was made for graph {} and binary {})", bake.program.definition_hash, bake.program.binary_hash))
         .unwrap_or_default();
     Err(Refusal::error(format!(
-        "the code changed since trigger '{node}' was last prepared, so its bake is stale{older}. Prepare it again: `weft bake` does it and changes nothing that listens; if the trigger is off, `weft activate` does it and turns it on; if it is on, `weft resync` brings it onto the new build and prepares it there"
+        "{moved}{hashes}. Prepare it again: `weft bake` does it and changes nothing that listens; if the trigger is off, `weft activate` does it and turns it on; if it is on, `weft resync` brings it onto the new build and prepares it there"
     )))
 }
 
@@ -519,12 +541,15 @@ impl KickPlan {
         let mut roots: BTreeSet<Located> = crate::run::scope::starting_members(program, &index, None, &Vec::new())
             .into_iter().map(Located::top).collect();
         roots.extend(crate::project::trigger_places(program).into_iter()
-            .filter(|place| index.admits(&place.id, &place.frames()) && !index.stands_in(&place.id, &place.frames()))
-            .filter(|place| index.get_incoming(program, &place.id, &place.frames()).is_empty()));
+            .filter(|place| {
+                let frames = index.frames_at(program, place);
+                index.admits(&place.id, &frames) && !index.stands_in(&place.id, &frames)
+                    && index.get_incoming(program, &place.id, &frames).is_empty()
+            }));
         roots.into_iter().map(|place| {
             let event = fire.filter(|(at, _)| *at == &place);
             Self {
-                frames: place.frames(),
+                frames: index.frames_at(program, &place),
                 node: place.id,
                 firing: event.is_some(), payload: event.map(|(_, value)| value.clone()),
                 port_snapshot: event.and(port_snapshot).cloned(),
@@ -631,14 +656,7 @@ pub struct TriggerCut {
 /// runs, with every bakeable infra place's baked outputs taken as saved,
 /// so it reads the source alone, never what an install has saved.
 pub fn trigger_cut(project: &ProjectDefinition, trigger: &str) -> Result<TriggerCut, String> {
-    let bakeable: crate::infra::bake::Saved = crate::project::infra_places(project)
-        .into_iter()
-        .filter_map(|place| {
-            let node = project.nodes.iter().find(|n| n.id == place.id)?;
-            (!node.baked_outputs.is_empty())
-                .then(|| (place, node.baked_outputs.iter().map(|port| (port.clone(), Value::Null)).collect()))
-        })
-        .collect();
+    let bakeable = bakeable_as_saved(project, |_| true);
     // The places read baked stand in, as a fire's do: the cut says so, and
     // they are no infra the trigger's fires run.
     let FireCut { fired, program, .. } = fire_cut(project, trigger, &bakeable)?;
@@ -670,11 +688,54 @@ pub fn trigger_cut(project: &ProjectDefinition, trigger: &str) -> Result<Trigger
     Ok(TriggerCut { fingerprint, depends_on: depends_on.into_iter().collect() })
 }
 
+/// Every bakeable infra place `keep` accepts, its baked outputs taken as
+/// saved: what a cut read from the source alone stands in for them.
+fn bakeable_as_saved(project: &ProjectDefinition, keep: impl Fn(&Located) -> bool) -> crate::infra::bake::Saved {
+    crate::project::infra_places(project)
+        .into_iter()
+        .filter(|place| keep(place))
+        .filter_map(|place| {
+            let node = project.nodes.iter().find(|n| n.id == place.id)?;
+            (!node.baked_outputs.is_empty())
+                .then(|| (place, node.baked_outputs.iter().map(|port| (port.clone(), Value::Null)).collect()))
+        })
+        .collect()
+}
+
+/// What a fire for no instance reads baked, from the source alone: every
+/// shared infra place's baked outputs, taken as saved. A per-instance
+/// place is never among them: a run for no instance reads no instance's
+/// copy (`crate::infra::bake::saved_for_run`). The same for every
+/// trigger of a program, so a caller asking [`instanceless_fire_reaches`]
+/// of several works it out once.
+pub fn instanceless_stand_ins(project: &ProjectDefinition) -> crate::infra::bake::Saved {
+    bakeable_as_saved(project, |place| !crate::project::is_per_instance(project, place))
+}
+
+/// The places a fire of the trigger at `trigger` (an address) for no
+/// instance runs that exist once per instance, read from the source alone
+/// with `stand_ins` ([`instanceless_stand_ins`]) standing in. For a shared
+/// trigger that cannot name an instance per fire, anything here is what
+/// [`refuse_instanceless`] would refuse every fire for, so the compiler
+/// refuses the trigger instead.
+pub fn instanceless_fire_reaches(
+    project: &ProjectDefinition,
+    trigger: &str,
+    stand_ins: &crate::infra::bake::Saved,
+) -> Result<BTreeSet<Located>, String> {
+    let FireCut { program, .. } = fire_cut(project, trigger, stand_ins)?;
+    Ok(per_instance_running(&program))
+}
+
 /// Every trigger place's [`TriggerCut`] by address, or why its cut cannot
-/// be walked (a trigger inside a half-selected loop): what `weft status`
-/// sends as the source's cuts (`StatusQuery::desired_trigger_cuts`) and
-/// the dispatcher compares the registered program's with.
-pub fn trigger_cuts(project: &ProjectDefinition) -> BTreeMap<String, Result<TriggerCut, String>> {
+/// be walked (a trigger inside a half-selected loop).
+pub type TriggerCuts = BTreeMap<String, Result<TriggerCut, String>>;
+
+/// The [`TriggerCuts`] of `project`: what `weft status` reads the
+/// source's cuts from ([`trigger_fingerprints`]), and what a build's
+/// registration records for the program it registers, which the install
+/// reads from then on instead of walking them again.
+pub fn trigger_cuts(project: &ProjectDefinition) -> TriggerCuts {
     crate::project::trigger_places(project)
         .iter()
         .map(|place| {
@@ -685,15 +746,14 @@ pub fn trigger_cuts(project: &ProjectDefinition) -> BTreeMap<String, Result<Trig
         .collect()
 }
 
-/// Each trigger's fingerprint by address ([`trigger_cuts`]), the ones whose
-/// cut can be walked: what the source's cuts are compared by, on the
-/// client that sends them (`StatusQuery::desired_trigger_cuts`) and on the
-/// dispatcher that reads the registered program's. A trigger left out is
-/// one whose cut cannot be walked; its activation says why.
-pub fn trigger_fingerprints(project: &ProjectDefinition) -> BTreeMap<String, String> {
-    trigger_cuts(project)
-        .into_iter()
-        .filter_map(|(trigger, cut)| cut.ok().map(|cut| (trigger, cut.fingerprint)))
+/// Each trigger of `cuts` by address, with its cut's fingerprint, `None`
+/// for one whose cut cannot be walked (its activation says why): what a
+/// trigger that is on is compared by, on the client that sends the
+/// source's (`crate::projects::StatusRequest::desired_trigger_cuts`) and on
+/// the dispatcher that reads the registered program's.
+pub fn trigger_fingerprints(cuts: &TriggerCuts) -> BTreeMap<String, Option<String>> {
+    cuts.iter()
+        .map(|(trigger, cut)| (trigger.clone(), cut.as_ref().ok().map(|cut| cut.fingerprint.clone())))
         .collect()
 }
 
@@ -889,7 +949,8 @@ pub fn resolve_seeded(spec: &RunSpec, project: &ProjectDefinition, saved: &crate
         .map(|spelled| crate::project::places::named(&g, spelled).map(crate::project::places::Named::into_place))
         .collect::<Result<_, String>>().map_err(Refusal::error)?;
     let fired = bounds.fired.clone();
-    let (mut walked, baked) = walk_reading_baked(&g, bounds, saved, &named);
+    let (mut walked, baked) = walk_reading_baked(&g, bounds.clone(), saved, &named);
+    cut::validate_loops(&g, &bounds, &walked).map_err(Refusal::error)?;
     // The bounds name nothing to run. A seed reusing all of what they name
     // leaves nothing to run either, which is a run that reuses everything.
     let walked_nothing = walked.runs.is_empty() && walked.stand_ins.is_empty();
@@ -1311,10 +1372,17 @@ pub fn refuse_unrunnable(project: &ProjectDefinition, resolved: &Resolved, spec:
 /// A place that stands in for its node never runs, so it needs no
 /// instance.
 pub fn per_instance_places(program: &ProjectDefinition) -> Vec<String> {
-    crate::project::places::running_places(program).iter()
-        .filter(|place| crate::project::is_per_instance(program, &place.id))
+    per_instance_running(program).iter()
         .map(|place| crate::project::address_of(program, &place.id, &place.path))
         .collect::<BTreeSet<_>>().into_iter().collect()
+}
+
+/// [`per_instance_places`], as places.
+fn per_instance_running(program: &ProjectDefinition) -> BTreeSet<Located> {
+    crate::project::places::running_places(program)
+        .into_iter()
+        .filter(|place| crate::project::is_per_instance(program, place))
+        .collect()
 }
 
 /// Refuse a run that reaches something per instance without saying which
@@ -1357,6 +1425,8 @@ pub fn instance_run_values(
     let mut values = crate::instance::InstanceValues::new();
     let mut refusal = Refusal { errors: Vec::new() };
     let mut seen = BTreeSet::new();
+    // The worker checks again what the install checked, and knows no
+    // install: the install's kind is the version build's to answer.
     let rules = crate::rules::RuleContext::new(project);
     // Only what runs reads its instance's values: a stand-in never does.
     for place in &crate::project::places::running_places(project) {
@@ -1616,11 +1686,24 @@ mod tests {
         };
         let mut bake = BakeSummary { program: program.clone(), captured: vec!["trigger".into()], run_id: RunId::nil(), at_unix: 1 };
         assert!(validate_fire_bake("trigger", &program, &[bake.clone()]).is_ok());
-        assert!(validate_fire_bake("trigger", &program, &[]).unwrap_err().to_string().contains("weft bake"));
+        let never = validate_fire_bake("trigger", &program, &[]).unwrap_err().to_string();
+        assert!(never.starts_with("trigger 'trigger' has not been prepared for this program yet. ") && never.contains("weft bake"), "{never}");
         bake.captured.clear();
         assert!(validate_fire_bake("trigger", &program, &[bake.clone()]).is_err());
         bake.captured.push("trigger".into());
-        for changed in ["graph", "binary", "implementation"] {
+        // This program baked other triggers only, and an older one baked
+        // this trigger: the trigger was never prepared here, whatever
+        // moved since the older one.
+        let others_only = BakeSummary { program: program.clone(), captured: vec!["other".into()], run_id: RunId::nil(), at_unix: 2 };
+        let mut older = bake.clone();
+        older.program.definition_hash.push('0');
+        let left_out = validate_fire_bake("trigger", &program, &[older, others_only]).unwrap_err().to_string();
+        assert!(left_out.starts_with("trigger 'trigger' has not been prepared for this program yet. ") && !left_out.contains("made for graph"), "{left_out}");
+        for (changed, moved) in [
+            ("graph", "the graph changed since"),
+            ("implementation", "a node's code changed since"),
+            ("binary", "the program's worker was built again since trigger 'trigger' was last prepared, from the same graph and node code (an update of weft"),
+        ] {
             let mut other = program.clone();
             match changed {
                 "graph" => other.definition_hash.push('2'),
@@ -1628,10 +1711,9 @@ mod tests {
                 _ => { other.implementations.insert("T".into(), "changed".into()); }
             }
             let refusal = validate_fire_bake("trigger", &other, &[bake.clone()]).unwrap_err().to_string();
-            // The cause leads (every reader of this got here by editing
-            // the graph); the hashes stay, for the rare case where it
-            // was something else.
-            assert!(refusal.contains("the code changed since"), "{refusal}");
+            // What moved leads; the hashes stay, for the rare case where
+            // it reads wrong.
+            assert!(refusal.starts_with(moved), "{changed}: {refusal}");
             assert!(refusal.contains("weft bake"), "it names the fix: {refusal}");
             assert!(refusal.contains("made for graph"), "{refusal}");
         }
@@ -1834,6 +1916,20 @@ mod tests {
         assert_eq!(fingerprint(&before, "hear"), fingerprint(&edited, "hear"), "an edit outside its cut");
         assert_ne!(fingerprint(&before, "tick"), fingerprint(&edited, "tick"), "an edit inside its cut");
         assert_eq!(fingerprint(&before, "hear"), fingerprint(&before.clone(), "hear"), "a function of the source alone");
+    }
+
+    /// Every trigger is fingerprinted, one whose cut cannot be walked as
+    /// `None`: the source's set is whole, so a trigger it leaves out is one
+    /// it has no more.
+    #[test]
+    fn every_trigger_is_fingerprinted_one_that_does_not_walk_as_none() {
+        let project = two_triggers();
+        let mut cuts = trigger_cuts(&project);
+        cuts.insert("looped".into(), Err("inside a loop run in part".into()));
+        let fingerprints = trigger_fingerprints(&cuts);
+        assert_eq!(fingerprints.keys().cloned().collect::<Vec<_>>(), vec!["hear".to_string(), "looped".to_string(), "tick".to_string()]);
+        assert_eq!(fingerprints["hear"], Some(trigger_cut(&project, "hear").unwrap().fingerprint));
+        assert_eq!(fingerprints["looped"], None);
     }
 
     /// What runs in front of a trigger runs at its setup, never at a
@@ -2290,7 +2386,7 @@ mod tests {
         let b = project.nodes.iter_mut().find(|n| n.id == "b").unwrap();
         b.port_literals.insert("in".into(), crate::instance::instance_filled_literal(None));
         b.instance_rules = Some(serde_json::from_value(json!({ "rules": [{
-            "when": { "kind": "config_equals", "field": "in", "equals": "bad" },
+            "when": { "kind": "value", "field": "in", "equals": "bad" },
             "then": { "message": "'{id}' refuses {field}", "field": "in" }
         }]})).unwrap());
         project
@@ -2331,7 +2427,7 @@ mod tests {
         let mut project = filled_program();
         let b = project.nodes.iter_mut().find(|n| n.id == "b").unwrap();
         b.instance_rules = Some(serde_json::from_value(json!({ "rules": [{
-            "when": { "kind": "not", "of": { "kind": "config_nonempty", "field": "in" } },
+            "when": { "kind": "not", "of": { "kind": "value", "field": "in", "nonempty": true } },
             "then": { "message": "'{id}' has nothing picked; pick one on the node", "field": "in" }
         }]})).unwrap());
         let ada = crate::instance::InstanceId::new("ada").unwrap();
@@ -2374,5 +2470,119 @@ mod tests {
         assert!(refused.contains("'a' is no node with a field each instance fills"), "{refused}");
         let unknown_field = InstanceValueInput { node: "b".into(), field: "other".into(), value: json!(1) };
         assert!(check_instance_values(&project, &ada, &Default::default(), &[unknown_field]).is_err());
+    }
+
+    /// A trigger whose own input is wired (`sched -> wired -> beat`, the
+    /// shape a bridge feeds a trigger) fires by hand on what it registered
+    /// at activation: the fire runs without `sched`, nothing calls the
+    /// wired port missing, and the one kick that fires is the trigger,
+    /// carrying its event, the kick its registered snapshot goes on. A
+    /// live fire hands the snapshot in here; a hand fire has it set on the
+    /// same firing kick by the dispatcher (`actions::runs`).
+    #[test]
+    fn a_registered_port_lets_the_fire_resolve() {
+        let project: ProjectDefinition = serde_json::from_value(json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [
+                node("sched", &[], &[], &["value"], false),
+                node("wired", &[], &[("cron", true)], &["scheduledTime"], true),
+                node("beat", &[], &[("data", true)], &[], false),
+            ],
+            "edges": [wire("sched", "value", "wired", "cron"), wire("wired", "scheduledTime", "beat", "data")],
+        })).unwrap();
+        let event = json!({"scheduledTime": "2026-03-03T00:00:00Z"});
+        let spec = RunSpec { fire: Some(("wired".into(), event.clone())), ..RunSpec::whole("x") };
+        let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
+        assert_eq!(resolved.runs, BTreeSet::from([Located::top("wired"), Located::top("beat")]), "sched is not in the fire");
+        refuse_unrunnable(&project, &resolved, &spec).expect("the wired port comes from the registration, not from sched");
+        let firing: Vec<&KickPlan> = resolved.kicks.iter().filter(|kick| kick.firing).collect();
+        assert_eq!(firing.len(), 1, "{:?}", resolved.kicks);
+        assert_eq!((firing[0].node.as_str(), firing[0].payload.as_ref()), ("wired", Some(&event)));
+
+        let snapshot = json!({"cron": "0 0 * * * *"});
+        let fire = compute_trigger_fire(&project, "wired", &event, Some(&snapshot), &Default::default()).unwrap();
+        let wired = fire.kicks.iter().find(|kick| kick.node == "wired").expect("the trigger is kicked");
+        assert_eq!((wired.firing, wired.port_snapshot.as_ref()), (true, Some(&snapshot)));
+        assert!(fire.kicks.iter().filter(|kick| kick.node != "wired").all(|kick| kick.port_snapshot.is_none()), "{:?}", fire.kicks);
+        assert!(fire.program.nodes.iter().all(|node| node.id != "sched"), "a fire never runs what feeds its trigger");
+    }
+
+    /// An aimed run is its target and what the target needs, nothing
+    /// else: two chains and a leaf (`left_src -> left -> out_left`, `left
+    /// -> side`, `right_src -> right -> out_right`), aimed at the end of
+    /// one chain or at a node in its middle, runs that node and its
+    /// upstream, kicks only that chain's root, and leaves the leaf and the
+    /// other chain out of the program entirely. A name that is no node is
+    /// refused before anything runs.
+    #[test]
+    fn an_aimed_run_is_its_target_and_what_the_target_needs() {
+        let project: ProjectDefinition = serde_json::from_value(json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [
+                node("left_src", &[], &[], &["value"], false),
+                node("left", &[], &[("value", true)], &["value"], false),
+                node("out_left", &[], &[("data", true)], &[], false),
+                node("side", &[], &[("value", true)], &["value"], false),
+                node("right_src", &[], &[], &["value"], false),
+                node("right", &[], &[("value", true)], &["value"], false),
+                node("out_right", &[], &[("data", true)], &[], false),
+            ],
+            "edges": [
+                wire("left_src", "value", "left", "value"), wire("left", "value", "out_left", "data"),
+                wire("left", "value", "side", "value"),
+                wire("right_src", "value", "right", "value"), wire("right", "value", "out_right", "data"),
+            ],
+        })).unwrap();
+        let aimed = |target: &str| resolve_spec(&RunSpec { target: vec![target.into()], ..RunSpec::whole("x") }, &project, &Default::default());
+        for (target, runs) in [("out_left", &["left_src", "left", "out_left"][..]), ("left", &["left_src", "left"][..])] {
+            let resolved = aimed(target).unwrap();
+            assert_eq!(resolved.runs, runs.iter().map(|id| Located::top(*id)).collect::<BTreeSet<_>>(), "aimed at {target}");
+            let mut in_program: Vec<&str> = resolved.program.nodes.iter().map(|node| node.id.as_str()).collect();
+            in_program.sort();
+            let mut expected = runs.to_vec();
+            expected.sort();
+            assert_eq!(in_program, expected, "aimed at {target}, the program holds nothing else");
+            let kicked: Vec<&str> = resolved.kicks.iter().map(|kick| kick.node.as_str()).collect();
+            assert_eq!(kicked, ["left_src"], "aimed at {target}, only the chain's root is kicked");
+        }
+        let refused = aimed("nope").unwrap_err().to_string();
+        assert!(refused.contains("unknown node 'nope'"), "{refused}");
+    }
+
+    /// A per-instance infra node (`svc = MiniService { @per_instance }`
+    /// read by `out`) makes a run name its instance: with none, the run is
+    /// refused saying it needs to know which instance it is for; with one,
+    /// it reads only that instance's copy, so a run for `ada` before
+    /// `ada`'s copy is up, or a run for `bob` while only `ada`'s runs, is
+    /// refused naming `svc (instance '<id>')` and the `--instance` start
+    /// that brings it up.
+    #[test]
+    fn a_run_reaching_a_per_instance_copy_names_its_instance_and_reads_only_that_copy() {
+        let mut svc = node("svc", &[], &[], &["status"], false);
+        svc["requiresInfra"] = json!(true);
+        svc["perInstance"] = json!("marked");
+        let project: ProjectDefinition = serde_json::from_value(json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "nodes": [svc, node("out", &[], &[("data", true)], &[], false)],
+            "edges": [wire("svc", "status", "out", "data")],
+        })).unwrap();
+        let spec = RunSpec::whole("x");
+        let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
+        let refused = refuse_unrunnable(&project, &resolved, &spec).unwrap_err().to_string();
+        assert!(refused.contains("'svc' exists once per instance, so this run needs to know which instance it is for"), "{refused}");
+
+        let (ada, bob) = (crate::instance::InstanceId::new("ada").unwrap(), crate::instance::InstanceId::new("bob").unwrap());
+        let for_ada = RunSpec { instance: Some(ada.clone()), ..spec.clone() };
+        refuse_unrunnable(&project, &resolved, &for_ada).expect("an instance named is enough to start");
+        use crate::infra::run_gate::{copies_read, infra_not_running, missing_copies, InfraCopyUp};
+        let down = |instance: &crate::instance::InstanceId, copies: &[InfraCopyUp]| {
+            infra_not_running(&missing_copies(&copies_read(&resolved.program, None, Some(instance)), copies))
+        };
+        let refused = down(&ada, &[]);
+        assert!(refused.contains("svc (instance 'ada')") && refused.contains("--instance ada"), "{refused}");
+        let adas = [InfraCopyUp { node_id: "svc".into(), instance: Some(ada.clone()), running: true, baked: Default::default() }];
+        assert!(missing_copies(&copies_read(&resolved.program, None, Some(&ada)), &adas).is_empty(), "ada's run reads ada's copy");
+        let refused = down(&bob, &adas);
+        assert!(refused.contains("svc (instance 'bob')"), "bob's copy is not ada's: {refused}");
     }
 }

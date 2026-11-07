@@ -19,17 +19,27 @@
     ],
     "acquisition": {
       "kind": "static",
-      "fields": [
+      "ways": [
         {
-          "name": "header",
-          "label": "Header name",
-          "secret": false,
-          "placeholder": "Authorization, or X-Api-Key"
-        },
-        {
-          "name": "value",
-          "label": "Header value",
-          "placeholder": "Bearer sk-..., or the bare key"
+          "fields": [
+            {
+              "name": "header",
+              "label": "Header name",
+              "secret": false,
+              "placeholder": "Authorization, or X-Api-Key"
+            },
+            {
+              "name": "value",
+              "label": "Header value",
+              "placeholder": "Bearer sk-..., or the bare key"
+            }
+          ],
+          "guide": {
+            "steps": [
+              "Name the header the API reads its key from (`Authorization` for most, `X-Api-Key` for some).",
+              "Paste the header's whole value, with its prefix when the API wants one (`Bearer sk-...`)."
+            ]
+          }
         }
       ]
     },
@@ -39,20 +49,12 @@
         "name": "{header}",
         "value": "{value}"
       }
-    ],
-    "ownPage": {
-      "guide": {
-        "steps": [
-          "Name the header the API reads its key from (`Authorization` for most, `X-Api-Key` for some).",
-          "Paste the header's whole value, with its prefix when the API wants one (`Bearer sk-...`)."
-        ]
-      }
-    }
+    ]
   },
   "inputs": [
     {
       "name": "connection",
-      "type": "Access",
+      "type": "Access[http_header_key]",
       "widget": {
         "kind": "access"
       },
@@ -125,15 +127,15 @@
         "kind": "all",
         "of": [
           {
-            "kind": "config_present",
+            "kind": "value",
             "field": "url"
           },
           {
             "kind": "not",
             "of": {
-              "kind": "config_matches",
+              "kind": "value",
               "field": "url",
-              "regex": "(?i)^https?://"
+              "matches": "(?i)^https?://"
             }
           }
         ]

@@ -2,7 +2,10 @@
 //!
 //! A tag is recorded as an `RunTagged` event (the record of the act,
 //! written by the run's own worker) AND kept in `run_tag`, one row per
-//! (run, tag), which the broker writes once the event is on record.
+//! (run, tag), which the broker writes once the event is on record. An
+//! unrecorded run writes its birth instead of the event
+//! (`crate::unrecorded`), so it is tagged and stopped through its run row
+//! like any run, and its tag rows go with that row.
 //! The table exists because `ctx.stop_tagged` has to answer "which live
 //! runs of this project carry tag T" on every inbound message, and
 //! folding every open run's record to find out would be O(all history).
@@ -31,7 +34,7 @@ pub struct TaggedRun {
 
 /// Insert `run_id`'s tag rows, on the caller's connection.
 /// Re-tagging an existing (run, tag) keeps the original row (and its
-/// `seq`): a body replayed after a durable wait lands on the same state,
+/// `seq`): a body run again after a pause or a crash lands on the same state,
 /// and a tag's position in the order is the FIRST time the run claimed it.
 pub async fn tag_run_in(db: &impl Client, run_id: RunId, tags: &[String], at_unix: u64) -> db::Result<()> {
     db.execute(
@@ -74,7 +77,8 @@ pub async fn max_tag_seq(db: &impl Client) -> db::Result<i64> {
 }
 
 /// Every LIVE run of `project_id` carrying `tag`, with its tag
-/// row's `seq`: a project run that has not ended (never a node test). The
+/// row's `seq`: a project run that has not ended (never a node test),
+/// recorded or not (an unrecorded run that tagged itself has its row). The
 /// ordering and self rules are applied afterwards by
 /// [`select_stop_targets`], which is pure, so the SQL stays a plain read
 /// and the rule has a layer-1 test.
@@ -166,6 +170,19 @@ mod tests {
             select_stop_targets(&[a.clone(), me.clone(), c.clone()], me.run_id, None, StopSelf::Include),
             vec![a.run_id, me.run_id, c.run_id]
         );
+    }
+
+    /// `Include` asked by a run that carries no tag (a purge from a run
+    /// nobody tagged): every run carrying the tag goes, and the asker is
+    /// not among them, so it lives on and finishes.
+    #[test]
+    fn include_stop_by_an_untagged_asker_reaches_every_row_and_spares_it() {
+        let a = tagged(1);
+        let b = tagged(2);
+        let asker = RunId::new_v4();
+        let stopped = select_stop_targets(&[a.clone(), b.clone()], asker, None, StopSelf::Include);
+        assert_eq!(stopped, vec![a.run_id, b.run_id]);
+        assert!(!stopped.contains(&asker));
     }
 
     /// `Keep` never returns the asker even when the seq filter would.

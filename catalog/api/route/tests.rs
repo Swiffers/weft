@@ -132,7 +132,7 @@ async fn unknown_key_refused(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig.run(&RouteNode, json!({ "path": "chat/{room}" })).await.ok()?;
     let (status, error) = refusal(&conn);
     assert_eq!(status, 400);
-    assert!(error.contains("unknown field \"userId\""), "{error}");
+    assert!(error.contains("unknown field 'userId'"), "{error}");
     assert!(outcome.outputs.is_empty(), "nothing downstream runs: {:?}", outcome.outputs);
     Ok(())
 }
@@ -143,7 +143,7 @@ async fn missing_field_refused(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig.run(&RouteNode, json!({ "path": "chat/{room}" })).await.ok()?;
     let (status, error) = refusal(&conn);
     assert_eq!(status, 400);
-    assert!(error.contains("missing required field \"name\""), "{error}");
+    assert!(error.contains("missing required field 'name'"), "{error}");
     assert!(outcome.outputs.is_empty(), "{:?}", outcome.outputs);
     Ok(())
 }
@@ -261,7 +261,7 @@ async fn inline_picture(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(file.mime_type, "image/png");
     assert_eq!(file.size_bytes, png_bytes().len() as u64);
     assert_eq!(file.filename, "body");
-    assert!(!rig.stored_meta(&file.key)?.keep, "run-scoped: the program keeps what it wants");
+    assert!(file.key.contains("/run/"), "run-scoped: the program keeps what it wants: {}", file.key);
     assert_eq!(outcome.outputs["body"]["caption"], json!("a cat"), "the other fields come as sent");
 
     // A stored-file object is never taken on a caller's word: it would
@@ -717,6 +717,20 @@ async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
     let spec = serde_json::to_value(&rig.registered_signals().last().expect("a second route").0).expect("spec serializes");
     assert_eq!(spec["config"]["error_mode"], "drop_chunk");
     assert_eq!(spec["config"]["backpressure"], "drop_oldest");
+
+    // A route checking its callers registers the check with the
+    // connection it reads; one with no connection is refused, naming it.
+    let keys = weft::access::Access::new("acc-1", "api_key_auth", None).to_value();
+    rig.run_setup_trigger(&RouteNode, json!({ "path": "secure", "auth": "api_keys", "connection": keys }))
+        .await
+        .ok()?;
+    let spec = serde_json::to_value(&rig.registered_signals().last().expect("a gated route").0).expect("spec serializes");
+    assert_eq!(
+        spec["config"]["auth"],
+        json!({ "kind": "connection", "access_id": "acc-1", "service": "api_key_auth", "verify": { "kind": "api_keys" } })
+    );
+    let err = rig.run_setup_trigger(&RouteNode, json!({ "path": "secure", "auth": "hmac_sha256" })).await.failure()?;
+    assert!(err.contains("checks callers with hmac but has no connection") && err.contains("weft connect"), "{err}");
     Ok(())
 }
 

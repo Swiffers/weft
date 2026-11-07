@@ -283,6 +283,7 @@ fn gate_inputs() -> [InputDefinition; 2] {
             from_spec: true,
             requires_scopes: None,
             requires_values: None,
+            keeps_blank: false,
         },
         InputDefinition {
             port: PortDefinition {
@@ -307,6 +308,7 @@ fn gate_inputs() -> [InputDefinition; 2] {
             from_spec: true,
             requires_scopes: None,
             requires_values: None,
+            keeps_blank: false,
         },
     ]
 }
@@ -452,6 +454,7 @@ pub fn enrich_collecting(
                 from_spec: true,
                 requires_scopes: spec.requires_scopes.clone(),
                 requires_values: spec.requires_values.clone(),
+                keeps_blank: spec.keeps_blank,
             })
             .collect();
         let mut catalog_outputs: Vec<PortDefinition> = meta
@@ -486,17 +489,19 @@ pub fn enrich_collecting(
 
         catalog_inputs.extend(gate_inputs());
 
-        // An ACCESS NODE (metadata carries the `service` recipe):
-        // stamp the service name onto its `access` widget, so the
-        // runtime bag and the editor read it off the node. The
-        // permissions are NOT materialized as an input: they are ticked
-        // once at connect time and live on the stored connection, never
-        // in source. The stamp itself is `AccessSpec::stamp_onto`, the
-        // one definition the compact wiring view shares.
-        if let Some(service_spec) = &meta.service {
-            for input in catalog_inputs.iter_mut() {
+        // A node taking a connection (an access node, or one checking its
+        // callers, whose recipe follows its `auth`): stamp the service
+        // name onto its `access` widget, so the runtime bag and the
+        // editor read it off the node. The permissions are NOT
+        // materialized as an input: they are ticked once at connect time
+        // and live on the stored connection, never in source. The stamp
+        // itself is `AccessSpec::stamp_onto`, the one definition the
+        // compact wiring view shares.
+        let connection = crate::connection_field::resolve(meta, node, node_span, &mut errors);
+        if let Some(field) = &connection {
+            for input in catalog_inputs.iter_mut().filter(|i| i.name == field.input) {
                 if let Some(widget) = &mut input.widget {
-                    service_spec.stamp_onto(widget);
+                    field.spec.stamp_onto(widget);
                 }
             }
         }
@@ -712,6 +717,9 @@ pub fn enrich_collecting(
         // stays too.
         let own_one_of = std::mem::take(&mut node.features.one_of_required);
         node.features = meta.features.clone();
+        // On the node, so a rule of a node it is wired into reads them
+        // off the program (`weft_core::node::ValueList::Wired`).
+        node.lists = meta.lists.clone();
         // A group the catalog declares and the author repeats at the
         // call site is ONE constraint; appending both would report one
         // unsatisfied node twice at the same span.
@@ -750,13 +758,13 @@ pub fn enrich_collecting(
             }
         }
         normalize_port_literals(node);
-        // An access node's connection is picked on each install, never
-        // written in the source (`weft_core::picks`): a field neither
-        // wired nor `@instance_filled` is marked picked on the install, and
-        // a connection written there (an instance's fallback included) is
+        // A node's connection is picked on each install, never written in
+        // the source (`weft_core::picks`): a field neither wired nor
+        // `@instance_filled` is marked picked on the install, and a
+        // connection written there (an instance's fallback included) is
         // the old way, refused naming the fix, since its id means nothing
-        // on any other install.
-        if let Some(input) = meta.access_input() {
+        // on any other install. A node checking no caller takes none.
+        if let Some(input) = connection.as_ref().and_then(|field| meta.inputs.iter().find(|i| i.name == field.input)) {
             let wired = incoming_wires
                 .get(&node.id)
                 .is_some_and(|wires| wires.iter().any(|w| w.target_port == input.name));
@@ -797,7 +805,7 @@ pub fn enrich_collecting(
                             "'{id}.{field}' holds a connection written in the source. That was the old way \
                              of connecting a node: a connection lives in one install, so its id means \
                              nothing on any other. Erase this line and connect again with `weft connect \
-                             --node {id}` (or the node's Connect button); the pick is kept by the install. \
+                             {id}` (or the node's Connect button); the pick is kept by the install. \
                              See {doc}",
                             id = node.id,
                             field = input.name,
@@ -818,8 +826,8 @@ pub fn enrich_collecting(
             rules: crate::validate::node_rules(meta, node),
             custom: weft_core::rules::CustomPorts::of(node, meta),
         });
-        node.instance_service = match (meta.access_input(), &meta.service) {
-            (Some(input), Some(spec)) if filled.contains(&input.name) => Some(spec.clone()),
+        node.instance_service = match connection {
+            Some(field) if filled.contains(&field.input) => Some(field.spec),
             _ => None,
         };
     }
@@ -855,9 +863,9 @@ pub fn enrich_collecting(
     }
     // A literal on a group's own port is cast the same way, against the
     // type the group declares there: the group sends it to every member
-    // that reads the port (`weft_core::run::scope`). A loop's sit on its
-    // `LoopIn`, cast above.
-    for group in project.groups.iter_mut().filter(|g| !matches!(g.kind, weft_core::project::GroupKind::Loop { .. })) {
+    // that reads the port (`weft_core::run::scope`). A loop holds none:
+    // its sit on its `LoopIn`, cast above.
+    for group in &mut project.groups {
         for input in &group.in_ports {
             if input.port_type.is_unresolved() { continue; }
             let Some(value) = group.port_literals.get(&input.name).cloned() else { continue };
@@ -899,84 +907,61 @@ pub fn enrich_collecting(
 /// Everything that reads a per-instance value becomes per-instance too.
 ///
 /// The author writes only the starting points (`@per_instance` on an infra
-/// node, `@instance_filled` on a field); whatever sits downstream of one along the
-/// wires reads that instance's value, so it exists per instance as well: a
-/// trigger reading an instance's bridge address is armed once per instance,
-/// and a node reading an instance's connection runs in that instance's runs.
-/// A wire runs straight from a node to the node that reads it, through any
-/// group's port, so the walk follows wires and nothing else, with one more
-/// step: a wire landing on a group's gate decides whether the group runs,
-/// so everything inside a group whose gate reads a per-instance value runs
-/// per instance too. A loop's boundaries are ordinary nodes the wires
-/// cross, and its `LoopIn` (where its gate lands) launches every
-/// iteration, so reaching it reaches the loop's inside. A node an include's body
-/// shares between call sites is one node, so one per-instance site makes
-/// it per-instance for every site: the conservative answer, and the one
-/// that never lets an instance's value reach a shared run unnoticed.
+/// node, `@instance_filled` on a field); whatever sits downstream of one
+/// (`places::per_instance_reach`, the walk and its rules) reads that
+/// instance's value, so it exists per instance as well: a trigger reading
+/// an instance's bridge address is armed once per instance, and a node
+/// reading an instance's connection runs in that instance's runs. The
+/// walk is over places, so a file included where an instance's value
+/// reaches it and where none does is per instance at the first site and
+/// shared at the second. A node per instance at every place it runs is
+/// marked `Derived`; one per instance at some of its places keeps those
+/// places (`per_instance_paths`).
 ///
 /// Derived and filled marks are recomputed from scratch each time, so a
 /// stale one can never outlive what it came from.
 pub fn mark_per_instance_slice(project: &mut ProjectDefinition) {
+    use weft_core::frames::Located;
     use weft_core::instance::PerInstance;
+    use weft_core::project::graph::{GraphView, ProjectGraph};
+    use weft_core::project::places;
     for node in project.nodes.iter_mut() {
         if matches!(node.per_instance, Some(PerInstance::Derived | PerInstance::Filled)) {
             node.per_instance = None;
         }
+        node.per_instance_paths.clear();
         // The second starting point: a node with a field each instance fills.
         if node.per_instance.is_none() && weft_core::instance::instance_filled_fields(node).next().is_some() {
             node.per_instance = Some(PerInstance::Filled);
         }
     }
-    let mut downstream: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
-    for edge in project.edges.iter().filter(|edge| !edge.to_group_port()) {
-        downstream.entry(edge.source.as_str()).or_default().push(edge.target.as_str());
+    // Each node's places, and the ones the walk reached.
+    let (every, reached) = {
+        let g = ProjectGraph::new(project);
+        let every = places::every_place_in(&g);
+        let starts: Vec<Located> = every
+            .iter()
+            .filter(|place| g.node(&place.id).is_some_and(|n| matches!(n.per_instance, Some(PerInstance::Marked | PerInstance::Filled))))
+            .cloned()
+            .collect();
+        let reached = places::per_instance_reach(&g, starts);
+        (every, reached)
+    };
+    let mut places_of: std::collections::HashMap<&str, Vec<&Located>> = std::collections::HashMap::new();
+    for place in &every {
+        places_of.entry(place.id.as_str()).or_default().push(place);
     }
-    // A group reached through its gate reaches everything inside it, and
-    // a call site the body it calls.
-    let mut inside: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
-    for node in &project.nodes {
-        for group in &node.scope {
-            inside.entry(group.as_str()).or_default().push(node.id.as_str());
+    for node in project.nodes.iter_mut().filter(|n| n.per_instance.is_none()) {
+        let here = places_of.get(node.id.as_str()).map(Vec::as_slice).unwrap_or_default();
+        let derived: std::collections::BTreeSet<Vec<String>> =
+            here.iter().filter(|place| reached.contains(**place)).map(|place| place.path.clone()).collect();
+        if derived.is_empty() {
+            continue;
         }
-    }
-    for group in &project.groups {
-        if let weft_core::project::GroupKind::Call { body, .. } = &group.kind {
-            inside.entry(group.id.as_str()).or_default().push(body.as_str());
-        }
-    }
-    let mut reached: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut frontier: Vec<&str> = project
-        .nodes
-        .iter()
-        .filter(|n| matches!(n.per_instance, Some(PerInstance::Marked | PerInstance::Filled)))
-        .map(|n| n.id.as_str())
-        .collect();
-    let groups: std::collections::HashSet<&str> = project.groups.iter().map(|g| g.id.as_str()).collect();
-    // A loop's gate lands on its `LoopIn`, which launches every iteration:
-    // reaching it reaches the loop's inside, the members no wire feeds
-    // among them.
-    let loop_of: std::collections::HashMap<&str, &str> = project.nodes.iter()
-        .filter_map(|n| n.group_boundary.as_ref()
-            .filter(|b| b.role == weft_core::project::GroupBoundaryRole::In)
-            .map(|b| (n.id.as_str(), b.group_id.as_str())))
-        .collect();
-    while let Some(id) = frontier.pop() {
-        let opens = if groups.contains(id) { Some(id) } else { loop_of.get(id).copied() };
-        let next = downstream.get(id).map(Vec::as_slice).unwrap_or_default().iter()
-            // A gate reached: the group's inside. A group's own port (a
-            // wire from it) is reached only through its gate, never on
-            // its own: a literal is no instance's value.
-            .chain(opens.and_then(|group| inside.get(group)).into_iter().flatten());
-        for &next in next {
-            if reached.insert(next.to_string()) {
-                frontier.push(next);
-            }
-        }
-    }
-    let reached: std::collections::BTreeSet<String> = reached;
-    for node in project.nodes.iter_mut() {
-        if node.per_instance.is_none() && reached.contains(&node.id) {
+        if derived.len() == here.len() {
             node.per_instance = Some(PerInstance::Derived);
+        } else {
+            node.per_instance_paths = derived;
         }
     }
 }

@@ -125,11 +125,11 @@ wire_enum! {
 // SYNC: NOT_DONE <-> crates/weft-broker/src/handlers.rs (unavailable_or_internal), crates/weft-broker-client/src/client.rs (turned_away)
 pub const NOT_DONE: &str = "the broker could not get a connection to its database, so nothing was done; send it again";
 
-/// The body of a 503 a broker copy that is stepping aside for a newer one
-/// answers a call that arrived on its line after it began to
-/// (`crate::line::server::serve`): nothing of it ran, and sent again it
-/// goes out on a line to a current copy.
-pub const STEPPING_ASIDE: &str = "this copy of the broker is stepping aside for a newer one, so nothing was done; send it again";
+/// The body of a 503 a stopping broker copy answers a call that arrived
+/// on its line after the stop began (`crate::line::server::serve`):
+/// nothing of it ran, and sent again it goes out on a line to a running
+/// copy.
+pub const STOPPING: &str = "this copy of the broker is stopping, so nothing was done; send it again";
 
 /// The answer to a call in a shape the broker does not read, and its body
 /// (`weft_core::wire_shape`), re-exported here beside the broker's other
@@ -575,6 +575,14 @@ pub struct ResolveConnectionRequest {
     /// and the runtime may retire it after (the crash backstop for a
     /// worker that dies without releasing).
     pub expected_duration_secs: u64,
+    /// A renewal (`ctx.renew`): the values this firing was handed, which
+    /// stopped working, as `weft_core::access::handed_digest`. The store
+    /// renews the connection while it still hands exactly those, once
+    /// however many ask, and otherwise answers what it holds now (another
+    /// renewal already replaced them). Harmless twice for that reason: a
+    /// renewal sent again finds the renewed values there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale: Option<String>,
 }
 
 /// A node handing out a connection to what it runs itself. Harmless twice: a
@@ -713,6 +721,11 @@ pub struct ResolveConnectionResponse {
     /// when one did (`weft_access_store::ResolvedAccess::published_by`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_by: Option<String>,
+    /// The way to sign in a pasted connection was made with
+    /// (`weft_access_store::ResolvedAccess::way`), what
+    /// `OpenedConnection::way` answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub way: Option<String>,
 }
 
 /// Releasing a connection after a firing. Harmless twice: releasing one released already does nothing.
@@ -1509,8 +1522,10 @@ pub struct AppliedEndpoints {
     /// Endpoint name to where the project's workers and weft's own roles
     /// (the front door passing a `Public` endpoint on, the dispatcher
     /// reading a unit's `/live`) reach it.
+    /// An endpoint inside another node's is kept as that endpoint and
+    /// its path (`EndpointRecord::Within`), followed by every reader.
     #[serde(rename = "endpoints")]
-    pub urls: std::collections::BTreeMap<String, String>,
+    pub urls: std::collections::BTreeMap<String, weft_core::infra::EndpointRecord>,
     /// Endpoint name to the path it answers at on the front door, for
     /// `Public` endpoints only (`weft_core::infra::public_path`).
     pub public_paths: std::collections::BTreeMap<String, String>,
@@ -2407,8 +2422,15 @@ pub use weft_core::access::events::ResolvedEventSource as ListenerResolvedSource
 /// signal's lock, one still fresh is answered as it is.
 pub const SUBSCRIPTION_ENSURE: BrokerCall = BrokerCall { path: "/v1/access/subscription/ensure", twice: Twice::Harmless };
 
+/// Whether keeping a provider-side subscription alive could work on this
+/// install, asked before anything is subscribed (a resync, before it takes
+/// the trigger down): the same request as [`SUBSCRIPTION_ENSURE`]. Reads
+/// only, so harmless twice.
+pub const SUBSCRIPTION_CHECK: BrokerCall = BrokerCall { path: "/v1/access/subscription/check", twice: Twice::Harmless };
+
 /// Ask the broker to make sure a live provider subscription serves
-/// this signal (subscribing or renewing as needed).
+/// this signal (subscribing or renewing as needed), or, at
+/// [`SUBSCRIPTION_CHECK`], whether it could.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubscriptionEnsureRequest {
     pub tenant: String,
@@ -2448,8 +2470,8 @@ pub const CALLER_VERIFY: BrokerCall = BrokerCall { path: "/v1/caller/verify", tw
 
 /// One caller of a live route, as the worker's door forwards it to the
 /// broker to check against the connection the route is gated by. The
-/// broker holds the connection (its `verify` recipe and its stored
-/// material); the door never sees a secret. The body is base64 (an
+/// route names the check (`verify`, its `auth`); the broker holds the
+/// connection's stored material; the door never sees a secret. The body is base64 (an
 /// HMAC scheme signs the exact bytes); a scheme that does not read it
 /// is handed an empty one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2461,6 +2483,9 @@ pub struct CallerVerifyRequest {
     pub for_instance: Option<weft_core::instance::InstanceScope>,
     pub access_id: String,
     pub service: String,
+    /// The check the route's `auth` names, run against the connection's
+    /// stored values.
+    pub verify: weft_core::access::events::VerifyKind,
     pub method: String,
     /// The path as called under the project (no tenant, no leading
     /// slash), for the broker's log.
@@ -2729,12 +2754,21 @@ pub struct DoorTickRequest {
     /// booked for the vouch and nothing else would bring forward.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shortens: bool,
+    /// Its memory note while its memory is nearly full, `None` while it
+    /// has room: written on the lease row with it, so the row holds it
+    /// however late it was written ([`DOOR_MEMORY`] tells it at once).
+    pub memory_full: Option<MemoryNote>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DoorCount {
     pub key: String,
     pub hits: i64,
+    /// The last reason given for the count, for a key that keeps one (a
+    /// dropped fire's, `weft_core::signal::limits::dropped_key`). A tick's
+    /// answer carries none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2744,6 +2778,28 @@ pub struct DoorTick {
     /// How many copies of the project are alive, this one included.
     pub copies: u32,
 }
+
+/// A worker's memory state. Harmless twice: the second sets what the
+/// first set.
+pub const DOOR_MEMORY: BrokerCall = BrokerCall { path: "/v1/door/memory", twice: Twice::Harmless };
+
+pub use weft_task_store::worker_door::MemoryNote;
+
+/// `POST /v1/door/memory`: the worker's memory just crossed the busy
+/// guard's line (`weft_engine::busy`), one way or the other, once per
+/// crossing, never per request. Kept on the worker's own lease row
+/// (`weft_task_store::worker_door::keep_memory_state`) when there is one
+/// already; its door's ticks carry it too ([`DoorTickRequest::memory_full`]),
+/// so a row written later holds it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoorMemoryRequest {
+    /// Its note while its memory is nearly full; `None` once it has room
+    /// again, which takes the note off.
+    pub full: Option<MemoryNote>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoorMemory {}
 
 /// One raw push, as the dispatcher forwards it to the broker: the
 /// exact bytes (signatures hash them; base64 so the wrapper stays
@@ -2844,13 +2900,49 @@ mod supervisor_protocol_tests {
         assert!(old_record.to_string().contains("missing field `after`"), "{old_record}");
     }
 
+    /// A worker's memory goes out full with its note, or with room as
+    /// none; the note comes back to the next worker inside its claim.
+    #[test]
+    fn a_memory_note_round_trip() {
+        let note = MemoryNote { used_bytes: 990, limit_bytes: 1000, at_unix: 12 };
+        let sent = json!({ "used_bytes": 990, "limit_bytes": 1000, "at_unix": 12 });
+        assert_eq!(serde_json::to_value(DoorMemoryRequest { full: Some(note) }).unwrap(), json!({ "full": sent }));
+        assert_eq!(serde_json::to_value(DoorMemoryRequest { full: None }).unwrap(), json!({ "full": null }));
+        assert_eq!(serde_json::from_value::<DoorMemoryRequest>(json!({ "full": sent })).unwrap().full, Some(note));
+        let tick = DoorTickRequest {
+            binary_hash: None,
+            in_flight: Default::default(),
+            window_start: 60,
+            counts: Vec::new(),
+            vouch_until: None,
+            shortens: false,
+            memory_full: Some(note),
+        };
+        assert_eq!(serde_json::to_value(&tick).unwrap()["memory_full"], sent);
+        let room = serde_json::to_value(DoorTickRequest { memory_full: None, ..tick }).unwrap();
+        assert_eq!(room["memory_full"], json!(null));
+        assert_eq!(serde_json::from_value::<DoorTickRequest>(room).unwrap().memory_full, None);
+
+        let claimed = |lost_full: serde_json::Value| {
+            serde_json::from_value::<RunClaimResponse>(json!({
+                "claimed": { "epoch": 2, "attempts": 1, "definition_hash": "h", "cancel_requested": null, "lost_full": lost_full },
+            }))
+            .unwrap()
+            .claimed
+            .expect("claimed")
+            .lost_full
+        };
+        assert_eq!(claimed(sent), Some(note));
+        assert_eq!(claimed(json!(null)), None);
+    }
+
     #[test]
     fn publish_access_round_trip() {
         // The request carries no project: the broker resolves that
         // from the run, so a worker cannot name someone else's.
         let spec: weft_core::AccessSpec = serde_json::from_value(json!({
             "service": "postgres",
-            "acquisition": { "kind": "static", "fields": [{ "name": "host" }] },
+            "acquisition": { "kind": "static", "ways": [{ "fields": [{ "name": "host" }] }] },
         }))
         .unwrap();
         let req = PublishAccessRequest {
@@ -2894,6 +2986,18 @@ mod supervisor_protocol_tests {
         }))
         .unwrap();
         assert_eq!(some.connection().expect("a connection").connection_id, "id-1");
+    }
+
+    /// The way a resolve answers rides beside the values.
+    #[test]
+    fn a_resolve_answers_its_way() {
+        let resolved: ResolveConnectionResponse = serde_json::from_value(json!({
+            "values": { "token": "t" }, "auth": [], "identity": null, "relay_url": null,
+            "owner": "author", "keep_until_unix": null, "way": "subscription",
+        }))
+        .unwrap();
+        assert_eq!(resolved.way.as_deref(), Some("subscription"));
+        assert_eq!(serde_json::to_value(&resolved).unwrap()["way"], "subscription");
     }
 
     #[test]
@@ -3102,7 +3206,7 @@ mod supervisor_protocol_tests {
         });
         let resp: SupervisorInfraNodesResponse = serde_json::from_value(json).unwrap();
         assert_eq!(resp.nodes[0].health_rules.as_ref().unwrap()[0].when.units_named(), vec!["main"]);
-        assert_eq!(resp.nodes[0].addresses.urls.get("api").unwrap(), "http://x.svc:8080");
+        assert_eq!(resp.nodes[0].addresses.urls.get("api").unwrap(), &weft_core::infra::EndpointRecord::Url("http://x.svc:8080".into()));
         assert_eq!(resp.nodes[0].addresses.public_paths.get("api").unwrap(), "/infra/p/wn-abc-tgi-12/hooks");
         assert_eq!(resp.nodes[0].addresses.doors.get("sql").unwrap(), "10.0.0.7:5432");
         assert_eq!(resp.nodes[0].units.get("main").unwrap().status, InfraNodeStatus::Running);
@@ -3142,7 +3246,7 @@ mod supervisor_protocol_tests {
             copy_id: "wn-abc-tgi-12".into(),
             applied_spec_hash: "deadbeef".into(),
             addresses: AppliedEndpoints {
-                urls: [("api".to_string(), "http://x".to_string())].into(),
+                urls: [("api".to_string(), weft_core::infra::EndpointRecord::Url("http://x".into()))].into(),
                 public_paths: [("api".to_string(), "/infra/p/wn-abc-tgi-12/hooks".to_string())].into(),
                 doors: [("sql".to_string(), "10.0.0.7:5432".to_string())].into(),
             },
@@ -3178,6 +3282,7 @@ mod supervisor_protocol_tests {
             required_permissions: vec!["drive.readonly".into()],
             required_values: vec!["imapHost".into()],
             expected_duration_secs: 120,
+            stale: None,
         };
         // The full literal object pins the FIELD NAMES on the wire: a
         // symmetric struct-field rename round-trips fine but breaks the
@@ -3201,6 +3306,11 @@ mod supervisor_protocol_tests {
         assert_eq!(back.frames, vec![weft_core::frames::Frame::Loop { index: 3 }]);
         assert_eq!(back.service, "openrouter");
         assert_eq!(back.expected_duration_secs, 120);
+        assert_eq!(back.stale, None, "an open names no stale values, and sends no key for them");
+
+        let renew = ResolveConnectionRequest { stale: Some("ab12".into()), ..back };
+        let v = serde_json::to_value(&renew).unwrap();
+        assert_eq!(v["stale"], "ab12", "a renewal names the values that stopped working");
     }
 
     #[test]
@@ -3217,6 +3327,7 @@ mod supervisor_protocol_tests {
                 owner: weft_core::CredentialOwner::Platform,
                 keep_until_unix: None,
                 published_by: None,
+                way: None,
             };
             // Field names pinned literally (a symmetric rename would
             // round-trip but break the peer).
@@ -3935,7 +4046,7 @@ mod supervisor_protocol_tests {
     #[test]
     fn to_routing_connection_auth_passes_config_through() {
         use weft_core::primitive::SignalAuth;
-        let cfg = json!({"access_id": "acc-1", "service": "api_key_auth"});
+        let cfg = json!({"access_id": "acc-1", "service": "api_key_auth", "verify": { "kind": "api_keys" }});
         let r = make_row(
             SignalSurfaceKind::PublicEntry,
             Some("/x"),
@@ -3955,6 +4066,7 @@ mod supervisor_protocol_tests {
             for_instance: None,
             access_id: "acc-1".into(),
             service: "hmac_auth".into(),
+            verify: serde_json::from_value(json!({ "kind": "api_keys" })).unwrap(),
             method: "POST".into(),
             path: "chat/room7".into(),
             url: Some("https://acme.example/p/chat/room7?v=1".into()),
@@ -3966,6 +4078,7 @@ mod supervisor_protocol_tests {
             v,
             json!({
                 "tenant": "alice", "access_id": "acc-1", "service": "hmac_auth",
+                "verify": { "kind": "api_keys" },
                 "method": "POST", "path": "chat/room7",
                 "url": "https://acme.example/p/chat/room7?v=1",
                 "headers": [["x-signature", "abc"], ["X-Signature", "def"]],
@@ -3976,7 +4089,7 @@ mod supervisor_protocol_tests {
         assert_eq!(back.path, "chat/room7");
         assert_eq!(back.headers.len(), 2, "a repeated header keeps every value");
         let bare: CallerVerifyRequest = serde_json::from_value(json!({
-            "tenant": "t", "access_id": "a", "service": "s", "method": "GET", "path": ""
+            "tenant": "t", "access_id": "a", "service": "s", "verify": { "kind": "api_keys" }, "method": "GET", "path": ""
         }))
         .unwrap();
         assert!(bare.headers.is_empty() && bare.url.is_none() && bare.body_b64.is_empty());
@@ -4017,9 +4130,10 @@ pub const ADMIN_DOORS: BrokerCall = BrokerCall { path: "/v1/access/admin/doors",
 /// A key pair for one move of a tenant's connections. Not safe twice: each
 /// call makes a new key.
 pub const ADMIN_MIGRATE_KEY: BrokerCall = BrokerCall { path: "/v1/access/admin/migrate/key", twice: Twice::NotSafe };
-/// A tenant's picked connections, sealed to another install's key. Not
-/// shown harmless twice, so never sent again.
-pub const ADMIN_MIGRATE_EXPORT: BrokerCall = BrokerCall { path: "/v1/access/admin/migrate/export", twice: Twice::NotSafe };
+/// A tenant's picked connections, sealed to another install's key.
+/// Harmless twice: it only reads them (`weft_access_store::migrate::export`),
+/// and a second copy is a second sealing of the same connections.
+pub const ADMIN_MIGRATE_EXPORT: BrokerCall = BrokerCall { path: "/v1/access/admin/migrate/export", twice: Twice::Harmless };
 /// Connections sealed to this install's key, written as the tenant's. Not
 /// safe twice: it writes them.
 pub const ADMIN_MIGRATE_IMPORT: BrokerCall = BrokerCall { path: "/v1/access/admin/migrate/import", twice: Twice::NotSafe };

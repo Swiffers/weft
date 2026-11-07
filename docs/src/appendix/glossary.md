@@ -7,9 +7,10 @@ the failure fails the run. A mistake in the program, like a bad setting, fails
 the run either way. A node that already sent something on a `Bus` or
 `Generator` output fails the run either way.
 
-**Access.** The port type for permission to call a service. One access node
-holds the connection and emits an `Access`; every node that calls that service
-takes one as an input. Nothing secret is in it.
+**Access.** The port type for permission to call a service, written with the
+service it is for: `Access[slack]`. One access node holds the connection and
+emits one; every node that calls that service takes one as an input. Nothing
+secret is in it.
 
 **Access node.** The node that owns the connection for one service. Its body is
 one line; everything it does is declared in its
@@ -47,8 +48,11 @@ process uses. Workers, listeners and supervisors ask it; only it and the
 dispatcher touch Postgres.
 
 **Bus.** A live channel between nodes that are running at the same time. Any
-number of participants, each with its own position. It lives exactly as long as
-its worker.
+number of participants, each with its own position. It stays open while any
+node that registered a name on it is still on it, through a pause of the run
+too, and ends once nobody is on it and no node can still join it, or when a node
+closes it (go and read [how a bus
+ends](../language/streams-and-buses.md#how-a-bus-ends)).
 
 **Closure.** A pulse carrying no value, meaning nothing will ever arrive here
 for this run. It is how a node says no rather than saying nothing. Not `null`,
@@ -155,8 +159,9 @@ like `FirstInOrder`. Its inputs are optional and it needs no gate.
 one or more of its events. It is what the graph shows you, and what a worker
 reads to pick up a durable run or one that was waiting.
 
-**Keep.** Marking a file to survive the sweep that clears a run's storage.
-Additive, and there is no un-keep.
+**Keep.** Giving a stored file a deadline: it is deleted once nobody has
+touched it for that long, or with its run or project if that comes first. The
+`KeepFile` node also copies a file into its project, so it outlives its run.
 
 **Left out.** A node folder weft could not load (bad metadata, a name two
 folders claim), which `weft describe-nodes` lists with why, or a node package

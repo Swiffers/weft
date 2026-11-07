@@ -18,11 +18,22 @@
     ],
     "acquisition": {
       "kind": "static",
-      "fields": [
+      "ways": [
         {
-          "name": "key",
-          "label": "API key",
-          "placeholder": "key_id:key_secret"
+          "fields": [
+            {
+              "name": "key",
+              "label": "API key",
+              "placeholder": "key_id:key_secret"
+            }
+          ],
+          "guide": {
+            "link": "https://fal.ai/dashboard/keys",
+            "steps": [
+              "Open fal.ai, Dashboard > Keys, and create an API key.",
+              "Paste it below and name the connection."
+            ]
+          }
         }
       ]
     },
@@ -41,21 +52,12 @@
     "verification": {
       "rung": "reports_validity",
       "cost": "free"
-    },
-    "ownPage": {
-      "guide": {
-        "link": "https://fal.ai/dashboard/keys",
-        "steps": [
-          "Open fal.ai, Dashboard > Keys, and create an API key.",
-          "Paste it below and name the connection."
-        ]
-      }
     }
   },
   "inputs": [
     {
       "name": "account",
-      "type": "Access",
+      "type": "Access[fal]",
       "widget": {
         "kind": "access"
       },
@@ -65,7 +67,7 @@
   "outputs": [
     {
       "name": "access",
-      "type": "Access",
+      "type": "Access[fal]",
       "description": "Wire into the fal media nodes' account input."
     }
   ]

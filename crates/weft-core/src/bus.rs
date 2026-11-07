@@ -1,8 +1,8 @@
 //! In-process message bus: a channel between co-alive nodes in the same
 //! run (the same worker process).
 //!
-//! One node creates a bus (`ctx.create_bus(opts)`) and emits the marker on
-//! an output port; downstream nodes resolve the marker via `ctx.bus`
+//! One node creates a bus (`ctx.open_bus(port, opts, name)`) and emits the
+//! marker on an output port; downstream nodes resolve the marker via `ctx.bus`
 //! and exchange messages in RAM. The pulse path never carries the bus
 //! traffic itself (only the marker rides the pulse).
 //!
@@ -15,34 +15,42 @@
 //! - **`BusInner.log`**: the in-RAM entry deque behind a `Mutex`,
 //!   plus a `Notify` that wakes waiting cursors when an entry lands.
 //! - **`BusCursor`**: a `(Weak<BusInner>, next_offset, filter)`. Its
-//!   `next()` future returns the next matching entry, or `None` when
-//!   the bus is closed and the cursor is at the tail.
+//!   `next(&mut state)` future returns the next matching entry, or `None`
+//!   when the bus is closed and the cursor is at the tail.
 //!
 //! Cursors are independent. Each consumer holds its own. Reading does
 //! not consume; the same offset can be read by N cursors. Cursors only
 //! ever read RAM: entries trimmed out of the in-RAM window are not
 //! reachable by a cursor, and a cursor positioned inside a trimmed span
-//! silently resumes forward at the next retained entry (only `Message`
-//! entries are ever trimmed; membership entries are always retained, so
-//! nothing a consumer needs can hide in a gap).
+//! silently resumes forward at the next retained entry (on a live bus
+//! only `Message` entries are ever trimmed; membership entries are always
+//! retained, so nothing a consumer needs can hide in a gap). A resumed
+//! reader carrying on behind a message the bus no longer holds is
+//! refused instead (below).
 //!
-//! A bus lives exactly as long as its worker process. It is NOT
-//! rebuilt on worker restart: nothing rehydrates a bus from the
-//! journal, and a marker resolved after a restart fails with
-//! `BusLookupError::UnknownBus`. A live bus and a durable suspension
-//! (`ctx.await_signal`) DO coexist: a bus-held worker resolves the
-//! suspension in process (the driver's idle loop polls the journal for
-//! the `SuspensionResolved` row while a bus keeps the worker alive). The
-//! restriction on waiting is unrelated to the bus, and enforced in the
-//! engine, not here: a node may `await_signal` after sending on an
-//! ordinary output port (on resume the body replays and that send is
-//! a no-op, its value already recorded), but not after yielding on or
-//! closing a stream output, nor while it reads a stream input, since
-//! those items went out or were consumed live and cannot be replayed.
+//! ## A bus outlives a pause
+//!
+//! A run pauses with a bus open: a member that pauses on a wait stays
+//! one (its names stay registered, nobody reads it leave), and when
+//! every node of the run waits, the whole run pauses around its buses. Every read and membership wait is a place the run
+//! can pause, so it takes the firing's state
+//! (`crate::context::PausePoint`); a firing opens one reader per bus a
+//! run of its body, and its [`FiringBuses`] keeps how far that reader
+//! read and which name it holds, saved with the state. The worker that picks the run up opens every bus that was
+//! open again, with its id, at the offset it stopped at
+//! ([`BusHandle::reopen`]), before any body runs: a journaled bus with
+//! the last window of messages its record kept whole, an ephemeral one
+//! empty. A resumed body creating its bus on the same port gets that bus
+//! back, its reader starts where it stopped, and its name comes back to
+//! it. A cursor of a resumed firing carrying on behind a message the bus
+//! no longer holds (one it came back from the pause without, or one its
+//! window dropped while the firing waited) fails its first read. A node
+//! whose reads must not stop at all holds the run instead
+//! (`crate::context::Holding`).
 //!
 //! ## Windowed journaling (the inspector trail)
 //!
-//! Journaling exists for the INSPECTOR, not for resume. Every append
+//! Every append
 //! signals a per-run `journal_pump_notify`; the engine's
 //! bus-journal-pump task drains every live bus's unjournaled tail. The
 //! pump buffers each bus's `Message` entries and flushes ONE
@@ -103,9 +111,10 @@
 //! name). The registered name is the sender stamp on every `send`, and
 //! is what peers wait on via `wait_for("llm")`. Registration is the
 //! explicit "I am here and ready" act: a node that needs a long warmup
-//! (download a model, open a socket) holds the bus the whole time and
+//! (download a model, open a socket) has the bus the whole time and
 //! only registers once it is truly ready, so peers waiting on it do not
-//! release early.
+//! release early. Registering is also what makes a node a member: the
+//! bus lives until nobody is on it and no node can still join it (below).
 //!
 //! ## Waiting
 //!
@@ -120,36 +129,59 @@
 //! appear. That question depends on dispatch state, terminations, and
 //! topology, all of which live in the engine. The engine watches the
 //! run and, when it concludes a wait can never be satisfied,
-//! closes the bus. Every waiting cursor wakes; `next()` returns `None`.
+//! closes the bus, failed, naming why. Every waiting cursor wakes, and
+//! its `next()` returns that failure.
+//!
+//! A member waiting on its own bus (`wait_for`, a read, `until_end`)
+//! after every other member left keeps waiting: it is a member, so the
+//! bus is open, and a node given the marker later may still join and
+//! talk. Nothing hangs for good: once nothing else in the run can move,
+//! that same stuck check closes the bus failed and the wait ends with
+//! that failure.
 //!
 //! ## How a bus ends
 //!
 //! The close carries an end ([`StreamEnd`]): `Finished`, or `Failed`
-//! with an error. Every bus a firing creates or joins is held by that
-//! firing ([`FiringBuses`]) and ended by weft when the body does, with
-//! how the body returned: a reader of a producer that failed halfway
-//! learns the stream is incomplete instead of reading a short one as
-//! whole. A body may end a bus early with [`BusHandle::close`], which
-//! only ever says finished. The engine's own closes (a stuck run, the
-//! run's end) say failed, naming why.
+//! with an error. Nobody owns a bus. A firing that registers a name on
+//! it (creating it with `ctx.open_bus`, joining it with `ctx.join_bus`,
+//! or registering on any handle it got) is a member until its body
+//! returns, however it returns, and then its names leave
+//! ([`FiringBuses::leave`]). A member leaving does nothing else to the
+//! bus, failed or not: the others carry on, and one of them may be the
+//! way the conversation recovers. Once nobody is on it, the bus ends as
+//! soon as no node can still join it, as its last member's body returned:
+//! finished, or failed with its error, so a reader of a stream whose only
+//! producer failed halfway learns it is incomplete instead of reading a
+//! short one as whole. A bus nobody ever joined ends finished. A node can
+//! still join while the bus's marker is on its way to it (on a wire, in a
+//! loop that will hand it to an iteration still to come) or in the input
+//! of a firing that has not ended and has not used the bus yet: the
+//! engine looks ([`crate::run::bus_reach`]) once it hears the bus is
+//! unattended ([`crate::liveness::WaitLiveness::unattended`]), and ends it
+//! ([`BusInner::end_unattended`]) when nothing can. A firing uses a bus by
+//! registering on it, opening its reader, or waiting on it; one that only
+//! hands the marker on holds the bus until it returns.
+//! Any node holding the bus may end it sooner with [`BusHandle::close`]:
+//! finished while somebody is on it, the way its last member left once
+//! nobody is. A reader that never registers (`ctx.bus_from_input`, a
+//! debug tap) is no member, and once it reads it keeps nothing open. A
+//! member that pauses stays one across the pause. The engine's
+//! own closes (a stuck run, the run's end) say failed, naming why.
 //!
-//! ## "wait" vs "park" vocabulary
+//! Membership is the log's `Joined` / `Left` entries, which the run's
+//! record folds into who is on each bus (`RecordedBus::members`); a bus
+//! opened again after a pause starts from that, so every worker reads
+//! the same members. A send touches none of it.
 //!
-//! The word "park" in this codebase already names `ctx.await_signal`:
-//! the worker is swapped, a fresh worker resumes from the journal,
-//! the body re-flows through. That's workflow-level suspension. The bus
-//! has nothing to do with that. A cursor's `next().await` is plain
-//! in-process tokio await; the worker stays alive; no swap; no journal
-//! write.
+//! ## Waiting and the engine
 //!
-//! The only reason the engine needs to know about the bus's await at
-//! all is the stuck-detector: it tracks, per FIRING, whether
-//! that node is parked inside a bus wait with nothing to read, so when
-//! every participant node is parked it can declare deadlock and close
-//! every bus. Hence `WaitLiveness` and the `wait_on` protocol (which
-//! pairs `enter_wait`/`exit_wait` internally); those live in
-//! `crate::liveness`, which the bus plugs into as one `WaitSource`
-//! among several. Two concepts, two names, no overlap.
+//! A cursor's `next` is a plain in-process tokio await; the worker stays
+//! alive and nothing is written. The engine needs to know about it for
+//! two decisions: whether every node is waiting with nothing to read (a
+//! deadlock, which it ends by closing the buses), and whether the run
+//! can pause around them. Hence `WaitLiveness` and the
+//! `wait_or_pause` protocol, in `crate::liveness`, which the bus plugs
+//! into as one `WaitSource` among several.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -161,7 +193,11 @@ use thiserror::Error;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
-use crate::liveness::{no_liveness, wait_on, FiringLocation, WaitLiveness, WaitSource};
+use crate::cancellation::CancellationFlag;
+use crate::context::{PausePoint, Point};
+use crate::error::{WeftError, WeftResult};
+use crate::liveness::{no_liveness, wait_or_pause, FiringLocation, WaitLiveness, WaitSource};
+use crate::run::saved::{BusPosition, Registration};
 
 // ----- Public types ----------------------------------------------------
 
@@ -169,7 +205,8 @@ use crate::liveness::{no_liveness, wait_on, FiringLocation, WaitLiveness, WaitSo
 /// values (chat-shaped traffic) or raw bytes (media frames; no base64
 /// wrapping between nodes). A consumer reads the kind off the handle
 /// (or the marker) and knows how to speak before the first message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BusPayloadKind {
     #[default]
     Json,
@@ -244,6 +281,17 @@ impl<'de> Deserialize<'de> for WirePayload {
     }
 }
 
+impl BusEntry {
+    /// A JSON message's kind and value: `None` for a membership entry, the
+    /// close, or a bytes message.
+    pub fn as_json(&self) -> Option<(&str, &Value)> {
+        match &self.kind {
+            BusEntryKind::Message { msg_kind, payload: Some(payload), .. } => payload.as_json().map(|value| (msg_kind.as_str(), value)),
+            _ => None,
+        }
+    }
+}
+
 impl WirePayload {
     /// The payload's JSON value; loud `None` for a byte payload (the
     /// consumer asked with the wrong shape).
@@ -260,6 +308,23 @@ impl WirePayload {
             WirePayload::Json(v) => Some(v),
             WirePayload::Bytes(_) => None,
         }
+    }
+
+    /// The payload's JSON value by move with its type; `None` for a byte
+    /// payload. A bus declares no type for its messages, so a message's
+    /// type is read off its own markers ([`WeftType::infer`]: a stored
+    /// file is its file type, a secret a `Secret`, an access its
+    /// service's `Access`). With it, a reader handles the message the
+    /// way a typed input is handled: files found by
+    /// [`crate::storage::media::map_stored_files`], secrets revealed by
+    /// [`crate::context::RunContext::reveal_in`]. Every reader that does
+    /// either reads its message's type here.
+    ///
+    /// [`WeftType::infer`]: crate::weft_type::WeftType::infer
+    pub fn into_typed_json(self) -> Option<(Value, crate::weft_type::WeftType)> {
+        let value = self.into_json()?;
+        let ty = crate::weft_type::WeftType::infer(&value);
+        Some((value, ty))
     }
 
     /// The payload's raw bytes by move; `None` for a JSON payload.
@@ -322,8 +387,11 @@ pub struct BusEntry {
 pub enum BusEntryKind {
     /// A handle registered `name`.
     Joined { name: String },
-    /// A registered handle dropped while the bus was open.
-    Left { name: String },
+    /// A name left the open bus: its firing's body returned
+    /// ([`BusInner::leave`]), or its handle outside every firing dropped.
+    /// `end` is how it left, which is how the bus ends if nobody else
+    /// joins it after ([`BusInner::end_unattended`]).
+    Left { name: String, end: StreamEnd },
     /// A successful `send` landed. `from` is the sender's registered
     /// name (the bus stamps it). For journaled buses, `payload` is
     /// `Some(value)`; for ephemeral buses, `payload` is `None` and the
@@ -339,18 +407,18 @@ pub enum BusEntryKind {
     },
     /// Appended once at the close, saying how the bus ended. Cursors
     /// never surface it as a regular `Some(entry)`; `next()` returns
-    /// `None` when it reaches this marker, and a reader asks the handle
-    /// how it ended ([`BusHandle::end`]). Journaled so the inspector
+    /// `None` when it reaches this marker of a bus that finished, and the
+    /// failure as an error for one that ended failed. Journaled so the inspector
     /// renders where the bus closed, or failed, instead of the panel
     /// just ending.
     Closed { end: StreamEnd },
 }
 
 /// How a bus ended: the same vocabulary a generator's stream ends with.
-/// `Finished` when the body of the firing that held it returned
-/// normally (or the bus was closed on purpose), `Failed` with the
-/// firing's error otherwise. Weft writes it ([`FiringBuses::end`]); a
-/// node can only end a bus as finished ([`BusHandle::close`]).
+/// `Finished` when the body of its last member to leave returned
+/// normally (or the bus was closed on purpose), `Failed` with that body's
+/// error otherwise. Weft writes it ([`FiringBuses::leave`]); a node can
+/// only end a bus as finished ([`BusHandle::close`]).
 pub use crate::primitive::StreamEnd;
 
 /// One message inside a journal window row: who sent it, when, and
@@ -554,27 +622,16 @@ pub enum RegisterError {
     /// The bus is already closed. The caller cannot join a dead channel.
     #[error("bus is closed; cannot register")]
     Closed,
-}
-
-/// Why a `wait_for` resolved without the awaited peer appearing.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum WaitError {
-    /// The bus closed before the wait was satisfied.
-    #[error("bus closed while waiting for peers")]
-    Closed,
-}
-
-/// Why a typed cursor read (`next_json` / `next_bytes`) failed
-/// (distinct from "closed", which is `None`). The raw `next()` cannot
-/// fail: gaps are bridged silently and close is `None`.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum CursorError {
-    /// The consumer asked for one payload shape but the bus carries the
-    /// other (`next_json` on a bytes bus, or the reverse). Mirrors the
-    /// send side's `SendError::WrongPayload`: the kind is frozen at
-    /// creation; read it off the handle before reading.
-    #[error("this bus carries {expected} payloads, not {requested}")]
-    WrongPayload { expected: &'static str, requested: &'static str },
+    /// The firing already holds another name on this bus (through another
+    /// handle, or held over its pause): a firing holds one name per bus,
+    /// the one its saved state carries over a pause.
+    #[error("this node already holds the name '{0}' on the bus; a node holds one name per bus")]
+    FiringHoldsAnother(String),
+    /// The body of the handle's firing already returned, taking its names
+    /// off every bus ([`BusInner::leave`]): a task the body left running
+    /// cannot join for it after.
+    #[error("cannot register '{0}': this node's body already returned, and a node is on a bus only while its body runs")]
+    FiringLeft(String),
 }
 
 // ----- Wait liveness (shared with every in-process wait) --------------
@@ -633,6 +690,12 @@ impl EphemeralStore {
         })
     }
 
+    /// Whether the next insert evicts a payload. Caller holds the bus log
+    /// lock.
+    fn is_full(&self) -> bool {
+        self.entries.lock().expect("ephemeral store poisoned").len() >= self.capacity
+    }
+
     /// Insert a fresh (offset, payload). Caller holds the bus log lock,
     /// so offsets are appended in order. Evicts the front when capacity
     /// is reached.
@@ -677,9 +740,9 @@ impl EphemeralStore {
 }
 
 /// Shared bus state behind every handle. The log is the source of
-/// truth for ordering and content; `present_names` is a denormalized
-/// view of currently-registered identities (kept in sync with the log
-/// under the same lock as appends).
+/// truth for ordering and content; `members` is a denormalized view of
+/// who is on the bus now (kept in sync with the log's `Joined` / `Left`
+/// entries under the same lock as appends).
 ///
 /// `liveness` and `journal_pump_notify` are `Weak` on purpose: the
 /// engine's `BusCoordinator` pins each bus via `BusRegistry::inner:
@@ -716,10 +779,27 @@ pub struct BusInner {
     /// the offset gaps and bridge them silently, resuming at the next
     /// retained entry.
     log: Mutex<Vec<BusEntry>>,
+    /// The offset the next entry lands at. Written under the log lock
+    /// (`push_entry`); a bus opened again after a pause starts at the
+    /// offset it stopped at, with no entry of its own yet.
+    next_offset: AtomicU64,
     /// Every name that EVER registered, regardless of later `Left`
     /// entries. The single source of truth for membership waits
     /// (`wait_for*`). Maintained under the log lock.
     ever_joined: Mutex<HashSet<String>>,
+    /// One past the newest message the bus no longer holds in RAM: one a
+    /// bus opened again after a pause could not bring back (an ephemeral
+    /// bus keeps none, a journaled one only its last window of messages
+    /// kept whole), or one its window dropped as it went (raised by every
+    /// trim, under the log lock). A resumed firing's cursor carrying on
+    /// below it would read on over messages it never got
+    /// ([`BusHandle::cursor_at`]). 0 for a bus that never dropped one.
+    lost_through: AtomicU64,
+    /// The filtered cursors of firings on this bus, carried past the
+    /// entries their filters turn down just before the bus drops any
+    /// ([`BusInner::carry_filtered_cursors`], which locks it inside the
+    /// log lock; nothing holding it takes the log lock).
+    filtered_cursors: Mutex<Vec<Weak<CursorSlot>>>,
     /// Highest offset the pump has successfully shipped to the
     /// journal, +1. Reads as `journaled_through`; the pump pulls
     /// `log[journaled_through..]` per drain. Atomic so the bus can
@@ -742,11 +822,23 @@ pub struct BusInner {
     /// `Notify` drives every cursor wait; the cursor re-reads state on
     /// every wake. Cheap because `notify_waiters` stores no permits.
     log_notify: Notify,
-    /// Denormalized: who's registered right now. Kept in sync with the
-    /// log under the same `log` lock so a `register`/`drop` race
-    /// against `close()` cannot produce a Joined without a matching
-    /// log entry.
-    present_names: Mutex<HashSet<String>>,
+    /// Who is on the bus now, by name: every name whose `Joined` has no
+    /// `Left` yet, the same set the run's record folds from those entries
+    /// (`RecordedBus::members`), which is what a bus opened again after a
+    /// pause starts from. When the last one leaves, the bus ends
+    /// ([`BusInner::leave`]). Kept in sync with the log under the same
+    /// `log` lock, so a `register` / leave racing `close()` cannot produce
+    /// a `Joined` without its entry.
+    members: Mutex<HashMap<String, Member>>,
+    /// How the last name to leave left (its `Left` entry's end), `None`
+    /// while none has: how the bus ends once nobody can still join it
+    /// ([`Self::end_unattended`]). Written under the `log` lock.
+    last_left: Mutex<Option<StreamEnd>>,
+    /// The firings whose bodies used this bus (registered on it, opened
+    /// its reader, or waited on it) and have not returned: a firing
+    /// holding the marker in its input that used the bus already is no
+    /// node that may still join it ([`crate::run::bus_reach`]).
+    used_by: Mutex<HashSet<FiringLocation>>,
     /// Engine node-liveness hook. `Weak::new()` outside an engine-driven
     /// run; set once at bus creation via
     /// `BusHandle::create_with_engine`. Fired at every cursor wait via
@@ -782,7 +874,98 @@ pub struct BusInner {
     window: usize,
 }
 
+/// One name on a bus ([`BusInner::members`]).
+struct Member {
+    /// The firing whose body registered it, `None` for a handle outside
+    /// every firing (a test's, a bus seeded from outside a body). A
+    /// firing's name stays its own until its body returns, through every
+    /// handle it drops and every pause; a name outside a firing leaves
+    /// with its handle.
+    firing: Option<FiringLocation>,
+    /// The offset of its `Joined` entry: where a handle taking the name
+    /// back anchors its reader.
+    joined_offset: u64,
+    /// A live handle carries it now. A firing's name whose handle went
+    /// (dropped mid-body, or by a pause) is taken back by the next handle
+    /// of the same firing registering it, with nothing appended.
+    in_hand: bool,
+}
+
+/// A bus to open again where a paused run left it
+/// ([`BusHandle::reopen`]), as the run's record tells it.
+pub struct ReopenedBus {
+    pub id: Uuid,
+    pub opts: BusOptions,
+    /// The offset its next entry lands at.
+    pub next_offset: u64,
+    /// Every name that ever joined it.
+    pub joined: Vec<String>,
+    /// Who was on it when the run paused: each name, the paused firing
+    /// it belongs to, and the offset of its `Joined` entry. Every one of
+    /// them is a firing that paused, since a run pauses only once every
+    /// node of it waits, and each body that returned before took its
+    /// names off with it.
+    pub members: Vec<(String, FiringLocation, u64)>,
+    /// The messages a journaled bus's record kept whole (each with its
+    /// payload, untrimmed), oldest first, at most its window, every one
+    /// after `lost_through`.
+    pub retained: Vec<WindowedBusMessage>,
+    /// One past the newest message it cannot bring back
+    /// ([`BusInner::lost_through`]).
+    pub lost_through: u64,
+    /// How it ended before the pause, `None` for a bus still open: an
+    /// ended one comes back ended, its `Closed` entry at `next_offset`
+    /// and already on the record.
+    pub end: Option<StreamEnd>,
+    /// How the last name to leave it left, `None` while none has: how an
+    /// open bus nobody is on ends once no node can still join it.
+    pub last_left: Option<StreamEnd>,
+}
+
 impl BusInner {
+    /// An empty bus `id`, opened with `opts` and the engine's hooks.
+    /// Errors on an invalid `window` (must be >= 1) or a journal window
+    /// out of range ([`crate::stream_journal::JournalPolicy::check`]).
+    fn new(id: Uuid, opts: &BusOptions, liveness: Weak<dyn WaitLiveness>, journal_pump_notify: Weak<Notify>) -> Result<Self, String> {
+        let window = opts.window.unwrap_or(DEFAULT_BUS_WINDOW);
+        if window == 0 {
+            return Err("bus window must be >= 1; 0 would evict every entry before any \
+                        cursor could read it"
+                .into());
+        }
+        opts.journal.check().map_err(|why| format!("bus: {why}"))?;
+        let ephemeral_store = if opts.journal.is_ephemeral() {
+            Some(EphemeralStore::new(window)?)
+        } else {
+            None
+        };
+        Ok(BusInner {
+            id,
+            journal: opts.journal,
+            log: Mutex::new(Vec::new()),
+            next_offset: AtomicU64::new(0),
+            ever_joined: Mutex::new(HashSet::new()),
+            lost_through: AtomicU64::new(0),
+            filtered_cursors: Mutex::new(Vec::new()),
+            journaled_through: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            end: std::sync::OnceLock::new(),
+            journal_degraded: AtomicBool::new(false),
+            degraded_reason: Mutex::new(String::new()),
+            log_notify: Notify::new(),
+            append_gen: AtomicU64::new(0),
+            members: Mutex::new(HashMap::new()),
+            last_left: Mutex::new(None),
+            used_by: Mutex::new(HashSet::new()),
+            liveness,
+            journal_pump_notify,
+            ephemeral_store,
+            payload_kind: opts.payload,
+            meta: opts.meta.clone(),
+            window,
+        })
+    }
+
     /// Lock the log, recovering from poisoning. The only user code
     /// that ever runs under this lock is a cursor's filter closure,
     /// and that section is read-only: a panicking filter leaves the
@@ -837,15 +1020,15 @@ impl BusInner {
     /// append: `close`, `register`, `send`, and `Drop` all funnel
     /// through this so the wake discipline (always log_notify, always
     /// pump-notify) can never drift between paths. Returns the offset
-    /// the entry landed at. Offsets derive from the LAST entry's
-    /// offset (not the length): ephemeral eviction removes interior
-    /// entries, so length is not a position.
+    /// the entry landed at, the bus's `next_offset` (never the log's
+    /// length: eviction removes interior entries, and a bus opened again
+    /// after a pause starts past entries it no longer holds).
     fn push_entry(
         &self,
         log: &mut Vec<BusEntry>,
         kind: BusEntryKind,
     ) -> u64 {
-        let offset = log.last().map(|e| e.offset + 1).unwrap_or(0);
+        let offset = self.next_offset.fetch_add(1, Ordering::AcqRel);
         log.push(BusEntry {
             offset,
             at_unix: now_unix(),
@@ -902,26 +1085,113 @@ impl BusInner {
             }
         }
         let journaled_through = self.journaled_through.load(Ordering::Acquire);
+        self.carry_filtered_cursors(log);
+        let mut dropped_through = 0u64;
         log.retain(|e| {
             // Always keep membership entries and anything in the window.
-            if !matches!(e.kind, BusEntryKind::Message { .. }) || e.offset >= window_floor {
-                return true;
-            }
             // A Message below the window: drop ONLY if already journaled.
-            // An un-shipped message stays so the pump can still drain it and
-            // a fresh worker can replay it (durability before RAM bound).
-            e.offset >= journaled_through
+            // An un-shipped message stays so the pump can still drain it
+            // onto the record (durability before RAM bound).
+            let keep = !matches!(e.kind, BusEntryKind::Message { .. })
+                || e.offset >= window_floor
+                || e.offset >= journaled_through;
+            if !keep {
+                dropped_through = dropped_through.max(e.offset + 1);
+            }
+            keep
+        });
+        self.lost_through.fetch_max(dropped_through, Ordering::AcqRel);
+    }
+
+    /// `entry` with its payload, when it is a retained message of an
+    /// ephemeral bus (whose log entry carries none); `None` for any other
+    /// entry, which carries what a reader sees. Caller holds the log lock.
+    fn resolve_ephemeral(&self, entry: &BusEntry) -> Option<BusEntry> {
+        let BusEntryKind::Message { from, msg_kind, payload: None, payload_byte_size } = &entry.kind else {
+            return None;
+        };
+        let store = self.ephemeral_store.as_ref().expect(
+            "Message with payload=None on a non-ephemeral bus is impossible \
+             by construction (send routes ephemeral payloads into the store)",
+        );
+        // A RETAINED Message always has a resident payload (send evicts
+        // the log entry in the same locked section that evicts the
+        // payload); a miss panics inside `get_resident`.
+        Some(BusEntry {
+            offset: entry.offset,
+            at_unix: entry.at_unix,
+            kind: BusEntryKind::Message {
+                from: from.clone(),
+                msg_kind: msg_kind.clone(),
+                payload: Some(store.get_resident(entry.offset)),
+                payload_byte_size: *payload_byte_size,
+            },
+        })
+    }
+
+    /// Where a cursor at `from` with `filter` would look next: carried
+    /// over the entries right after it that the filter turns down, as its
+    /// read would, stopping at a `Closed` entry, at the tail, and at a
+    /// message the bus no longer holds (a gap is never bridged here: a
+    /// dropped message may be one the reader wanted).
+    fn past_turned_down(&self, from: u64, filter: &CursorFilter) -> u64 {
+        let log = self.lock_log();
+        self.past_turned_down_in(&log, from, filter)
+    }
+
+    /// [`Self::past_turned_down`] over `log`, which the caller holds
+    /// locked.
+    fn past_turned_down_in(&self, log: &[BusEntry], from: u64, filter: &CursorFilter) -> u64 {
+        let mut at = from;
+        let mut idx = log.partition_point(|e| e.offset < from);
+        while let Some(entry) = log.get(idx) {
+            if entry.offset != at || matches!(entry.kind, BusEntryKind::Closed { .. }) {
+                break;
+            }
+            let resolved = self.resolve_ephemeral(entry);
+            // A reader's filter runs here on the sender's thread: one that
+            // panics stops the carry (the reader meets the panic on its own
+            // read) instead of failing the sender.
+            let turned_down = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| !filter(resolved.as_ref().unwrap_or(entry))));
+            if !turned_down.unwrap_or(false) {
+                break;
+            }
+            at += 1;
+            idx += 1;
+        }
+        at
+    }
+
+    /// Carry every filtered cursor of a firing past the entries right
+    /// after it that its filter turns down, just before the bus drops
+    /// messages from `log` (held locked, every message in it still
+    /// readable): a reader filtering out its own messages, whose firing
+    /// pauses after sending more than the window holds, is saved past
+    /// them rather than behind a gap ([`CursorSlot::saved_offset`]).
+    fn carry_filtered_cursors(&self, log: &[BusEntry]) {
+        self.filtered_cursors.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|slot| {
+            let Some(slot) = slot.upgrade() else { return false };
+            let filter = slot.filter.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            if let Some(filter) = filter {
+                let carried = self.past_turned_down_in(log, slot.position(), &filter);
+                slot.carried.fetch_max(carried, Ordering::AcqRel);
+            }
+            true
         });
     }
 
     /// Close this bus as `end`. Appends a `Closed` entry carrying it
     /// (idempotent: the first close's end stands), sets the closed
     /// flag, wakes every cursor waiting on the log and the engine's
-    /// liveness hook. Public so the engine can end a firing's buses
-    /// with how its body returned, and fire the stuck-detection close
-    /// via a raw `Arc<BusInner>` it pins for the pump's lifetime.
+    /// liveness hook. Public so the engine can fire the stuck-detection
+    /// close via a raw `Arc<BusInner>` it pins for the pump's lifetime.
     pub fn close(&self, end: StreamEnd) {
         let mut log = self.lock_log();
+        self.close_in(&mut log, end);
+    }
+
+    /// [`Self::close`] with the log already locked.
+    fn close_in(&self, log: &mut Vec<BusEntry>, end: StreamEnd) {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
@@ -929,7 +1199,99 @@ impl BusInner {
         // also reads the end.
         let _ = self.end.set(end.clone());
         self.closed.store(true, Ordering::Release);
-        self.push_entry(&mut log, BusEntryKind::Closed { end });
+        self.push_entry(log, BusEntryKind::Closed { end });
+    }
+
+    /// The firing at `at` left: its body returned (`end` says how), so
+    /// every name it has on the bus leaves, each with its `Left` entry,
+    /// whether a handle still carries it or not, and it no longer counts
+    /// as having used the bus. Nothing else happens to the bus, unless
+    /// that left nobody on it: then it ends once no node can still join
+    /// it ([`Self::unattended`]), as the last name to leave left. A firing
+    /// with no name on the bus leaves none, and tells of a bus it made
+    /// with nobody on it.
+    pub fn leave(&self, at: &FiringLocation, end: StreamEnd) {
+        self.used_by.lock().expect("bus users poisoned").remove(at);
+        let mut log = self.lock_log();
+        self.leave_in(&mut log, |_, member| member.firing.as_ref() == Some(at), end);
+    }
+
+    /// Take every member `which` picks off the bus, each with its `Left`
+    /// entry carrying `end`. The one way a name leaves: a firing's body
+    /// returning ([`Self::leave`]) and a handle outside every firing
+    /// dropping ([`BusHandle`]'s drop) both come through here. A bus left
+    /// with nobody on it is unattended ([`Self::unattended`]), whether a
+    /// name just left or none was there. A closed bus takes no entry any
+    /// more, so nothing is written on one.
+    fn leave_in(&self, log: &mut Vec<BusEntry>, which: impl Fn(&str, &Member) -> bool, end: StreamEnd) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let (gone, nobody_left) = {
+            let mut members = self.members.lock().expect("bus members poisoned");
+            let gone: Vec<String> = members.iter().filter(|(name, member)| which(name, member)).map(|(name, _)| name.clone()).collect();
+            for name in &gone {
+                members.remove(name);
+            }
+            (gone, members.is_empty())
+        };
+        if !gone.is_empty() {
+            *self.last_left.lock().expect("bus last leave poisoned") = Some(end.clone());
+        }
+        let left_now = !gone.is_empty();
+        for name in gone {
+            self.push_entry(log, BusEntryKind::Left { name, end: end.clone() });
+        }
+        if !nobody_left {
+            return;
+        }
+        match self.liveness.upgrade() {
+            Some(engine) => engine.unattended(self.id),
+            // Outside a run (a test's bus, a run whose engine is gone) no
+            // node can still join it, so the last name leaving ends it.
+            None if left_now => self.close_in(log, end),
+            None => {}
+        }
+    }
+
+    /// End the bus if nobody is on it, as the last name to leave left
+    /// (finished when none ever did): the engine's call, once no node of
+    /// the run can still join it ([`crate::run::bus_reach`]). A bus a node
+    /// joined meanwhile stays open. Answers whether it ended now.
+    pub fn end_unattended(&self) -> bool {
+        let mut log = self.lock_log();
+        if self.closed.load(Ordering::Acquire) || !self.members.lock().expect("bus members poisoned").is_empty() {
+            return false;
+        }
+        let end = self.last_left.lock().expect("bus last leave poisoned").clone().unwrap_or(StreamEnd::Finished);
+        self.close_in(&mut log, end);
+        true
+    }
+
+    /// Whether anybody is on the bus.
+    pub fn attended(&self) -> bool {
+        !self.members.lock().expect("bus members poisoned").is_empty()
+    }
+
+    /// The firing at `at` used the bus (registered on it, opened its
+    /// reader, or waited on it): from here on, holding its marker is no
+    /// reason for the bus to stay open. With nobody on the bus the engine
+    /// is told again, since this may be what kept it open.
+    fn used(&self, at: &FiringLocation) {
+        if !self.used_by.lock().expect("bus users poisoned").insert(at.clone()) {
+            return;
+        }
+        if !self.is_closed() && !self.attended() {
+            if let Some(engine) = self.liveness.upgrade() {
+                engine.unattended(self.id);
+            }
+        }
+    }
+
+    /// Whether the firing at `at` used the bus ([`Self::used`]) in a body
+    /// that has not returned.
+    pub fn used_by(&self, at: &FiringLocation) -> bool {
+        self.used_by.lock().expect("bus users poisoned").contains(at)
     }
 
     /// How the bus ended, `None` while it is open.
@@ -1022,21 +1384,19 @@ impl BusInner {
 
     /// One past the highest offset ever appended. The pump compares
     /// this with `journaled_through` to know whether anything is left
-    /// to drain. Snapshot under the log lock. Derived from the last
-    /// entry's offset, not the length (ephemeral eviction removes
-    /// interior entries).
+    /// to drain. Snapshot under the log lock.
     pub fn log_len(&self) -> u64 {
-        let log = self.lock_log();
-        log.last().map(|e| e.offset + 1).unwrap_or(0)
+        let _log = self.lock_log();
+        self.next_offset.load(Ordering::Acquire)
     }
 
     /// The earliest offset still resident in the in-RAM log (the floor a
     /// cursor can reach; anything below it was trimmed out of RAM and is not
-    /// readable by a cursor, by design cursors never read the DB). `0` on an
-    /// empty log.
+    /// readable by a cursor, by design cursors never read the DB). The next
+    /// offset on an empty log.
     pub fn retained_floor(&self) -> u64 {
         let log = self.lock_log();
-        log.first().map(|e| e.offset).unwrap_or(0)
+        log.first().map(|e| e.offset).unwrap_or_else(|| self.next_offset.load(Ordering::Acquire))
     }
 
     /// The pump's `journaled_through` cursor (one past the highest
@@ -1074,6 +1434,10 @@ pub struct BusHandle {
     /// (`new_handle`) inherit it, because a forked handle is still the
     /// SAME node grabbing a second grip on the bus.
     node: Option<FiringLocation>,
+    /// That firing's side of every bus it touches ([`FiringBuses`]): where
+    /// its one reader on the bus starts and how far it read, the name it
+    /// holds, whether its body returned. `None` outside a firing.
+    firing: Option<Arc<FiringBuses>>,
 }
 
 impl BusHandle {
@@ -1093,6 +1457,7 @@ impl BusHandle {
     pub fn new_handle(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            firing: self.firing.clone(),
             registration: None,
             node: self.node.clone(),
         }
@@ -1110,71 +1475,105 @@ impl BusHandle {
     /// Create with explicit options, no engine hooks. Errors on an
     /// invalid `window` or journal window.
     pub fn create_with_options(opts: BusOptions) -> Result<Self, String> {
-        Self::create_with_engine(opts, no_liveness(), Weak::<Notify>::new(), None)
+        Self::create_with_engine(opts, no_liveness(), Weak::<Notify>::new(), None, None)
     }
 
     /// Create with options + engine hooks. The liveness hook fires
     /// whenever this node's cursor enters/leaves a wait and on every
     /// append; the pump notify fires after every append to signal the
-    /// engine's bus-journal-pump task. `node` is the minting node
-    /// run (`None` outside an engine-driven node). Errors on an
-    /// invalid `window` (must be >= 1) or a journal window out of range
+    /// engine's bus-journal-pump task. `node` is the minting firing and
+    /// `firing` its [`FiringBuses`] (`None` outside an engine-driven
+    /// node). Errors on an invalid `window` (must be >= 1) or a journal
+    /// window out of range
     /// ([`crate::stream_journal::JournalPolicy::check`]).
     pub fn create_with_engine(
         opts: BusOptions,
         liveness: Weak<dyn WaitLiveness>,
         journal_pump_notify: Weak<Notify>,
         node: Option<FiringLocation>,
+        firing: Option<Arc<FiringBuses>>,
     ) -> Result<Self, String> {
-        let window = opts.window.unwrap_or(DEFAULT_BUS_WINDOW);
-        if window == 0 {
-            return Err("bus window must be >= 1; 0 would evict every entry before any \
-                        cursor could read it"
-                .into());
-        }
-        opts.journal.check().map_err(|why| format!("bus: {why}"))?;
-        let ephemeral_store = if opts.journal.is_ephemeral() {
-            Some(EphemeralStore::new(window)?)
-        } else {
-            None
-        };
-        let inner = Arc::new(BusInner {
-            id: Uuid::new_v4(),
-            journal: opts.journal,
-            log: Mutex::new(Vec::new()),
-            ever_joined: Mutex::new(HashSet::new()),
-            journaled_through: AtomicU64::new(0),
-            closed: AtomicBool::new(false),
-            end: std::sync::OnceLock::new(),
-            journal_degraded: AtomicBool::new(false),
-            degraded_reason: Mutex::new(String::new()),
-            log_notify: Notify::new(),
-            append_gen: AtomicU64::new(0),
-            present_names: Mutex::new(HashSet::new()),
-            liveness,
-            journal_pump_notify,
-            ephemeral_store,
-            payload_kind: opts.payload,
-            meta: opts.meta,
-            window,
-        });
-        Ok(Self {
-            inner,
-            registration: None,
-            node,
-        })
+        let inner = BusInner::new(Uuid::new_v4(), &opts, liveness, journal_pump_notify)?;
+        Ok(Self { inner: Arc::new(inner), registration: None, node, firing })
     }
 
-    /// Build a handle from an existing inner, attributed to the node
-    /// run `node` that is resolving the marker. Used by
+    /// Open again a bus a run paused with, where it stood
+    /// ([`ReopenedBus`]): the same id, so every marker handed out still
+    /// names it, the next entry at the offset the bus stopped at,
+    /// everything before it already on the run's record, its members
+    /// on it again, each its paused firing's to take back, and
+    /// for a journaled bus the messages its record kept whole, so a reader
+    /// reaching back finds them. A bus that ended before the pause comes
+    /// back ended the same way: its readers read what it kept and come to
+    /// its end, and a close or a register meets an ended bus, as they
+    /// would have before the pause. The handle is the run's, attributed to
+    /// no firing; the bodies reach the bus by marker or port as before.
+    pub fn reopen(
+        bus: ReopenedBus,
+        liveness: Weak<dyn WaitLiveness>,
+        journal_pump_notify: Weak<Notify>,
+    ) -> Result<Self, String> {
+        let inner = BusInner::new(bus.id, &bus.opts, liveness, journal_pump_notify)?;
+        {
+            let mut log = inner.lock_log();
+            for message in bus.retained {
+                let Some(payload) = message.payload else {
+                    return Err(format!("its record kept message {} without its payload, which cannot be read again", message.offset));
+                };
+                log.push(BusEntry {
+                    offset: message.offset,
+                    at_unix: message.at_unix,
+                    kind: BusEntryKind::Message {
+                        from: message.from,
+                        msg_kind: message.msg_kind,
+                        payload: Some(payload),
+                        payload_byte_size: message.payload_byte_size,
+                    },
+                });
+            }
+            let mut next_offset = bus.next_offset;
+            if let Some(end) = bus.end {
+                // Its `Closed` entry, already on the record: past it, so
+                // the pump writes it no second time.
+                log.push(BusEntry { offset: next_offset, at_unix: now_unix(), kind: BusEntryKind::Closed { end: end.clone() } });
+                let _ = inner.end.set(end);
+                inner.closed.store(true, Ordering::Release);
+                next_offset += 1;
+            }
+            inner.next_offset.store(next_offset, Ordering::Release);
+            inner.journaled_through.store(next_offset, Ordering::Release);
+            inner.lost_through.store(bus.lost_through, Ordering::Release);
+            *inner.ever_joined.lock().expect("ever_joined poisoned") = bus.joined.into_iter().collect();
+            *inner.last_left.lock().expect("bus last leave poisoned") = bus.last_left;
+            if !inner.closed.load(Ordering::Acquire) {
+                let mut members = inner.members.lock().expect("bus members poisoned");
+                for (name, firing, joined_offset) in bus.members {
+                    members.insert(name, Member { firing: Some(firing), joined_offset, in_hand: false });
+                }
+            }
+        }
+        // Open with nobody on it (its last member left, or it never had
+        // one, before the pause): the engine looks again at whether a node
+        // can still join it.
+        if !inner.is_closed() && !inner.attended() {
+            if let Some(engine) = inner.liveness.upgrade() {
+                engine.unattended(inner.id);
+            }
+        }
+        Ok(Self { inner: Arc::new(inner), registration: None, node: None, firing: None })
+    }
+
+    /// Build a handle from an existing inner, attributed to the firing
+    /// `node` resolving the marker (and its [`FiringBuses`]). Used by
     /// `BusRegistry::lookup` to hand a consumer a fresh handle on a bus
-    /// the producer already created; the consumer's own node identity
-    /// (not the producer's) keys its liveness.
-    pub(crate) fn from_inner(inner: Arc<BusInner>, node: Option<FiringLocation>) -> Self {
+    /// the producer already created; the consumer's own firing (not the
+    /// producer's) keys its liveness and its positions.
+    pub(crate) fn from_inner(inner: Arc<BusInner>, node: Option<FiringLocation>, firing: Option<Arc<FiringBuses>>) -> Self {
         Self {
             inner,
             registration: None,
             node,
+            firing,
         }
     }
 
@@ -1214,48 +1613,110 @@ impl BusHandle {
         self.inner.clone()
     }
 
-    /// Claim `name` as this handle's identity. Errors if the bus is
-    /// closed (`Closed`), the name is already held (`NameTaken`), or
-    /// this handle already registered (`AlreadyRegistered`).
+    /// Claim `name` as this handle's identity, which makes its firing a
+    /// member of the bus until its body returns ([`BusInner::leave`]).
+    /// Errors if the bus is closed (`Closed`), the name is already held
+    /// (`NameTaken`), this handle already registered
+    /// (`AlreadyRegistered`), or its firing's body already returned
+    /// (`FiringLeft`).
     ///
-    /// The append to the log AND the `present_names` insert AND the
+    /// The append to the log AND the `members` insert AND the
     /// closed-flag re-check all happen under the SAME `log` lock. A
     /// `close()` in flight either lands before (this register sees
     /// `closed=true` and errors), or after (this register has finished
     /// inserting, the close appends the `Closed` entry next). No
     /// register-then-close race producing an orphan Joined.
+    ///
+    /// A name this handle's firing already has on the bus with no handle
+    /// carrying it (one it dropped, or held over its pause) is taken back
+    /// as it was, at its first `Joined` offset, with nothing appended: to
+    /// its peers the firing never left. That holds on a bus that ended
+    /// while the firing was paused too: the resumed body gets its name
+    /// back on the ended bus, and only a name it never held is refused
+    /// (`Closed`).
     pub fn register(&mut self, name: impl Into<String>) -> Result<(), RegisterError> {
         if let Some((existing, _)) = &self.registration {
             return Err(RegisterError::AlreadyRegistered(existing.clone()));
         }
         let name = name.into();
         let mut log = self.inner.lock_log();
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(RegisterError::Closed);
-        }
-        {
-            let mut present = self
-                .inner
-                .present_names
-                .lock()
-                .expect("present_names poisoned");
-            if present.contains(&name) {
-                return Err(RegisterError::NameTaken(name));
+        if let Some(firing) = &self.firing {
+            if firing.has_left() {
+                return Err(RegisterError::FiringLeft(name));
             }
-            present.insert(name.clone());
+            if let Some(held) = firing.held_name(self.inner.id) {
+                if held != name {
+                    return Err(RegisterError::FiringHoldsAnother(held));
+                }
+            }
         }
-        self.inner
-            .ever_joined
-            .lock()
-            .expect("ever_joined poisoned")
-            .insert(name.clone());
-        let joined_offset = self.inner.push_entry(
-            &mut log,
-            BusEntryKind::Joined { name: name.clone() },
-        );
+        if self.inner.closed.load(Ordering::Acquire) {
+            // The bus ended while the firing was paused holding this name
+            // (here, or before the run was picked up): the resumed body
+            // gets the name back as it held it, the bus ended, so its
+            // reader comes to that end. Only a name it never held is
+            // refused.
+            let Some(held) = self.firing.as_ref().and_then(|firing| firing.held_over_its_pause(self.inner.id)).filter(|held| held.name == name)
+            else {
+                return Err(RegisterError::Closed);
+            };
+            drop(log);
+            self.note_registered(&name, held.joined_offset);
+            self.registration = Some((name, held.joined_offset));
+            self.note_use();
+            return Ok(());
+        }
+        let firing = self.member_firing();
+        let joined_offset = {
+            let mut members = self.inner.members.lock().expect("bus members poisoned");
+            match members.get_mut(&name) {
+                Some(member) if !member.in_hand && firing.is_some() && member.firing == firing => {
+                    member.in_hand = true;
+                    Some(member.joined_offset)
+                }
+                Some(_) => return Err(RegisterError::NameTaken(name)),
+                None => None,
+            }
+        };
+        let joined_offset = match joined_offset {
+            Some(taken_back) => taken_back,
+            None => {
+                self.inner.ever_joined.lock().expect("ever_joined poisoned").insert(name.clone());
+                let joined_offset = self.inner.push_entry(&mut log, BusEntryKind::Joined { name: name.clone() });
+                self.inner.members.lock().expect("bus members poisoned").insert(name.clone(), Member { firing, joined_offset, in_hand: true });
+                joined_offset
+            }
+        };
         drop(log);
+        self.note_registered(&name, joined_offset);
         self.registration = Some((name, joined_offset));
+        self.note_use();
         Ok(())
+    }
+
+    /// The firing a name this handle registers belongs to: the handle's
+    /// own, `None` for a handle outside every firing.
+    fn member_firing(&self) -> Option<FiringLocation> {
+        self.firing.as_ref().and(self.node.clone())
+    }
+
+    /// This handle's firing used the bus (registered on it, opened its
+    /// reader, or waited on it): holding its marker no longer keeps the
+    /// bus open for it ([`BusInner::used`]), and its body returning takes
+    /// that back ([`FiringBuses::leave`]).
+    fn note_use(&self) {
+        if let (Some(firing), Some(at)) = (&self.firing, &self.node) {
+            firing.touched(self.inner.id);
+            self.inner.used(at);
+        }
+    }
+
+    /// Tell this handle's firing it holds `name` on this bus, for its
+    /// saved positions.
+    fn note_registered(&self, name: &str, joined_offset: u64) {
+        if let Some(firing) = &self.firing {
+            firing.registered(self.inner.id, Registration { name: name.to_string(), joined_offset });
+        }
     }
 
     /// This handle's registered name, if it has registered.
@@ -1326,6 +1787,11 @@ impl BusHandle {
                 .clone();
             return Err(SendError::JournalDegraded(reason));
         }
+        // This send evicts a payload: carry the filtered cursors while
+        // every message in the log still has its own.
+        if self.inner.ephemeral_store.as_ref().is_some_and(EphemeralStore::is_full) {
+            self.inner.carry_filtered_cursors(&log);
+        }
         let offset = self.inner.push_entry(
             &mut log,
             BusEntryKind::Message {
@@ -1356,14 +1822,19 @@ impl BusHandle {
                 let journaled_through =
                     self.inner.journaled_through.load(Ordering::Acquire);
                 let mut lost_unjournaled = 0u64;
+                let mut dropped_through = 0u64;
                 log.retain(|e| {
                     let keep = e.offset >= floor
                         || !matches!(e.kind, BusEntryKind::Message { .. });
-                    if !keep && e.offset >= journaled_through {
-                        lost_unjournaled += 1;
+                    if !keep {
+                        dropped_through = dropped_through.max(e.offset + 1);
+                        if e.offset >= journaled_through {
+                            lost_unjournaled += 1;
+                        }
                     }
                     keep
                 });
+                self.inner.lost_through.fetch_max(dropped_through, Ordering::AcqRel);
                 if lost_unjournaled > 0 {
                     tracing::error!(
                         target: "weft_core::bus",
@@ -1379,8 +1850,8 @@ impl BusHandle {
             // Journaled mode: bound the in-RAM log to `window` Message
             // entries WITHOUT losing durability. We only ever drop Message
             // entries that are BOTH (a) already shipped to the DB
-            // (`offset < journaled_through`, so a fresh worker can replay
-            // them) AND (b) older than the most recent `window` messages.
+            // (`offset < journaled_through`, so the record holds them) AND
+            // (b) older than the most recent `window` messages.
             // Membership entries (Joined/Left/Closed) are always retained
             // (load-bearing for cursors, bounded by participant churn). A
             // cursor that had pointed into the trimmed span silently
@@ -1407,12 +1878,18 @@ impl BusHandle {
     /// would race: the peer's first message could land between my
     /// `register()` and my `cursor()` and be lost forever (both sides
     /// then park on each other).
-    pub fn cursor(&self) -> BusCursor {
-        let next_offset = match &self.registration {
+    ///
+    /// A firing opens one reader per bus a run of its body (this one,
+    /// [`Self::cursor_at`] or [`Self::cursor_from_start`]): a second is
+    /// refused. In a resumed firing it starts where its reader stopped
+    /// before the pause.
+    #[track_caller]
+    pub fn cursor(&self) -> WeftResult<BusCursor> {
+        let anchor = match &self.registration {
             Some((_, joined_offset)) => *joined_offset,
             None => self.inner.log_len(),
         };
-        BusCursor::new(Arc::downgrade(&self.inner), next_offset, None, self.node.clone())
+        self.cursor_at(anchor)
     }
 
     /// The earliest offset still resident in RAM. A cursor cannot read
@@ -1429,8 +1906,41 @@ impl BusHandle {
     /// below the retained floor silently resumes at the oldest retained
     /// entry (RAM-only: the window is the whole readable world); an
     /// `offset` past the tail simply waits for entries to arrive.
-    pub fn cursor_at(&self, offset: u64) -> BusCursor {
-        BusCursor::new(Arc::downgrade(&self.inner), offset, None, self.node.clone())
+    ///
+    /// A resumed firing's cursor carrying on from where it stopped before
+    /// the pause, below a message the bus no longer holds
+    /// ([`BusInner::lost_through`]: one it came back from the pause
+    /// without, or one its window dropped while the firing was paused)
+    /// would read on over messages it never got: its first read fails
+    /// instead. A reader the body opens fresh starts like any other.
+    #[track_caller]
+    pub fn cursor_at(&self, offset: u64) -> WeftResult<BusCursor> {
+        let at = std::panic::Location::caller();
+        let (start, slot) = match &self.firing {
+            Some(firing) => {
+                let (start, slot) = firing.open_cursor(&self.inner, offset, at).map_err(|first| {
+                    WeftError::NodeFailed(format!(
+                        "node '{}' opened a second reader on a bus at {}:{}:{}, which it already opened one on at \
+                         {}:{}:{}: a node keeps one reader per bus, so that it can come back where it stopped after a \
+                         pause. Read every message through that one reader, filtering by sender or kind in the node's \
+                         code",
+                        self.node.as_ref().map_or("?", |node| node.node_id.as_str()),
+                        at.file(),
+                        at.line(),
+                        at.column(),
+                        first.file(),
+                        first.line(),
+                        first.column(),
+                    ))
+                })?;
+                (start, Some(slot))
+            }
+            None => (CursorStart::Fresh(offset), None),
+        };
+        self.note_use();
+        let behind = matches!(start, CursorStart::Saved(saved) if saved < self.inner.lost_through.load(Ordering::Acquire));
+        let cancellation = self.firing.as_ref().and_then(|firing| firing.cancellation.clone());
+        Ok(BusCursor::new(Arc::downgrade(&self.inner), self.inner.id, start.offset(), None, self.node.clone(), slot, behind, cancellation))
     }
 
     /// A fresh cursor from the earliest entry STILL RETAINED in RAM. Not
@@ -1438,7 +1948,8 @@ impl BusHandle {
     /// trimmed (journaled ones live on in the DB, but a cursor never reads
     /// the DB). This reads everything a cursor can still reach, oldest
     /// first.
-    pub fn cursor_from_start(&self) -> BusCursor {
+    #[track_caller]
+    pub fn cursor_from_start(&self) -> WeftResult<BusCursor> {
         self.cursor_at(self.inner.retained_floor())
     }
 
@@ -1446,11 +1957,73 @@ impl BusHandle {
 
     /// Wait until `name` has joined this bus at any point in its
     /// history. Resolves immediately if `name` already appeared
-    /// (past-aware: the cursor walks the log from offset 0). Errors
-    /// with `Closed` if the bus closes before the wait is satisfied.
-    pub async fn wait_for(&self, name: &str) -> Result<(), WaitError> {
+    /// (past-aware: membership survives truncation and a pause). Fails
+    /// if the bus closes before the wait is satisfied. The run can pause
+    /// while it waits, so it takes the firing's state; a resumed body gets
+    /// past it at once, since the list of who joined comes back with the
+    /// bus. Not a read, so the rule of `crate::context::Places` does not
+    /// count it.
+    #[track_caller]
+    pub fn wait_for<'a, P: PausePoint>(&'a self, name: &'a str, at: &'a mut P) -> impl std::future::Future<Output = WeftResult<()>> + 'a {
+        self.wait_for_at(name, at, Point::unchecked("waited for a member of a bus", std::panic::Location::caller()))
+    }
+
+    async fn wait_for_at<P: PausePoint>(&self, name: &str, at: &mut P, point: Point) -> WeftResult<()> {
+        at.before(&point, self.node.is_some())?;
+        self.note_use();
         let name_owned = name.to_string();
-        self.wait_for_joins(move |seen| seen.contains(&name_owned)).await
+        match self.wait_for_joins(at.pausable(), move |seen| seen.contains(&name_owned)).await {
+            Some(Ok(())) => Ok(()),
+            Some(Err(())) => Err(WeftError::NodeFailed(format!("the bus closed before '{name}' joined it"))),
+            None => Err(at.paused().await),
+        }
+    }
+
+    /// Wait until the bus ends, for a node that keeps a bus open while
+    /// others use it and has nothing to read on it: a member waiting for
+    /// the node that closes it. `Ok` once it ended finished; an error once
+    /// it ended failed (`the bus ended failed: <why>`), as a reader's read
+    /// fails there, so the `?` fails the node rather than letting a broken
+    /// stream pass as a whole one (a body handling the failure itself
+    /// matches the error, and [`Self::end`] says why).
+    ///
+    /// The run can pause while it waits, so it takes the firing's state
+    /// (or the `Holding`). It is no reader: it keeps no place on the bus,
+    /// so a resumed body waits on, however many messages the bus dropped
+    /// meanwhile, and the firing may still open its one reader on the bus.
+    /// Ends with the cancelled error when the run is cancelled.
+    #[track_caller]
+    pub fn until_end<'a, P: PausePoint>(&'a self, at: &'a mut P) -> impl std::future::Future<Output = WeftResult<()>> + 'a {
+        self.until_end_at(at, Point::unchecked("waited for a bus to end", std::panic::Location::caller()))
+    }
+
+    async fn until_end_at<P: PausePoint>(&self, at: &mut P, point: Point) -> WeftResult<()> {
+        at.before(&point, self.node.is_some())?;
+        self.note_use();
+        let inner = self.inner.clone();
+        let check = move || -> Option<()> {
+            let _log = inner.lock_log();
+            inner.closed.load(Ordering::Acquire).then_some(())
+        };
+        let source = self.inner.clone() as Arc<dyn WaitSource>;
+        let wait = wait_or_pause(&self.inner.liveness, &self.node, &source, at.pausable(), check);
+        let cancellation = self.firing.as_ref().and_then(|firing| firing.cancellation.clone());
+        let ended = match cancellation.as_deref() {
+            Some(cancellation) => tokio::select! {
+                biased;
+                () = cancellation.cancelled() => None,
+                ended = wait => Some(ended),
+            },
+            None => Some(wait.await),
+        };
+        match ended {
+            None => Err(WeftError::Cancelled),
+            Some(Ok(())) => match self.inner.end() {
+                Some(StreamEnd::Failed { error }) => Err(WeftError::NodeFailed(format!("the bus ended failed: {error}"))),
+                Some(StreamEnd::Finished) | None => Ok(()),
+            },
+            Some(Err(crate::liveness::Paused)) => Err(at.paused().await),
+        }
     }
 
     /// Past-aware membership wait. Re-evaluates `pred` against the
@@ -1466,13 +2039,15 @@ impl BusHandle {
     /// is a two-line predicate to add here the moment a real consumer
     /// needs one.
     ///
-    /// Runs the shared wait protocol (`liveness::wait_on`), which
+    /// Runs the shared wait protocol (`liveness::wait_or_pause`), which
     /// holds exactly ONE wait registration (one `WaitId`) across the
     /// entire call: the wait's observed/parked state in the engine's
     /// liveness map stays continuous across wakes instead of being
     /// re-minted at the conservative not-parked baseline on each wake,
     /// which would keep deferring a provable deadlock.
-    async fn wait_for_joins<F>(&self, mut pred: F) -> Result<(), WaitError>
+    /// `Some(Err(()))` when the bus closed first, `None` when the run
+    /// paused.
+    async fn wait_for_joins<F>(&self, pausable: bool, mut pred: F) -> Option<Result<(), ()>>
     where
         F: FnMut(&HashSet<String>) -> bool + Send + Sync,
     {
@@ -1482,7 +2057,7 @@ impl BusHandle {
         // entry was found first). Both reads happen under the log
         // lock so they see one consistent snapshot (register and
         // close both mutate under it).
-        let check = || -> Option<Result<(), WaitError>> {
+        let check = || -> Option<Result<(), ()>> {
             let _log = self.inner.lock_log();
             let seen = self
                 .inner
@@ -1493,25 +2068,32 @@ impl BusHandle {
                 return Some(Ok(()));
             }
             if self.inner.closed.load(Ordering::Acquire) {
-                return Some(Err(WaitError::Closed));
+                return Some(Err(()));
             }
             None
         };
-        // The shared wait protocol (`liveness::wait_on`) holds ONE
+        // The shared wait protocol (`liveness::wait_or_pause`) holds ONE
         // guard for the whole wait, arms before every check (no lost
         // wakeup) and records observed under the same generation
         // discipline the stuck-check relies on.
         let source = self.inner.clone() as Arc<dyn WaitSource>;
-        wait_on(&self.inner.liveness, &self.node, &source, check).await
+        wait_or_pause(&self.inner.liveness, &self.node, &source, pausable, check).await.ok()
     }
 
     // ----- lifecycle ---------------------------------------------
 
-    /// End the bus now, as finished: "no more messages". A failed end is
-    /// never a node's to write; weft writes it from how the body of the
-    /// firing holding the bus returned ([`FiringBuses`]).
+    /// End the bus now: "no more messages", whoever calls it and whoever
+    /// is still on it. With somebody on it, it ends finished. With nobody
+    /// on it, it ends as it would have ended itself: as its last member
+    /// left, so a stream whose producer failed halfway still reads as
+    /// failed however a node later closes it (finished when nobody ever
+    /// joined). A failed end is never a node's to write; weft writes it
+    /// from how the body of the last member to leave returned
+    /// ([`FiringBuses::leave`]).
     pub fn close(&self) {
-        self.inner.close(StreamEnd::Finished);
+        if !self.inner.end_unattended() {
+            self.inner.close(StreamEnd::Finished);
+        }
     }
 
     pub fn is_closed(&self) -> bool {
@@ -1532,99 +2114,312 @@ impl BusHandle {
     }
 }
 
-/// The buses one firing ends when its body does: every bus it created
-/// (`ctx.create_bus`, `ctx.open_bus`) and every bus it joined
-/// (`ctx.join_bus`). Weft ends them with how the body returned
-/// ([`Self::end`]): finished when it returned normally, failed with its
-/// error otherwise, so a reader learns whether the stream it read is
-/// complete and no node writes that itself. A bus the body closed
-/// earlier keeps the end it was closed with. One per firing, held by
-/// its ctx handle.
+/// One firing's side of every bus it touches. Two jobs:
+///
+/// - Taking its names off every bus when its body returns
+///   ([`Self::leave`]), however it returns: a firing that registered a
+///   name on a bus (by creating it, `ctx.open_bus`, or joining it,
+///   `ctx.join_bus`) is a member of it until then, and nobody owns a bus.
+///   A bus ends once nobody is on it and no node can still join it,
+///   the way its last member's body returned: finished, or failed with
+///   its error. A body that paused
+///   leaves nothing: it carries on from its state, its names with it
+///   ([`body_end`]).
+/// - Where it stands on each bus, saved with its state
+///   ([`crate::run::saved::BusPosition`]): how far its reader read (a
+///   firing opens one reader per bus a run of its body), and the name it
+///   holds. A resumed firing starts from the positions it saved
+///   ([`Self::resumed`]): its reader starts there, and its names come
+///   back to it.
+///
+/// One per firing, held by its ctx handle and by every bus handle the
+/// firing gets.
 #[derive(Default)]
 pub struct FiringBuses {
-    held: Mutex<HeldBuses>,
+    /// Where the firing stood on each bus when it last saved, by bus id.
+    restored: std::collections::BTreeMap<String, BusPosition>,
+    /// Where it stands now, by bus id: its reader (its next offset,
+    /// shared with the cursor) and the name it holds.
+    positions: Mutex<HashMap<Uuid, LivePosition>>,
+    /// Its body returned and its names left ([`Self::leave`]): a handle
+    /// of it registering after that is refused.
+    left: AtomicBool,
+    /// The buses it used this run of its body ([`BusHandle::note_use`])
+    /// and the ones it made: each is told when its body returns, so one
+    /// it used stops counting it, and one it made that nobody joined
+    /// learns it is unattended.
+    touched: Mutex<HashSet<Uuid>>,
+    /// The run's cancel: a reader of the firing ends with the cancelled
+    /// error the moment it trips ([`BusCursor::next`]). `None` outside a
+    /// run (a test's firing).
+    cancellation: Option<Arc<CancellationFlag>>,
 }
 
-#[derive(Default)]
-struct HeldBuses {
-    buses: Vec<Weak<BusInner>>,
-    /// The body's end, once it came: a bus taken after it (by a task
-    /// the body left running) ends at once the same way.
-    ended: Option<StreamEnd>,
+/// Where a firing's reader starts ([`FiringBuses::open_cursor`]): where
+/// it stopped when the firing paused, or where the body asked.
+#[derive(Clone, Copy)]
+enum CursorStart {
+    Saved(u64),
+    Fresh(u64),
 }
 
-/// How a body's return ends the buses it holds (it created them, or
-/// joined them as a party to the conversation): `Finished` only when it
-/// returned, `Failed` otherwise. A body that paused on a wait has left the
-/// conversation too: a bus lives in this process, and the body that
-/// resumes opens or joins one afresh, so a reader of this one must not
-/// take what it read as whole.
-pub fn body_end(result: &crate::error::WeftResult<()>) -> StreamEnd {
-    use crate::error::WeftError;
-    match result {
-        Ok(()) => StreamEnd::Finished,
-        Err(WeftError::Suspended { .. }) => {
-            StreamEnd::Failed { error: "the node holding this bus paused on a wait".into() }
+impl CursorStart {
+    fn offset(self) -> u64 {
+        match self {
+            Self::Saved(offset) | Self::Fresh(offset) => offset,
         }
-        Err(error) => StreamEnd::Failed { error: error.to_string() },
+    }
+}
+
+/// Where a firing's cursor stands, shared by the cursor (which moves it
+/// as it reads) and the firing's [`FiringBuses`] (which saves it).
+struct CursorSlot {
+    bus: Weak<BusInner>,
+    next_offset: AtomicU64,
+    /// How far the bus carried it past entries its filter turns down
+    /// before dropping them ([`BusInner::carry_filtered_cursors`]).
+    carried: AtomicU64,
+    filter: Mutex<Option<CursorFilter>>,
+}
+
+impl CursorSlot {
+    /// The offset a save keeps: where the cursor's next read would look,
+    /// past the entries right after it that its filter turns down
+    /// ([`BusInner::past_turned_down`]). A reader filtering out its own
+    /// messages that pauses after sending some is then not behind them,
+    /// whatever the bus drops of them before it comes back.
+    fn saved_offset(&self) -> u64 {
+        let offset = self.position();
+        let filter = self.filter.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        match (filter, self.bus.upgrade()) {
+            (Some(filter), Some(inner)) => inner.past_turned_down(offset, &filter),
+            _ => offset,
+        }
+    }
+
+    /// Where the cursor stands: as far as it read, or as far as the bus
+    /// carried it, whichever is further.
+    fn position(&self) -> u64 {
+        self.next_offset.load(Ordering::Acquire).max(self.carried.load(Ordering::Acquire))
+    }
+}
+
+/// One bus as the firing touches it now ([`FiringBuses::positions`]).
+#[derive(Default, Clone)]
+struct LivePosition {
+    /// The reader it opened on this bus this run of its body, kept once
+    /// the body dropped it (how far it read is where a save leaves it),
+    /// and the line that opened it.
+    cursor: Option<(Arc<CursorSlot>, &'static std::panic::Location<'static>)>,
+    /// The name it took since it resumed: `None` while it took none (its
+    /// saved one stands).
+    registered: Option<Registration>,
+}
+
+/// How a body's return takes it off the buses it is a member of
+/// ([`FiringBuses::leave`]), which is how a bus it leaves last ends:
+/// `Finished` when it returned, `Failed` with its error otherwise, and
+/// nothing when it paused: the body carries on from its saved state, a
+/// member of its buses still.
+pub fn body_end(result: &WeftResult<()>) -> Option<StreamEnd> {
+    match result {
+        Ok(()) => Some(StreamEnd::Finished),
+        Err(WeftError::Suspended { .. }) => None,
+        Err(error) => Some(StreamEnd::Failed { error: error.to_string() }),
     }
 }
 
 impl FiringBuses {
-    /// Hold `bus` until the body ends.
-    pub fn hold(&self, bus: &BusHandle) {
-        let mut held = self.held.lock().expect("firing buses poisoned");
-        match &held.ended {
-            Some(end) => bus.inner.close(end.clone()),
-            None => held.buses.push(Arc::downgrade(&bus.inner)),
+    /// The side of a firing resumed from the positions it saved
+    /// ([`crate::run::saved::Positions::buses`]).
+    pub fn resumed(restored: std::collections::BTreeMap<String, BusPosition>) -> Self {
+        Self { restored, ..Self::default() }
+    }
+
+    /// The same side, of a run cancelled by `cancellation`: the firing's
+    /// readers end with the cancelled error when it trips.
+    pub fn cancelled_by(mut self, cancellation: Arc<CancellationFlag>) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    /// The body of the firing at `at` returned as `end`: its names leave
+    /// every bus it has one on ([`BusInner::leave`]), the ones it took
+    /// this run of its body and the ones it held over a pause and never
+    /// took back, and every bus it used or made hears it is done. `bus`
+    /// finds a bus of the run by id. A bus this left with nobody on it
+    /// ends as `end` once no node can still join it; any other stays open.
+    /// Once only: a later call (the engine's failure path after the body's
+    /// own end) changes nothing.
+    pub fn leave(&self, at: &FiringLocation, end: StreamEnd, bus: impl Fn(Uuid) -> Option<Arc<BusInner>>) {
+        if self.left.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let mut buses = self.named_on();
+        buses.extend(self.touched.lock().expect("touched buses poisoned").iter().copied());
+        buses.sort_unstable();
+        buses.dedup();
+        for id in buses {
+            if let Some(inner) = bus(id) {
+                inner.leave(at, end.clone());
+            }
         }
     }
 
-    /// End every bus still open as `end`. The first end stands: a
-    /// later call (the engine's failure path after the body's own end)
-    /// changes nothing.
-    pub fn end(&self, end: StreamEnd) {
-        let buses = {
-            let mut held = self.held.lock().expect("firing buses poisoned");
-            if held.ended.is_some() {
-                return;
+    /// Its body paused (`body_end` answered `None`): it keeps its names,
+    /// and the buses it used forget that it did. A parked firing holding a
+    /// bus's marker counts as one that may still join it
+    /// ([`crate::run::bus_reach`]), as it would on a worker picking the run
+    /// up, whose buses know nothing of who used them.
+    pub fn paused(&self, at: &FiringLocation, bus: impl Fn(Uuid) -> Option<Arc<BusInner>>) {
+        for id in self.touched.lock().expect("touched buses poisoned").iter() {
+            if let Some(inner) = bus(*id) {
+                inner.used_by.lock().expect("bus users poisoned").remove(at);
             }
-            held.ended = Some(end.clone());
-            std::mem::take(&mut held.buses)
-        };
-        for bus in buses.iter().filter_map(Weak::upgrade) {
-            bus.close(end.clone());
         }
     }
+
+    /// The firing at `at` resumed: each bus its saved positions say it read
+    /// or held a name on before its pause counts it as having used it, as
+    /// its body goes on past that use without making it again. Read off
+    /// the state its record keeps, so any worker counts the same.
+    pub fn used_before_its_pause(&self, at: &FiringLocation, bus: impl Fn(Uuid) -> Option<Arc<BusInner>>) {
+        let used: Vec<Uuid> = self
+            .restored
+            .iter()
+            .filter(|(_, position)| position.cursor.is_some() || position.registered.is_some())
+            .filter_map(|(id, _)| Uuid::parse_str(id).ok())
+            .collect();
+        for id in used {
+            if let Some(inner) = bus(id) {
+                self.touched(id);
+                inner.used(at);
+            }
+        }
+    }
+
+    /// It used bus `id`, or made it: its body returning tells that bus
+    /// ([`Self::leave`]).
+    pub fn touched(&self, id: Uuid) {
+        self.touched.lock().expect("touched buses poisoned").insert(id);
+    }
+
+    /// Whether its body returned and took its names off its buses.
+    fn has_left(&self) -> bool {
+        self.left.load(Ordering::Acquire)
+    }
+
+    /// Where the firing stands on every bus it touched, this run of its
+    /// body or before a pause: what its saved state carries. A bus whose
+    /// reader it has not opened again since resuming keeps the position it
+    /// was saved with.
+    pub fn positions(&self) -> std::collections::BTreeMap<String, BusPosition> {
+        let mut positions = self.restored.clone();
+        // Taken out first: a reader's saved offset reads its bus's log,
+        // which is never locked inside this lock.
+        let live: Vec<(Uuid, LivePosition)> =
+            self.positions.lock().expect("bus positions poisoned").iter().map(|(bus, live)| (*bus, live.clone())).collect();
+        for (bus, LivePosition { cursor, registered }) in live {
+            let position = positions.entry(bus.to_string()).or_default();
+            if let Some((cursor, _)) = cursor {
+                position.cursor = Some(cursor.saved_offset());
+            }
+            if let Some(registered) = registered {
+                position.registered = Some(registered);
+            }
+        }
+        positions
+    }
+
+    /// The buses the firing has a name on, taken this run of its body or
+    /// before a pause: the ones it leaves when its body returns.
+    fn named_on(&self) -> Vec<Uuid> {
+        let mut buses: Vec<Uuid> = self
+            .restored
+            .iter()
+            .filter(|(_, position)| position.registered.is_some())
+            .filter_map(|(bus, _)| Uuid::parse_str(bus).ok())
+            .collect();
+        let live = self.positions.lock().expect("bus positions poisoned");
+        buses.extend(live.iter().filter(|(_, position)| position.registered.is_some()).map(|(bus, _)| *bus));
+        buses.sort_unstable();
+        buses.dedup();
+        buses
+    }
+
+    /// Open the firing's reader on `bus`, asked to start at `requested`:
+    /// it starts where it stopped before the pause, if it read there.
+    /// Answers its start and the slot it stands in. A second reader on
+    /// the bus in one run of the body, opened `at`, is refused with the
+    /// line that opened the first: the one position a firing saves per
+    /// bus could only bring one of them back.
+    fn open_cursor(
+        &self,
+        bus: &Arc<BusInner>,
+        requested: u64,
+        at: &'static std::panic::Location<'static>,
+    ) -> Result<(CursorStart, Arc<CursorSlot>), &'static std::panic::Location<'static>> {
+        let mut positions = self.positions.lock().expect("bus positions poisoned");
+        let live = positions.entry(bus.id).or_default();
+        if let Some((_, first)) = &live.cursor {
+            return Err(first);
+        }
+        let start = match self.restored.get(&bus.id.to_string()).and_then(|saved| saved.cursor) {
+            Some(offset) => CursorStart::Saved(offset),
+            None => CursorStart::Fresh(requested),
+        };
+        let slot = Arc::new(CursorSlot {
+            bus: Arc::downgrade(bus),
+            next_offset: AtomicU64::new(start.offset()),
+            carried: AtomicU64::new(0),
+            filter: Mutex::new(None),
+        });
+        live.cursor = Some((slot.clone(), at));
+        Ok((start, slot))
+    }
+
+    /// The firing holds `registration` on `bus`.
+    fn registered(&self, bus: Uuid, registration: Registration) {
+        self.positions.lock().expect("bus positions poisoned").entry(bus).or_default().registered = Some(registration);
+    }
+
+    /// The name the firing holds on `bus` now: taken this run of its body,
+    /// else held over its pause and not let go.
+    fn held_name(&self, bus: Uuid) -> Option<String> {
+        let live = self.positions.lock().expect("bus positions poisoned").get(&bus).and_then(|live| live.registered.clone());
+        live.or_else(|| self.restored.get(&bus.to_string()).and_then(|saved| saved.registered.clone())).map(|registration| registration.name)
+    }
+
+    /// The name the firing held on `bus` when it paused, if this run of its
+    /// body has neither taken it back nor let it go yet.
+    fn held_over_its_pause(&self, bus: Uuid) -> Option<Registration> {
+        let touched = self.positions.lock().expect("bus positions poisoned").get(&bus).is_some_and(|live| live.registered.is_some());
+        if touched {
+            return None;
+        }
+        self.restored.get(&bus.to_string()).and_then(|saved| saved.registered.clone())
+    }
+
 }
 
 impl Drop for BusHandle {
-    /// When a registered handle goes away, append a `Left` entry and
-    /// remove the name from the live set. Unregistered handles drop
-    /// with no log effect.
-    ///
-    /// The append and the `present_names` removal happen under the
-    /// same `log` lock as everything else. If the bus has already
-    /// been closed (the `Closed` entry has landed), we bail without
-    /// touching either: a closed bus does not accept further log
-    /// entries, and neither `wait_for*` nor a fresh `register` will
-    /// ever read `present_names` again on a closed bus, so the
-    /// cleanup would be dead work.
+    /// A registered handle going away leaves its name where it belongs.
+    /// A firing's name stays on the bus, the firing's, until its body
+    /// returns ([`FiringBuses::leave`]): dropping a handle mid-body, or
+    /// with a pause, is not leaving, and the firing's next handle
+    /// registering the name takes it back. A handle outside every firing
+    /// leaves with its name now, with its `Left` entry, ending the bus if
+    /// it was the last one on it ([`BusInner::leave_in`]).
     fn drop(&mut self) {
         let Some((name, _)) = self.registration.take() else { return };
         let mut log = self.inner.lock_log();
-        if self.inner.closed.load(Ordering::Acquire) {
-            // The bus is dead; no cursor or wait_for can read state
-            // from here on, so neither the Left entry nor the
-            // present_names removal is observable. Bail.
+        if self.member_firing().is_some() {
+            if let Some(member) = self.inner.members.lock().expect("bus members poisoned").get_mut(&name) {
+                member.in_hand = false;
+            }
             return;
         }
-        self.inner
-            .present_names
-            .lock()
-            .expect("present_names poisoned")
-            .remove(&name);
-        self.inner.push_entry(&mut log, BusEntryKind::Left { name });
+        self.inner.leave_in(&mut log, |member_name, _| member_name == name, StreamEnd::Finished);
     }
 }
 
@@ -1632,9 +2427,14 @@ impl Drop for BusHandle {
 
 type CursorFilter = Arc<dyn Fn(&BusEntry) -> bool + Send + Sync + 'static>;
 
-/// Independent read-cursor over a bus log. `next()` returns the next
-/// matching entry, `None` when the cursor reaches a `Closed` entry or
-/// the bus's inner has been reclaimed.
+/// Independent read-cursor over a bus log. `next(&mut state)` returns
+/// the next matching entry, `None` when the cursor reaches the `Closed`
+/// entry of a bus that finished or the bus's inner has been reclaimed,
+/// and the failure as an error when the bus ended failed. A read of a
+/// firing ends with the cancelled error when its run is cancelled.
+/// Every read is a place the
+/// run can pause, so it takes the firing's state
+/// ([`crate::context::PausePoint`]).
 ///
 /// Stores `Weak<BusInner>`, upgrades to `Arc` per `next()` call. The
 /// cursor never pins a bus alive on its own: a producer-side drop
@@ -1642,6 +2442,9 @@ type CursorFilter = Arc<dyn Fn(&BusEntry) -> bool + Send + Sync + 'static>;
 /// exists. The Arc is held only for the duration of one `next()`.
 pub struct BusCursor {
     inner: Weak<BusInner>,
+    /// The bus's id: what its reads are keyed by
+    /// (`crate::context::Places`).
+    bus: Uuid,
     next_offset: u64,
     filter: Option<CursorFilter>,
     /// The firing that owns this cursor (inherited from the
@@ -1649,20 +2452,37 @@ pub struct BusCursor {
     /// Keys this cursor's waits in the engine's liveness map, so a node
     /// parked in `next()` is correctly attributed.
     node: Option<FiringLocation>,
+    /// Where the firing's [`FiringBuses`] reads this cursor's next offset
+    /// (and its filter) when it saves; `None` outside a firing.
+    slot: Option<Arc<CursorSlot>>,
+    /// The cursor of a resumed firing starts below what the bus came back
+    /// from the pause without ([`BusHandle::cursor_at`]).
+    behind: bool,
+    /// The run's cancel, inherited from the firing
+    /// ([`FiringBuses::cancellation`]).
+    cancellation: Option<Arc<CancellationFlag>>,
 }
 
 impl BusCursor {
     fn new(
         inner: Weak<BusInner>,
+        bus: Uuid,
         next_offset: u64,
         filter: Option<CursorFilter>,
         node: Option<FiringLocation>,
+        slot: Option<Arc<CursorSlot>>,
+        behind: bool,
+        cancellation: Option<Arc<CancellationFlag>>,
     ) -> Self {
         Self {
             inner,
+            bus,
             next_offset,
             filter,
             node,
+            slot,
+            behind,
+            cancellation,
         }
     }
 
@@ -1675,7 +2495,14 @@ impl BusCursor {
     where
         F: Fn(&BusEntry) -> bool + Send + Sync + 'static,
     {
-        self.filter = Some(Arc::new(filter));
+        let filter: CursorFilter = Arc::new(filter);
+        if let Some(slot) = &self.slot {
+            let first = slot.filter.lock().unwrap_or_else(std::sync::PoisonError::into_inner).replace(filter.clone()).is_none();
+            if let (true, Some(inner)) = (first, slot.bus.upgrade()) {
+                inner.filtered_cursors.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(Arc::downgrade(slot));
+            }
+        }
+        self.filter = Some(filter);
         self
     }
 
@@ -1685,14 +2512,24 @@ impl BusCursor {
     }
 
     /// The next MESSAGE of kind `kind`, skipping membership entries and
-    /// other kinds: `(sender, payload)`, or `None` when the bus closes.
+    /// other kinds: `(sender, payload)`, `None` when the bus finishes, the
+    /// failure as an error when it ended failed.
     /// The typed read every plain consumer wants instead of matching
     /// the entry enum by hand. Composes with a constructed filter (both
     /// must accept).
-    pub async fn next_message(&mut self, kind: &str) -> Option<(String, WirePayload)> {
+    #[track_caller]
+    pub fn next_message<'a, P: PausePoint>(
+        &'a mut self,
+        kind: &'a str,
+        at: &'a mut P,
+    ) -> impl std::future::Future<Output = WeftResult<Option<(String, WirePayload)>>> + 'a {
+        self.next_message_at(kind, at, Point::direct("read a bus", std::panic::Location::caller()))
+    }
+
+    async fn next_message_at<P: PausePoint>(&mut self, kind: &str, at: &mut P, point: Point) -> WeftResult<Option<(String, WirePayload)>> {
         loop {
-            match self.next().await {
-                None => return None,
+            match self.next_at(at, point).await? {
+                None => return Ok(None),
                 Some(entry) => match entry.kind {
                     BusEntryKind::Message { from, msg_kind, payload, .. }
                         if msg_kind == kind =>
@@ -1701,7 +2538,7 @@ impl BusCursor {
                             "a cursor-delivered Message always carries its payload \
                              (ephemeral payloads are resolved before delivery)",
                         );
-                        return Some((from, payload));
+                        return Ok(Some((from, payload)));
                     }
                     _ => continue,
                 },
@@ -1711,38 +2548,52 @@ impl BusCursor {
 
     /// [`Self::next_message`] for a JSON bus: `(sender, value)`. The
     /// payload shape is frozen at bus creation, so a mismatch here is a
-    /// wiring bug (a bytes bus read as JSON), surfaced as a loud
-    /// `CursorError::WrongPayload` the caller must handle.
-    pub async fn next_json(
-        &mut self,
-        kind: &str,
-    ) -> Result<Option<(String, Value)>, CursorError> {
-        match self.next_message(kind).await {
-            None => Ok(None),
-            Some((from, payload)) => match payload.into_json() {
-                Some(value) => Ok(Some((from, value))),
-                None => Err(CursorError::WrongPayload { expected: "bytes", requested: "json" }),
-            },
+    /// wiring bug (a bytes bus read as JSON), and fails loudly. A reader
+    /// that hands the value outside weft, where a file or a secret in it
+    /// has to become what it stands for, reads it with
+    /// [`Self::next_message`] and [`WirePayload::into_typed_json`].
+    #[track_caller]
+    pub fn next_json<'a, P: PausePoint>(
+        &'a mut self,
+        kind: &'a str,
+        at: &'a mut P,
+    ) -> impl std::future::Future<Output = WeftResult<Option<(String, Value)>>> + 'a {
+        let point = Point::direct("read a bus", std::panic::Location::caller());
+        async move {
+            match self.next_message_at(kind, at, point).await? {
+                None => Ok(None),
+                Some((from, payload)) => match payload.into_json() {
+                    Some(value) => Ok(Some((from, value))),
+                    None => Err(wrong_payload("bytes", "json")),
+                },
+            }
         }
     }
 
     /// [`Self::next_message`] for a bytes bus: `(sender, bytes)`. A
-    /// JSON payload here is the same wiring bug in the other direction,
-    /// surfaced as `CursorError::WrongPayload`.
-    pub async fn next_bytes(
-        &mut self,
-        kind: &str,
-    ) -> Result<Option<(String, bytes::Bytes)>, CursorError> {
-        match self.next_message(kind).await {
-            None => Ok(None),
-            Some((from, payload)) => match payload.into_bytes() {
-                Some(bytes) => Ok(Some((from, bytes))),
-                None => Err(CursorError::WrongPayload { expected: "json", requested: "bytes" }),
-            },
+    /// JSON payload here is the same wiring bug in the other direction.
+    #[track_caller]
+    pub fn next_bytes<'a, P: PausePoint>(
+        &'a mut self,
+        kind: &'a str,
+        at: &'a mut P,
+    ) -> impl std::future::Future<Output = WeftResult<Option<(String, bytes::Bytes)>>> + 'a {
+        let point = Point::direct("read a bus", std::panic::Location::caller());
+        async move {
+            match self.next_message_at(kind, at, point).await? {
+                None => Ok(None),
+                Some((from, payload)) => match payload.into_bytes() {
+                    Some(bytes) => Ok(Some((from, bytes))),
+                    None => Err(wrong_payload("json", "bytes")),
+                },
+            }
         }
     }
 
-    /// Next matching entry, `None` on close (no more entries). A cursor
+    /// Next matching entry, `None` once the bus finished (no more
+    /// entries), the failure as an error once it ended failed: a reader
+    /// never takes a stream its producer broke off for a whole one. A
+    /// cursor
     /// pointing into a trimmed span (its offsets evicted from the
     /// in-RAM window) silently resumes at the next retained entry: only
     /// `Message` entries are ever trimmed, membership entries are
@@ -1761,11 +2612,34 @@ impl BusCursor {
     /// read-only and zero-copy on rejection); the lock is
     /// poison-recovering (see `BusInner::lock_log`) so a panicking
     /// filter fails only its own node, not every bus participant.
-    pub async fn next(&mut self) -> Option<BusEntry> {
-        let inner = self.inner.upgrade()?;
+    ///
+    /// When the run pauses while this waits, the firing's state is saved
+    /// with the cursor where it stands (nothing read) and the read
+    /// returns the suspension the body hands back with `?`. When the run
+    /// is cancelled, the read ends with the cancelled error, nothing read.
+    #[track_caller]
+    pub fn next<'a, P: PausePoint>(&'a mut self, at: &'a mut P) -> impl std::future::Future<Output = WeftResult<Option<BusEntry>>> + 'a {
+        self.next_at(at, Point::direct("read a bus", std::panic::Location::caller()))
+    }
+
+    async fn next_at<P: PausePoint>(&mut self, at: &mut P, point: Point) -> WeftResult<Option<BusEntry>> {
+        at.before(&point.on(self.bus.as_u128()), self.node.is_some())?;
+        if self.behind {
+            return Err(WeftError::NodeFailed(
+                "this node paused with messages of a bus it had not read yet, and the bus no longer holds them \
+                 (a bus keeps only its last window of messages, and over a pause an ephemeral bus keeps none and a \
+                 journaled one only those of that window after the newest one over 100 KB): it cannot read on as if \
+                 it had them. \
+                 Make the bus journaled with a window that holds what a reader may fall behind by, or hold the run \
+                 while reading it (`ctx.hold()`)"
+                    .into(),
+            ));
+        }
+        let pausable = at.pausable();
+        let Some(inner) = self.inner.upgrade() else { return Ok(None) };
         // One destructure splits the borrows: the closure takes the
         // cursor position and filter, the wait keeps the node identity.
-        let Self { next_offset, filter, node, .. } = self;
+        let Self { next_offset, filter, node, slot, cancellation, .. } = self;
         // The full search under the log lock is the wait condition:
         // `Some(Some(entry))` on a hit, `Some(None)` at end-of-stream,
         // `None` parks. The shared protocol (`liveness::wait_on`)
@@ -1774,7 +2648,11 @@ impl BusCursor {
         // wakeup, and "observed == current" provably means "this
         // waiter saw everything and still parked".
         let search_inner = inner.clone();
+        // A reborrow the search moves in, so the position is the
+        // cursor's own again once the wait is over (the slot reads it).
+        let next_offset_now = &mut *next_offset;
         let evaluate = move || -> Option<Option<BusEntry>> {
+            let next_offset = &mut *next_offset_now;
             let log = search_inner.lock_log();
             // The scan starts at the first RETAINED entry at or past the
             // cursor's offset: an offset inside a trimmed span (only
@@ -1790,43 +2668,7 @@ impl BusCursor {
                     *next_offset = entry.offset;
                     return Some(None);
                 }
-                let needs_ephemeral_resolve = matches!(
-                    &entry.kind,
-                    BusEntryKind::Message { payload, .. } if payload.is_none()
-                );
-                let resolved_entry: Option<BusEntry> = if needs_ephemeral_resolve {
-                    let store = search_inner.ephemeral_store.as_ref().expect(
-                        "Message with payload=None on a non-ephemeral bus is impossible \
-                         by construction (send routes ephemeral payloads into the store)",
-                    );
-                    // A RETAINED Message always has a resident
-                    // payload (send evicts the log entry in the
-                    // same locked section that evicts the
-                    // payload); a miss panics inside
-                    // `get_resident`.
-                    let value = store.get_resident(entry.offset);
-                    let BusEntryKind::Message {
-                        from,
-                        msg_kind,
-                        payload_byte_size,
-                        ..
-                    } = &entry.kind
-                    else {
-                        unreachable!("needs_ephemeral_resolve guards Message variant");
-                    };
-                    Some(BusEntry {
-                        offset: entry.offset,
-                        at_unix: entry.at_unix,
-                        kind: BusEntryKind::Message {
-                            from: from.clone(),
-                            msg_kind: msg_kind.clone(),
-                            payload: Some(value),
-                            payload_byte_size: *payload_byte_size,
-                        },
-                    })
-                } else {
-                    None
-                };
+                let resolved_entry = search_inner.resolve_ephemeral(entry);
                 let entry_for_filter: &BusEntry = resolved_entry.as_ref().unwrap_or(entry);
                 let allow = filter.as_ref().is_none_or(|f| f(entry_for_filter));
                 if !allow {
@@ -1841,7 +2683,7 @@ impl BusCursor {
             // filter-rejected entries are not rescanned). Never moved
             // backward so a cursor positioned past the tail keeps its
             // place.
-            *next_offset = (*next_offset).max(log.last().map(|e| e.offset + 1).unwrap_or(0));
+            *next_offset = (*next_offset).max(search_inner.next_offset.load(Ordering::Acquire));
             if search_inner.closed.load(Ordering::Acquire) {
                 // The log is closed and this cursor is at (or started
                 // past) its tail. Under the log lock, `closed` implies
@@ -1853,8 +2695,51 @@ impl BusCursor {
             None
         };
         let source = inner.clone() as Arc<dyn WaitSource>;
-        wait_on(&inner.liveness, node, &source, evaluate).await
+        let wait = wait_or_pause(&inner.liveness, node, &source, pausable, evaluate);
+        // The cancel is checked first, so a read of a cancelled run never
+        // hands out one more entry.
+        let read = match cancellation.as_deref() {
+            Some(cancellation) => tokio::select! {
+                biased;
+                () = cancellation.cancelled() => None,
+                read = wait => Some(read),
+            },
+            None => Some(wait.await),
+        };
+        if let Some(slot) = slot {
+            slot.next_offset.store(*next_offset, Ordering::Release);
+        }
+        match read {
+            None => Err(WeftError::Cancelled),
+            Some(Ok(Some(entry))) => Ok(Some(entry)),
+            Some(Ok(None)) => match inner.end() {
+                Some(StreamEnd::Failed { error }) => Err(WeftError::NodeFailed(format!("the bus ended failed: {error}"))),
+                Some(StreamEnd::Finished) | None => Ok(None),
+            },
+            Some(Err(crate::liveness::Paused)) => Err(at.paused().await),
+        }
     }
+}
+
+impl crate::context::kept::sealed::Sealed for BusCursor {}
+
+/// A bus reader read through the state (`Kept::read`): the next entry.
+impl crate::context::StateRead for BusCursor {
+    type Item = BusEntry;
+
+    fn read_through<'a, P: PausePoint>(
+        &'a mut self,
+        at: &'a mut P,
+        point: Point,
+    ) -> impl std::future::Future<Output = WeftResult<Option<BusEntry>>> + Send + 'a {
+        self.next_at(at, point)
+    }
+}
+
+/// A typed read that asked for one payload shape on a bus carrying the
+/// other: the shape is frozen at creation, so this is a wiring bug.
+fn wrong_payload(expected: &str, requested: &str) -> WeftError {
+    WeftError::NodeFailed(format!("this bus carries {expected} payloads, not {requested}"))
 }
 
 // ----- Registry --------------------------------------------------------
@@ -1906,11 +2791,13 @@ impl BusRegistry {
 
     /// Resolve a marker JSON value to a fresh consumer handle attributed
     /// to the resolving firing `node` (whose identity keys its
-    /// own bus liveness). Errors loud on every failure mode.
+    /// own bus liveness) and its [`FiringBuses`]. Errors loud on every
+    /// failure mode.
     pub fn lookup(
         &self,
         marker: &Value,
         node: Option<FiringLocation>,
+        firing: Option<Arc<FiringBuses>>,
     ) -> Result<BusHandle, BusLookupError> {
         let id_str = crate::weft_type::WeftType::bus_marker_id(marker)
             .ok_or(BusLookupError::NotABusMarker)?;
@@ -1923,7 +2810,18 @@ impl BusRegistry {
             .get(&id)
             .map(Arc::clone)
             .ok_or(BusLookupError::UnknownBus(id))?;
-        Ok(BusHandle::from_inner(inner, node))
+        Ok(BusHandle::from_inner(inner, node, firing))
+    }
+
+    /// A handle on the bus `id` for the firing `node`, if the run holds
+    /// it.
+    pub fn handle(&self, id: Uuid, node: Option<FiringLocation>, firing: Option<Arc<FiringBuses>>) -> Option<BusHandle> {
+        Some(BusHandle::from_inner(self.bus(id)?, node, firing))
+    }
+
+    /// The bus `id`, if the run holds it.
+    pub fn bus(&self, id: Uuid) -> Option<Arc<BusInner>> {
+        self.inner.lock().expect("BusRegistry mutex poisoned").get(&id).map(Arc::clone)
     }
 
     /// Snapshot every currently-live bus as `Weak<BusInner>` for the
@@ -1981,6 +2879,7 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::HarnessRead;
     use serde_json::json;
 
     fn registered(bus: &BusHandle, name: &str) -> BusHandle {
@@ -2005,13 +2904,13 @@ mod tests {
         })
         .unwrap();
         let producer = registered(&bus, "mic");
-        let mut cursor = bus.cursor();
+        let mut cursor = bus.cursor().unwrap();
 
         // The wrong shape is refused loudly; the right one flows as bytes.
         let err = producer.send("frame", json!({"x": 1})).unwrap_err();
         assert!(matches!(err, SendError::WrongPayload { expected: "bytes", sent: "json" }));
         producer.send_bytes("frame", vec![1u8, 2, 3]).unwrap();
-        let (from, frame) = cursor.next_bytes("frame").await.unwrap().unwrap();
+        let (from, frame) = cursor.next_bytes("frame", &mut HarnessRead).await.unwrap().unwrap();
         assert_eq!((from.as_str(), frame.as_ref()), ("mic", &[1u8, 2, 3][..]));
 
         // The declared parameters read back off the handle; the marker
@@ -2127,85 +3026,243 @@ mod tests {
         })
         .unwrap();
         let mic = registered(&bytes_bus, "mic");
-        let mut c = bytes_bus.cursor();
+        let mut c = bytes_bus.cursor().unwrap();
         mic.send_bytes("frame", vec![1u8, 2]).unwrap();
-        assert_eq!(
-            c.next_json("frame").await.unwrap_err(),
-            CursorError::WrongPayload { expected: "bytes", requested: "json" }
-        );
+        assert_eq!(c.next_json("frame", &mut HarnessRead).await.unwrap_err().to_string(), wrong_payload("bytes", "json").to_string());
 
         let json_bus = BusHandle::create();
         let chat = registered(&json_bus, "chat");
-        let mut c = json_bus.cursor();
+        let mut c = json_bus.cursor().unwrap();
         chat.send("msg", json!("hi")).unwrap();
-        assert_eq!(
-            c.next_bytes("msg").await.unwrap_err(),
-            CursorError::WrongPayload { expected: "json", requested: "bytes" }
-        );
+        assert_eq!(c.next_bytes("msg", &mut HarnessRead).await.unwrap_err().to_string(), wrong_payload("json", "bytes").to_string());
     }
 
-    /// A firing's buses end with its body: a reader drains what was sent,
-    /// then reads how the bus ended. Dropping the handle ends nothing
-    /// on its own; the body's end does.
+    /// `firing`'s body, at `node`, returned as `end`: its names leave
+    /// `bus`, the one bus the test knows.
+    fn left(firing: &FiringBuses, node: &str, end: StreamEnd, bus: &BusHandle) {
+        let inner = bus.inner_arc();
+        firing.leave(&at(node), end, |id| (id == inner.id()).then(|| inner.clone()));
+    }
+
+    /// A member of `bus` at `node`, registered as `node`, with its firing.
+    fn member(bus: &BusHandle, node: &str) -> (BusHandle, Arc<FiringBuses>) {
+        let firing = Arc::new(FiringBuses::default());
+        let mut handle = firing_handle(bus, node, &firing);
+        handle.register(node).unwrap();
+        (handle, firing)
+    }
+
+    /// The creator returning leaves the bus to a member still on it: its
+    /// name leaves, and nothing else happens. The last one leaving ends it
+    /// finished.
     #[tokio::test]
-    async fn a_firings_buses_end_with_its_body() {
-        let firing = FiringBuses::default();
+    async fn a_bus_lives_until_its_last_member_leaves() {
         let bus = BusHandle::create();
-        let mut cursor = bus.cursor();
-        let host = registered(&bus, "host");
-        firing.hold(&host);
+        let mut reader = bus.cursor().unwrap();
+        let (host, host_firing) = member(&bus, "host");
+        let (guest, guest_firing) = member(&bus, "guest");
         host.send("hi", json!(1)).unwrap();
         drop(host);
-        assert!(!bus.is_closed(), "a dropped handle leaves the bus to the body's end");
-        firing.end(StreamEnd::Failed { error: "the model went away".into() });
-        assert!(matches!(cursor.next_json("hi").await, Ok(Some((_, v))) if v == json!(1)));
-        assert!(cursor.next_json("hi").await.unwrap().is_none(), "ended by the body");
+        left(&host_firing, "host", StreamEnd::Finished, &bus);
+        assert!(!bus.is_closed(), "the guest is still on it");
+        assert!(matches!(&bus.inner.lock_log().last().unwrap().kind, BusEntryKind::Left { name, .. } if name == "host"));
+        guest.send("hi", json!(2)).unwrap();
+        drop(guest);
+        left(&guest_firing, "guest", StreamEnd::Finished, &bus);
+        assert_eq!(bus.end(), Some(StreamEnd::Finished), "the last member left");
+        let mut read = Vec::new();
+        while let Some((_, value)) = reader.next_json("hi", &mut HarnessRead).await.unwrap() {
+            read.push(value);
+        }
+        assert_eq!(read, vec![json!(1), json!(2)], "both messages, then the end");
+    }
+
+    /// A bus whose last member left failing ends failed with its error: a
+    /// reader drains what was sent, then reads the failure, so a stream
+    /// whose only producer crashed never reads as whole.
+    #[tokio::test]
+    async fn the_last_member_leaving_failed_ends_the_bus_failed() {
+        let bus = BusHandle::create();
+        let mut reader = bus.cursor().unwrap();
+        let (host, firing) = member(&bus, "host");
+        host.send("hi", json!(1)).unwrap();
+        drop(host);
+        assert!(!bus.is_closed(), "a firing dropping its handle is not leaving");
+        left(&firing, "host", StreamEnd::Failed { error: "the model went away".into() }, &bus);
+        assert!(matches!(reader.next_json("hi", &mut HarnessRead).await, Ok(Some((_, v))) if v == json!(1)));
+        let failed = reader.next_json("hi", &mut HarnessRead).await.unwrap_err();
+        assert!(matches!(&failed, WeftError::NodeFailed(why) if why.contains("the model went away")), "{failed}");
         assert_eq!(bus.end(), Some(StreamEnd::Failed { error: "the model went away".into() }));
     }
 
-    /// The first end stands: a bus closed on purpose stays finished when
-    /// the body then fails, a second end changes nothing, and a bus taken
-    /// after the body ended ends at once the same way.
+    /// A member that fails just leaves: the others stay on an open bus (one
+    /// of them may be how the conversation recovers), and the bus ends as
+    /// its last member returns, finished here, not as the earlier failure.
     #[test]
-    fn the_first_end_stands() {
-        let firing = FiringBuses::default();
-        let done_early = BusHandle::create();
+    fn a_failing_member_leaves_the_others_an_open_bus() {
+        let bus = BusHandle::create();
+        let (_host, host_firing) = member(&bus, "host");
+        let (_guest, guest_firing) = member(&bus, "guest");
+        left(&guest_firing, "guest", StreamEnd::Failed { error: "the guest broke".into() }, &bus);
+        assert!(!bus.is_closed(), "a member failing does not end the bus");
+        left(&host_firing, "host", StreamEnd::Finished, &bus);
+        assert_eq!(bus.end(), Some(StreamEnd::Finished), "it ends as the last one to leave returned");
+    }
+
+    /// Any node holding the bus may end it, a member or not, whoever is
+    /// still on it; the first end stands, so members leaving after (failed
+    /// or not) change nothing, and a firing leaves only once.
+    #[test]
+    fn a_close_ends_the_bus_for_everyone_and_the_first_end_stands() {
+        let bus = BusHandle::create();
+        let (_host, host_firing) = member(&bus, "host");
+        let (_guest, guest_firing) = member(&bus, "guest");
+        let closer = firing_handle(&bus, "closer", &Arc::new(FiringBuses::default()));
+        closer.close();
+        assert_eq!(bus.end(), Some(StreamEnd::Finished));
+        let after = bus.inner.log_len();
+        left(&guest_firing, "guest", StreamEnd::Failed { error: "boom".into() }, &bus);
+        left(&host_firing, "host", StreamEnd::Failed { error: "boom".into() }, &bus);
+        assert_eq!(bus.end(), Some(StreamEnd::Finished), "the close stands");
+        assert_eq!(bus.inner.log_len(), after, "an ended bus takes no entry");
+
         let open = BusHandle::create();
-        firing.hold(&done_early);
-        firing.hold(&open);
-        done_early.close();
-        firing.end(StreamEnd::Failed { error: "boom".into() });
-        firing.end(StreamEnd::Finished);
-        assert_eq!(done_early.end(), Some(StreamEnd::Finished));
-        assert_eq!(open.end(), Some(StreamEnd::Failed { error: "boom".into() }));
-        let late = BusHandle::create();
-        firing.hold(&late);
-        assert_eq!(late.end(), Some(StreamEnd::Failed { error: "boom".into() }));
+        let (_a, firing) = member(&open, "a");
+        let (_b, _) = member(&open, "b");
+        left(&firing, "a", StreamEnd::Finished, &open);
+        let after = open.inner.log_len();
+        left(&firing, "a", StreamEnd::Failed { error: "again".into() }, &open);
+        assert_eq!(open.inner.log_len(), after, "a firing leaves once");
+        let mut late = firing_handle(&open, "a", &firing);
+        assert_eq!(late.register("a"), Err(RegisterError::FiringLeft("a".into())), "a body that returned cannot join for it after");
         assert_eq!(BusHandle::create().end(), None, "an open bus has no end yet");
     }
 
-    /// Only a body that returned ends its buses finished; a pause, a
-    /// skip or any failure ends them failed.
+    /// A close on an open bus nobody is on ends it the way its last member
+    /// left: failed with that member's error here, a bus that paused while
+    /// a node could still join it after its only member left failing. A
+    /// bus nobody ever joined ends finished.
+    #[tokio::test]
+    async fn a_close_with_nobody_on_the_bus_ends_it_as_its_last_member_left() {
+        let failure = StreamEnd::Failed { error: "the producer broke off".into() };
+        let bus = BusHandle::reopen(
+            ReopenedBus {
+                id: Uuid::new_v4(),
+                opts: BusOptions::default(),
+                next_offset: 3,
+                joined: vec!["host".into()],
+                members: Vec::new(),
+                retained: Vec::new(),
+                lost_through: 3,
+                end: None,
+                last_left: Some(failure.clone()),
+            },
+            no_liveness(),
+            Weak::<Notify>::new(),
+        )
+        .unwrap();
+        assert!(!bus.is_closed(), "open, with nobody on it");
+        firing_handle(&bus, "closer", &Arc::new(FiringBuses::default())).close();
+        assert_eq!(bus.end(), Some(failure), "it ends as its last member left");
+        let error = bus.cursor_from_start().unwrap().next(&mut HarnessRead).await.unwrap_err().to_string();
+        assert!(error.contains("the bus ended failed: the producer broke off"), "{error}");
+
+        let never_joined = BusHandle::create();
+        never_joined.close();
+        assert_eq!(never_joined.end(), Some(StreamEnd::Finished), "nobody ever joined");
+    }
+
+    /// A reader that never registers is no member: it keeps nothing open,
+    /// and its firing leaving changes nothing on the bus.
+    #[test]
+    fn an_observer_keeps_nothing_open() {
+        let bus = BusHandle::create();
+        let watcher_firing = Arc::new(FiringBuses::default());
+        let watcher = firing_handle(&bus, "watcher", &watcher_firing);
+        let _cursor = watcher.cursor().unwrap();
+        let (_host, host_firing) = member(&bus, "host");
+        left(&watcher_firing, "watcher", StreamEnd::Failed { error: "the tap broke".into() }, &bus);
+        assert!(!bus.is_closed(), "the watcher was never on it");
+        left(&host_firing, "host", StreamEnd::Finished, &bus);
+        assert_eq!(bus.end(), Some(StreamEnd::Finished), "the host was its only member, whoever still reads");
+    }
+
+    /// A name outside every firing (a test's handle) leaves with its
+    /// handle, and the last one leaving that way ends the bus finished.
+    #[test]
+    fn a_handle_outside_a_firing_leaves_with_its_name() {
+        let bus = BusHandle::create();
+        let a = registered(&bus, "a");
+        let b = registered(&bus, "b");
+        drop(a);
+        let _again = registered(&bus, "a");
+        drop(b);
+        assert!(!bus.is_closed(), "the second 'a' is still on it");
+        drop(_again);
+        assert_eq!(bus.end(), Some(StreamEnd::Finished));
+    }
+
+    /// A bus that finished reads to `None` after its last message; one
+    /// that ended failed hands its failure to every reader, also one that
+    /// opens after the end.
+    #[tokio::test]
+    async fn a_failed_bus_reads_as_its_failure() {
+        let finished = BusHandle::create();
+        let mut reader = finished.cursor().unwrap();
+        registered(&finished, "host").send("hi", json!(1)).unwrap();
+        finished.close();
+        assert!(reader.next_json("hi", &mut HarnessRead).await.unwrap().is_some());
+        assert!(reader.next_json("hi", &mut HarnessRead).await.unwrap().is_none());
+
+        let failed = BusHandle::create();
+        failed.inner_arc().close(StreamEnd::Failed { error: "the producer broke off".into() });
+        let mut late = failed.cursor_from_start().unwrap();
+        let error = late.next(&mut HarnessRead).await.unwrap_err();
+        assert!(matches!(&error, WeftError::NodeFailed(why) if why.contains("the producer broke off")), "{error}");
+    }
+
+    /// A reader of a firing waiting on a quiet bus ends with the cancelled
+    /// error the moment its run is cancelled, and a read asked after the
+    /// cancel ends at once, even with a message waiting.
+    #[tokio::test]
+    async fn a_read_ends_cancelled_when_the_run_is_cancelled() {
+        let cancellation = CancellationFlag::new_arc();
+        let firing = Arc::new(FiringBuses::default().cancelled_by(cancellation.clone()));
+        let bus = BusHandle::create();
+        let mut reader = BusHandle::from_inner(bus.inner_arc(), None, Some(firing)).cursor().unwrap();
+        let waiting = tokio::spawn(async move {
+            let read = reader.next(&mut HarnessRead).await;
+            (read, reader)
+        });
+        tokio::task::yield_now().await;
+        cancellation.cancel_because(crate::run::CancelCause::User);
+        let (read, mut reader) = tokio::time::timeout(std::time::Duration::from_secs(5), waiting).await.unwrap().unwrap();
+        assert!(matches!(read, Err(WeftError::Cancelled)), "{read:?}");
+        registered(&bus, "host").send("hi", json!(1)).unwrap();
+        assert!(matches!(reader.next(&mut HarnessRead).await, Err(WeftError::Cancelled)));
+    }
+
+    /// Only a body that returned leaves its buses finished; a skip or any
+    /// failure leaves them failed, and a pause leaves nothing (the body
+    /// carries on from its state, a member still).
     #[test]
     fn a_body_end_follows_how_it_returned() {
-        use crate::error::WeftError;
-        assert_eq!(body_end(&Ok(())), StreamEnd::Finished);
-        assert!(
-            matches!(body_end(&Err(WeftError::Suspended { token: "t".into() })), StreamEnd::Failed { error } if error.contains("paused")),
-        );
-        assert!(matches!(body_end(&Err(WeftError::WaitSkipped("w".into()))), StreamEnd::Failed { .. }));
+        assert_eq!(body_end(&Ok(())), Some(StreamEnd::Finished));
+        assert_eq!(body_end(&Err(WeftError::Suspended { token: Some("t".into()) })), None);
+        assert_eq!(body_end(&Err(WeftError::Suspended { token: None })), None);
+        assert!(matches!(body_end(&Err(WeftError::WaitSkipped("w".into()))), Some(StreamEnd::Failed { .. })));
         assert_eq!(
             body_end(&Err(WeftError::NodeFailed("the model went away".into()))),
-            StreamEnd::Failed { error: WeftError::NodeFailed("the model went away".into()).to_string() }
+            Some(StreamEnd::Failed { error: WeftError::NodeFailed("the model went away".into()).to_string() })
         );
-        assert!(matches!(body_end(&Err(WeftError::Cancelled)), StreamEnd::Failed { .. }));
+        assert!(matches!(body_end(&Err(WeftError::Cancelled)), Some(StreamEnd::Failed { .. })));
     }
 
     /// Drive `cursor` until its next Message entry; skips Joined/Left.
     /// Returns `(from, kind, payload)` or None on close.
     async fn next_message(cursor: &mut BusCursor) -> Option<(String, String, Value)> {
         loop {
-            match cursor.next().await {
+            match cursor.next(&mut crate::context::kept::FiringRead).await.unwrap() {
                 None => return None,
                 Some(entry) => match entry.kind {
                     BusEntryKind::Message { from, msg_kind, payload, .. } => {
@@ -2222,7 +3279,7 @@ mod tests {
         let bus = BusHandle::create();
         let stt = registered(&bus, "stt");
         let consumer = registered(&bus, "llm");
-        let mut cursor = consumer.cursor();
+        let mut cursor = consumer.cursor().unwrap();
         stt.send("transcript", json!({ "text": "hi" })).unwrap();
         let (from, kind, payload) = next_message(&mut cursor).await.unwrap();
         assert_eq!(from, "stt");
@@ -2235,7 +3292,7 @@ mod tests {
         let bus = BusHandle::create();
         let llm = registered(&bus, "llm");
         let rx = registered(&bus, "rx");
-        let mut cursor = rx.cursor();
+        let mut cursor = rx.cursor().unwrap();
         llm.send("response", json!("hi")).unwrap();
         assert_eq!(next_message(&mut cursor).await.unwrap().0, "llm");
     }
@@ -2274,7 +3331,7 @@ mod tests {
         let bus = BusHandle::create();
         let waiter = bus.new_handle();
         let bus2 = bus.new_handle();
-        let wait = tokio::spawn(async move { waiter.wait_for("llm").await });
+        let wait = tokio::spawn(async move { waiter.wait_for("llm", &mut HarnessRead).await });
         tokio::task::yield_now().await;
         let _llm = registered(&bus2, "llm");
         assert!(wait.await.unwrap().is_ok());
@@ -2288,17 +3345,17 @@ mod tests {
         let _host = registered(&bus, "host");
         let guest = bus.new_handle();
         // No yield needed; the Joined entry is in the log.
-        assert!(guest.wait_for("host").await.is_ok());
+        assert!(guest.wait_for("host", &mut HarnessRead).await.is_ok());
     }
 
     #[tokio::test]
     async fn wait_for_errors_on_close() {
         let bus = BusHandle::create();
         let waiter = bus.new_handle();
-        let wait = tokio::spawn(async move { waiter.wait_for("llm").await });
+        let wait = tokio::spawn(async move { waiter.wait_for("llm", &mut HarnessRead).await });
         tokio::task::yield_now().await;
         bus.close();
-        assert_eq!(wait.await.unwrap().unwrap_err(), WaitError::Closed);
+        assert!(wait.await.unwrap().unwrap_err().to_string().contains("the bus closed before 'llm' joined it"));
     }
 
     #[tokio::test]
@@ -2306,7 +3363,7 @@ mod tests {
         let bus = BusHandle::create();
         let stt = registered(&bus, "stt");
         let consumer = registered(&bus, "llm");
-        let mut cursor = consumer.cursor();
+        let mut cursor = consumer.cursor().unwrap();
         bus.close();
         assert_eq!(stt.send("late", json!(null)), Err(SendError::Closed));
         assert!(next_message(&mut cursor).await.is_none());
@@ -2316,7 +3373,7 @@ mod tests {
     async fn close_unblocks_a_waiting_cursor() {
         let bus = BusHandle::create();
         let consumer = registered(&bus, "llm");
-        let mut cursor = consumer.cursor();
+        let mut cursor = consumer.cursor().unwrap();
         let recv_task = tokio::spawn(async move { next_message(&mut cursor).await });
         tokio::task::yield_now().await;
         bus.close();
@@ -2328,7 +3385,7 @@ mod tests {
         let bus = BusHandle::create();
         let stt = registered(&bus, "stt");
         let consumer = registered(&bus, "llm");
-        let mut cursor = consumer.cursor();
+        let mut cursor = consumer.cursor().unwrap();
         stt.send("a", json!(1)).unwrap();
         stt.send("b", json!(2)).unwrap();
         bus.close();
@@ -2343,8 +3400,8 @@ mod tests {
         let stt = registered(&bus, "stt");
         let a = registered(&bus, "llm");
         let b = registered(&bus, "tts");
-        let mut ca = a.cursor();
-        let mut cb = b.cursor();
+        let mut ca = a.cursor().unwrap();
+        let mut cb = b.cursor().unwrap();
         stt.send("m", json!(1)).unwrap();
         assert_eq!(next_message(&mut ca).await.unwrap().2, json!(1));
         assert_eq!(next_message(&mut cb).await.unwrap().2, json!(1));
@@ -2366,7 +3423,7 @@ mod tests {
                 let waiter = bus.new_handle();
                 let registrar = bus.new_handle();
                 drop(bus);
-                let wait = tokio::spawn(async move { waiter.wait_for("peer").await });
+                let wait = tokio::spawn(async move { waiter.wait_for("peer", &mut HarnessRead).await });
                 let reg = tokio::spawn(async move {
                     let mut h = registrar;
                     h.register("peer").unwrap();
@@ -2382,20 +3439,6 @@ mod tests {
         }
     );
 
-    #[tokio::test]
-    async fn dropping_a_registered_handle_unregisters_it() {
-        let bus = BusHandle::create();
-        let llm = registered(&bus, "llm");
-        assert!(bus.wait_for("llm").await.is_ok());
-        drop(llm);
-        // The new wait_for reads the `ever_joined` set, so it would still
-        // find the past Joined. The honest "is the name live RIGHT NOW"
-        // signal is `present_names`; we exercise it indirectly via
-        // wait_for_all_releases_on_complete_set.
-        // For this regression we assert membership-set hygiene:
-        let _new_llm = registered(&bus, "llm"); // not NameTaken
-    }
-
     // ----- New shape: cursors + offsets + log entries -------------
 
     #[tokio::test]
@@ -2404,10 +3447,10 @@ mod tests {
         let p = registered(&bus, "p");
         p.send("a", json!(1)).unwrap();
         p.send("b", json!(2)).unwrap();
-        let mut c = bus.cursor_from_start();
+        let mut c = bus.cursor_from_start().unwrap();
         let mut offsets = Vec::new();
         for _ in 0..3 {
-            let e = c.next().await.unwrap();
+            let e = c.next(&mut HarnessRead).await.unwrap().unwrap();
             offsets.push(e.offset);
         }
         assert_eq!(offsets, vec![0, 1, 2]);
@@ -2419,10 +3462,10 @@ mod tests {
         let p = registered(&bus, "p");
         p.send("a", json!(1)).unwrap();
         p.send("b", json!(2)).unwrap();
-        let mut c = bus.cursor_from_start().with_filter(|e| {
+        let mut c = bus.cursor_from_start().unwrap().with_filter(|e| {
             matches!(&e.kind, BusEntryKind::Message { msg_kind, .. } if msg_kind == "b")
         });
-        let e = c.next().await.unwrap();
+        let e = c.next(&mut HarnessRead).await.unwrap().unwrap();
         match e.kind {
             BusEntryKind::Message { msg_kind, .. } => assert_eq!(msg_kind, "b"),
             _ => panic!("expected Message"),
@@ -2440,10 +3483,10 @@ mod tests {
         // The log is Joined, Message, Closed. The cursor returns the
         // first two, then `None` on the Closed.
         drop(p);
-        let mut c = bus.cursor_from_start();
-        let _joined = c.next().await.unwrap();
-        let _msg = c.next().await.unwrap();
-        assert!(c.next().await.is_none());
+        let mut c = bus.cursor_from_start().unwrap();
+        let _joined = c.next(&mut HarnessRead).await.unwrap().unwrap();
+        let _msg = c.next(&mut HarnessRead).await.unwrap().unwrap();
+        assert!(c.next(&mut HarnessRead).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -2473,10 +3516,10 @@ mod tests {
             BusHandle::create_with_options(BusOptions { journal: crate::stream_journal::JournalPolicy::ephemeral(), window: Some(8), ..Default::default() }).expect("valid options");
         let p = registered(&bus, "p");
         p.send("frame", json!({ "n": 1 })).unwrap();
-        let mut c = bus.cursor_from_start();
+        let mut c = bus.cursor_from_start().unwrap();
         // skip the Joined
-        let _j = c.next().await.unwrap();
-        let m = c.next().await.unwrap();
+        let _j = c.next(&mut HarnessRead).await.unwrap().unwrap();
+        let m = c.next(&mut HarnessRead).await.unwrap().unwrap();
         match m.kind {
             BusEntryKind::Message { payload, .. } => {
                 assert_eq!(payload.unwrap(), WirePayload::Json(json!({ "n": 1 })));
@@ -2496,17 +3539,17 @@ mod tests {
         // Create the cursor BEFORE sends so it starts at the joined-only
         // tail; the test exercises a consumer reading slowly enough that
         // the store evicts.
-        let mut c = bus.cursor_from_start();
+        let mut c = bus.cursor_from_start().unwrap();
         for i in 0..6 {
             p.send("frame", json!({ "i": i })).unwrap();
         }
         // First next() is the Joined entry (always retained, never in the
         // ephemeral store).
-        let _j = c.next().await.unwrap();
+        let _j = c.next(&mut HarnessRead).await.unwrap().unwrap();
         // Offsets 1..=4 were evicted (window=2 keeps 5,6). The cursor
         // bridges the gap silently: the next read delivers the oldest
         // RETAINED message (i=4 at offset 5), then the tail one.
-        let m = c.next().await.expect("a retained message");
+        let m = c.next(&mut HarnessRead).await.unwrap().expect("a retained message");
         let BusEntryKind::Message { payload, .. } = m.kind else { panic!("expected Message") };
         assert_eq!(m.offset, 5, "resumes at the oldest retained message, never backward");
         assert_eq!(payload.unwrap(), WirePayload::Json(json!({ "i": 4 })));
@@ -2536,10 +3579,10 @@ mod tests {
     #[tokio::test]
     async fn gap_bridging_never_skips_a_joined_entry() {
         let bus = sparse_membership_bus();
-        let mut c = bus.cursor_from_start();
+        let mut c = bus.cursor_from_start().unwrap();
         let (mut joins, mut live) = (0u32, 0u32);
         for _ in 0..10 {
-            match c.next().await {
+            match c.next(&mut HarnessRead).await.unwrap() {
                 Some(entry) => match entry.kind {
                     BusEntryKind::Joined { .. } => joins += 1,
                     BusEntryKind::Message { .. } => { live += 1; break; }
@@ -2583,7 +3626,7 @@ mod tests {
 
     /// Helper for the resume test: one read off a fresh cursor at `offset`.
     async fn cur_next(bus: &BusHandle, offset: u64) -> BusEntry {
-        bus.cursor_at(offset).next().await.expect("an entry")
+        bus.cursor_at(offset).unwrap().next(&mut HarnessRead).await.unwrap().expect("an entry")
     }
 
     #[tokio::test]
@@ -2679,10 +3722,11 @@ mod tests {
         // Tail-anchored cursor on an unregistered handle: starts past
         // the Closed entry.
         let observer = bus.new_handle();
-        let mut c = observer.cursor();
-        let r = tokio::time::timeout(std::time::Duration::from_millis(500), c.next())
+        let mut c = observer.cursor().unwrap();
+        let r = tokio::time::timeout(std::time::Duration::from_millis(500), c.next(&mut HarnessRead))
             .await
-            .expect("must resolve, not spin");
+            .expect("must resolve, not spin")
+            .unwrap();
         assert!(r.is_none(), "end-of-stream");
     }
 
@@ -2700,12 +3744,13 @@ mod tests {
         // guest mints its cursor.
         let host = registered(&bus, "host");
         host.send("hello", json!("first")).unwrap();
-        let mut c = guest.cursor().with_filter(|e| {
+        let mut c = guest.cursor().unwrap().with_filter(|e| {
             matches!(&e.kind, BusEntryKind::Message { from, .. } if from == "host")
         });
-        let got = tokio::time::timeout(std::time::Duration::from_millis(500), c.next())
+        let got = tokio::time::timeout(std::time::Duration::from_millis(500), c.next(&mut HarnessRead))
             .await
             .expect("must resolve")
+            .unwrap()
             .expect("an entry");
         match got.kind {
             BusEntryKind::Message { payload, .. } => {
@@ -2732,21 +3777,21 @@ mod tests {
                 drop(bus);
                 let host_task = tokio::spawn(async move {
                     host.register("host").unwrap();
-                    host.wait_for("guest").await.unwrap();
-                    let mut replies = host.cursor().with_filter(|e| {
+                    host.wait_for("guest", &mut HarnessRead).await.unwrap();
+                    let mut replies = host.cursor().unwrap().with_filter(|e| {
                         matches!(&e.kind, BusEntryKind::Message { from, .. } if from == "guest")
                     });
                     host.send("turn", json!("hello guest")).unwrap();
-                    let reply = replies.next().await.expect("guest reply");
+                    let reply = replies.next(&mut HarnessRead).await.unwrap().expect("guest reply");
                     assert!(matches!(reply.kind, BusEntryKind::Message { .. }));
                 });
                 let guest_task = tokio::spawn(async move {
                     guest.register("guest").unwrap();
-                    guest.wait_for("host").await.unwrap();
-                    let mut inbox = guest.cursor().with_filter(|e| {
+                    guest.wait_for("host", &mut HarnessRead).await.unwrap();
+                    let mut inbox = guest.cursor().unwrap().with_filter(|e| {
                         matches!(&e.kind, BusEntryKind::Message { from, .. } if from == "host")
                     });
-                    let msg = inbox.next().await.expect("host message");
+                    let msg = inbox.next(&mut HarnessRead).await.unwrap().expect("host message");
                     assert!(matches!(msg.kind, BusEntryKind::Message { .. }));
                     guest.send("turn", json!("hello host")).unwrap();
                 });
@@ -2774,13 +3819,13 @@ mod tests {
                 let producer = registered(&bus, "p");
                 let consumer = bus.new_handle();
                 drop(bus);
-                let mut c = consumer.cursor().with_filter(|e| {
+                let mut c = consumer.cursor().unwrap().with_filter(|e| {
                     matches!(&e.kind, BusEntryKind::Message { .. })
                 });
                 let recv = tokio::spawn(async move {
                     let mut got = Vec::new();
                     for _ in 0..20 {
-                        let entry = c.next().await.expect("a message");
+                        let entry = c.next(&mut HarnessRead).await.unwrap().expect("a message");
                         let BusEntryKind::Message { payload, .. } = entry.kind else {
                             panic!("filter admits only messages");
                         };
@@ -2817,8 +3862,8 @@ mod tests {
                 let consumer = bus.new_handle();
                 let closer = bus.new_handle();
                 drop(bus);
-                let mut c = consumer.cursor();
-                let recv = tokio::spawn(async move { c.next().await });
+                let mut c = consumer.cursor().unwrap();
+                let recv = tokio::spawn(async move { c.next(&mut HarnessRead).await.unwrap() });
                 let close = tokio::spawn(async move { closer.close() });
                 let r = tokio::time::timeout(std::time::Duration::from_millis(1000), recv)
                     .await
@@ -2847,7 +3892,7 @@ mod tests {
         }
         // Pump never acked, so journaled_through==0: every message is still
         // in RAM, readable from the retained floor, despite window=2.
-        let mut cursor = rx.cursor_from_start();
+        let mut cursor = rx.cursor_from_start().unwrap();
         let mut seen = Vec::new();
         while let Some((_, _, p)) = next_message(&mut cursor).await {
             seen.push(p["i"].as_i64().unwrap());
@@ -2887,10 +3932,10 @@ mod tests {
         assert!(oldest_msg > 1, "shipped messages past the window were trimmed");
         // A cursor into the trimmed span bridges it silently and delivers
         // the oldest RETAINED message.
-        let mut c = bus.new_handle().cursor_at(1);
+        let mut c = bus.new_handle().cursor_at(1).unwrap();
         let mut first_msg: Option<i64> = None;
         for _ in 0..10 {
-            match c.next().await {
+            match c.next(&mut HarnessRead).await.unwrap() {
                 Some(e) => {
                     if let BusEntryKind::Message { payload, .. } = e.kind {
                         first_msg = Some(payload.unwrap().into_json().unwrap()["i"].as_i64().unwrap());
@@ -2914,9 +3959,337 @@ mod tests {
         let tx = registered(&bus, "tx");
         let obs = bus.new_handle();
         tx.send("m", json!({ "i": 0 })).unwrap(); // before the cursor
-        let mut cursor = obs.cursor(); // unregistered handle: tail cursor
+        let mut cursor = obs.cursor().unwrap(); // unregistered handle: tail cursor
         tx.send("m", json!({ "i": 1 })).unwrap(); // after the cursor
         let (_, _, p) = next_message(&mut cursor).await.unwrap();
         assert_eq!(p["i"].as_i64().unwrap(), 1, "forward cursor skips the pre-existing message");
+    }
+
+    fn at(node: &str) -> FiringLocation {
+        FiringLocation::new(node, vec![])
+    }
+
+    /// A handle of the firing at `node`, with that firing's buses.
+    fn firing_handle(bus: &BusHandle, node: &str, firing: &Arc<FiringBuses>) -> BusHandle {
+        BusHandle::from_inner(bus.inner_arc(), Some(at(node)), Some(firing.clone()))
+    }
+
+    /// A firing that pauses keeps its name: nobody reads it leave, nobody
+    /// else can take it, and its resumed body takes it back as it was,
+    /// at its first `Joined` offset, with nothing appended.
+    #[test]
+    fn a_paused_firing_keeps_its_name_and_takes_it_back() {
+        let bus = BusHandle::create();
+        let firing = Arc::new(FiringBuses::default());
+        let mut host = firing_handle(&bus, "host", &firing);
+        host.register("host").unwrap();
+        let joined = host.registration.as_ref().unwrap().1;
+        let before = bus.inner.log_len();
+        drop(host);
+        assert_eq!(bus.inner.log_len(), before, "a firing's handle going writes no Left");
+
+        let mut other = firing_handle(&bus, "intruder", &Arc::new(FiringBuses::default()));
+        assert_eq!(other.register("host"), Err(RegisterError::NameTaken("host".into())));
+
+        let resumed = Arc::new(FiringBuses::default());
+        let mut again = firing_handle(&bus, "host", &resumed);
+        again.register("host").unwrap();
+        assert_eq!(again.registration.as_ref().unwrap().1, joined, "taken back at its first Joined offset");
+        assert_eq!(bus.inner.log_len(), before, "taking it back appends nothing");
+        assert_eq!(resumed.positions()[&bus.id().to_string()].registered, Some(Registration { name: "host".into(), joined_offset: joined }));
+    }
+
+    /// A name held over a pause leaves, with its `Left`, once its firing's
+    /// body returns without taking it back; another firing returning lets
+    /// go of nothing.
+    #[test]
+    fn a_name_held_over_leaves_once_its_firing_returns() {
+        let bus = BusHandle::create();
+        let (_guest, _) = member(&bus, "guest");
+        let firing = Arc::new(FiringBuses::default());
+        let mut host = firing_handle(&bus, "host", &firing);
+        host.register("host").unwrap();
+        drop(host);
+        let before = bus.inner.log_len();
+        bus.inner.leave(&at("someone-else"), StreamEnd::Finished);
+        assert_eq!(bus.inner.log_len(), before, "another firing's end lets go of nothing");
+        let saved = firing.positions();
+        left(&FiringBuses::resumed(saved), "host", StreamEnd::Finished, &bus);
+        assert_eq!(bus.inner.log_len(), before + 1);
+        assert!(matches!(&bus.inner.lock_log().last().unwrap().kind, BusEntryKind::Left { name, .. } if name == "host"));
+        assert!(!bus.is_closed(), "the guest is still on it");
+        let mut newcomer = firing_handle(&bus, "other", &Arc::new(FiringBuses::default()));
+        newcomer.register("host").expect("the name is free again");
+    }
+
+    /// A bus opened again after a pause keeps its id, carries on at the
+    /// offset it stopped at, still knows who joined, gives the names its
+    /// paused firings hold back to them, and hands a reader reaching back
+    /// the messages its record kept whole.
+    #[tokio::test]
+    async fn a_reopened_bus_carries_on_where_it_stopped() {
+        let id = Uuid::new_v4();
+        let kept = |offset: u64, text: &str| WindowedBusMessage {
+            offset,
+            from: "host".into(),
+            msg_kind: "msg".into(),
+            payload: Some(WirePayload::Json(json!(text))),
+            payload_byte_size: 4,
+            trimmed: false,
+            at_unix: 1,
+        };
+        let bus = BusHandle::reopen(
+            ReopenedBus {
+                id,
+                opts: BusOptions::default(),
+                next_offset: 10,
+                joined: vec!["host".into(), "guest".into()],
+                members: vec![("guest".into(), at("guest"), 3)],
+                retained: vec![kept(7, "a"), kept(8, "b")],
+                lost_through: 7,
+                end: None,
+                last_left: None,
+            },
+            no_liveness(),
+            Weak::<Notify>::new(),
+        )
+        .unwrap();
+        assert_eq!(bus.id(), id);
+        assert_eq!(bus.inner.log_len(), 10);
+        assert_eq!(bus.inner.journaled_through(), 10, "everything before it is on record already");
+
+        let mut back = bus.cursor_at(0).unwrap();
+        assert_eq!(next_message(&mut back).await.unwrap().2, json!("a"));
+        assert_eq!(next_message(&mut back).await.unwrap().2, json!("b"));
+
+        let mut guest = firing_handle(&bus, "guest", &Arc::new(FiringBuses::default()));
+        guest.register("guest").unwrap();
+        assert_eq!(guest.registration.as_ref().unwrap().1, 3);
+        guest.wait_for("host", &mut crate::context::kept::FiringRead).await.expect("host joined before the pause");
+
+        let host = registered(&bus, "host");
+        assert_eq!(host.registration.as_ref().unwrap().1, 10, "the next entry lands where the bus stopped");
+        host.send("msg", json!("c")).unwrap();
+        assert_eq!(next_message(&mut back).await.unwrap().2, json!("c"));
+    }
+
+    /// A bus that ended before the pause comes back ended, as it was: a
+    /// reader reads what it kept and comes to its end (`None` when it
+    /// finished, the failure when it failed), a close changes nothing, a
+    /// register is refused as on any ended bus, the name a paused firing
+    /// held on it is not held any more, and nothing is left for the pump
+    /// to write again.
+    #[tokio::test]
+    async fn a_bus_that_ended_before_the_pause_comes_back_ended() {
+        let kept = WindowedBusMessage {
+            offset: 4,
+            from: "host".into(),
+            msg_kind: "msg".into(),
+            payload: Some(WirePayload::Json(json!("last"))),
+            payload_byte_size: 6,
+            trimmed: false,
+            at_unix: 1,
+        };
+        let ended = |end: StreamEnd| {
+            BusHandle::reopen(
+                ReopenedBus {
+                    id: Uuid::new_v4(),
+                    opts: BusOptions::default(),
+                    next_offset: 5,
+                    joined: vec!["host".into()],
+                    members: vec![("guest".into(), at("guest"), 3)],
+                    retained: vec![kept.clone()],
+                    lost_through: 4,
+                    end: Some(end),
+                    last_left: None,
+                },
+                no_liveness(),
+                Weak::<Notify>::new(),
+            )
+            .unwrap()
+        };
+        let finished = ended(StreamEnd::Finished);
+        assert!(finished.is_closed());
+        assert_eq!(finished.end(), Some(StreamEnd::Finished));
+        assert_eq!(finished.inner.journaled_through(), finished.inner.log_len(), "its end is on record already");
+        assert!(finished.inner.drain_journal_tail().is_empty(), "the pump writes nothing again");
+        let mut reader = finished.cursor_from_start().unwrap();
+        assert_eq!(next_message(&mut reader).await.unwrap().2, json!("last"));
+        assert!(reader.next(&mut crate::context::kept::FiringRead).await.unwrap().is_none(), "a finished end");
+        finished.close();
+        assert_eq!(finished.end(), Some(StreamEnd::Finished), "a close changes nothing");
+        let mut guest = firing_handle(&finished, "guest", &Arc::new(FiringBuses::default()));
+        assert_eq!(guest.register("guest"), Err(RegisterError::Closed));
+
+        let failed = ended(StreamEnd::Failed { error: "the session went away".into() });
+        failed.close();
+        let mut reader = failed.cursor_from_start().unwrap();
+        assert_eq!(next_message(&mut reader).await.unwrap().2, json!("last"));
+        let error = reader.next(&mut crate::context::kept::FiringRead).await.unwrap_err().to_string();
+        assert!(error.contains("the bus ended failed: the session went away"), "{error}");
+    }
+
+    /// A resumed firing's reader starts where it stopped, and its position
+    /// carries on from there, also once the body dropped it; a second
+    /// reader on the bus in the same run of the body is refused.
+    #[tokio::test]
+    async fn a_resumed_firings_reader_starts_where_it_stopped_and_is_the_only_one() {
+        let bus = BusHandle::create();
+        let host = registered(&bus, "host");
+        for i in 0..4 {
+            host.send("msg", json!(i)).unwrap();
+        }
+        let saved = std::collections::BTreeMap::from([(bus.id().to_string(), BusPosition { cursor: Some(3), registered: None })]);
+        let firing = Arc::new(FiringBuses::resumed(saved));
+        let reader = firing_handle(&bus, "reader", &firing);
+        let mut cursor = reader.cursor_from_start().unwrap();
+        assert_eq!(cursor.next_offset(), 3, "the reader starts where it stopped");
+        assert_eq!(next_message(&mut cursor).await.unwrap().2, json!(2));
+        drop(cursor);
+        assert_eq!(firing.positions()[&bus.id().to_string()].cursor, Some(4), "a dropped reader is saved where it stopped");
+        let refused = reader.cursor().err().expect("a second reader is refused").to_string();
+        assert!(refused.contains("opened a second reader on a bus at") && refused.contains("which it already opened one on at"), "{refused}");
+        assert!(bus.cursor().is_ok(), "a cursor outside every firing is not held to it");
+    }
+
+    /// A resumed firing's cursor behind messages the reopened bus came back
+    /// without (an ephemeral bus reopens empty) fails its first read
+    /// instead of reading on over the hole; one that read them all reads
+    /// on.
+    #[tokio::test]
+    async fn a_resumed_cursor_behind_what_the_bus_kept_fails_its_read() {
+        let bus = BusHandle::reopen(
+            ReopenedBus {
+                id: Uuid::new_v4(),
+                opts: BusOptions { journal: crate::stream_journal::JournalPolicy::ephemeral(), ..Default::default() },
+                next_offset: 10,
+                joined: vec!["host".into()],
+                members: Vec::new(),
+                retained: Vec::new(),
+                lost_through: 10,
+                end: None,
+                last_left: None,
+            },
+            no_liveness(),
+            Weak::<Notify>::new(),
+        )
+        .unwrap();
+        let saved = std::collections::BTreeMap::from([(bus.id().to_string(), BusPosition { cursor: Some(7), registered: None })]);
+        let reader = firing_handle(&bus, "reader", &Arc::new(FiringBuses::resumed(saved)));
+        let refused = reader.cursor_from_start().unwrap().next(&mut crate::context::kept::FiringRead).await.unwrap_err().to_string();
+        assert!(refused.contains("paused with messages of a bus it had not read yet"), "{refused}");
+        let caught_up = std::collections::BTreeMap::from([(bus.id().to_string(), BusPosition { cursor: Some(10), registered: None })]);
+        let reader = firing_handle(&bus, "caught-up", &Arc::new(FiringBuses::resumed(caught_up)));
+        let mut caught_up = reader.cursor_from_start().unwrap();
+        let mut fresh = firing_handle(&bus, "late", &Arc::new(FiringBuses::default())).cursor_from_start().unwrap();
+        registered(&bus, "host").send("msg", json!("after")).unwrap();
+        assert!(fresh.next(&mut crate::context::kept::FiringRead).await.unwrap().is_some(), "a cursor of a firing never paused reads as asked");
+        assert!(caught_up.next(&mut crate::context::kept::FiringRead).await.unwrap().is_some(), "a reader that missed nothing reads on");
+    }
+
+    /// A firing that paused in place, its bus live, while its window
+    /// dropped messages it had not read, fails its first read when it
+    /// resumes; one that read up to what the bus still holds reads on.
+    #[tokio::test]
+    async fn a_resumed_cursor_behind_what_the_window_dropped_fails_its_read() {
+        let bus = BusHandle::create_with_options(BusOptions {
+            journal: crate::stream_journal::JournalPolicy::ephemeral(),
+            window: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+        let host = registered(&bus, "host");
+        for i in 0..5 {
+            host.send("msg", json!(i)).unwrap();
+        }
+        let lost_through = bus.inner.lost_through.load(Ordering::Acquire);
+        assert!(lost_through > 1, "the window dropped the oldest messages");
+        let resumed_at = |offset: u64| {
+            let saved = std::collections::BTreeMap::from([(bus.id().to_string(), BusPosition { cursor: Some(offset), registered: None })]);
+            firing_handle(&bus, "reader", &Arc::new(FiringBuses::resumed(saved))).cursor_from_start().unwrap()
+        };
+        let refused = resumed_at(1).next(&mut crate::context::kept::FiringRead).await.unwrap_err().to_string();
+        assert!(refused.contains("paused with messages of a bus it had not read yet"), "{refused}");
+        let read = resumed_at(lost_through).next(&mut crate::context::kept::FiringRead).await.unwrap();
+        assert!(read.is_some(), "a reader that missed nothing the bus dropped reads on");
+        let mut live = bus.cursor_at(1).unwrap();
+        assert!(live.next(&mut crate::context::kept::FiringRead).await.unwrap().is_some(), "a live slow reader skips ahead");
+    }
+
+    /// A reader filtering out its own messages that pauses after sending
+    /// some saves its place past them, so the bus dropping them before it
+    /// comes back leaves it behind nothing; a message it would read stops
+    /// the carry.
+    #[tokio::test]
+    async fn a_filtered_reader_is_saved_past_what_its_filter_turns_down() {
+        let bus = BusHandle::create_with_options(BusOptions {
+            journal: crate::stream_journal::JournalPolicy::ephemeral(),
+            window: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+        let firing = Arc::new(FiringBuses::default());
+        let host = {
+            let mut host = firing_handle(&bus, "host", &firing);
+            host.register("host").unwrap();
+            host
+        };
+        let guest = registered(&bus, "guest");
+        let mut replies = host.cursor().unwrap().with_filter(|entry| matches!(&entry.kind, BusEntryKind::Message { from, .. } if from == "guest"));
+        guest.send("msg", json!("hello")).unwrap();
+        assert!(replies.next(&mut crate::context::kept::FiringRead).await.unwrap().is_some());
+        for i in 0..3 {
+            host.send("msg", json!(i)).unwrap();
+        }
+        let saved = firing.positions()[&bus.id().to_string()].cursor.expect("the reader is saved");
+        assert_eq!(saved, bus.inner.next_offset.load(Ordering::Acquire), "carried past its own messages to the tail");
+        assert!(bus.inner.lost_through.load(Ordering::Acquire) <= saved, "nothing it would read was dropped");
+
+        guest.send("msg", json!("again")).unwrap();
+        let wanted = bus.inner.next_offset.load(Ordering::Acquire) - 1;
+        host.send("msg", json!("after")).unwrap();
+        assert_eq!(firing.positions()[&bus.id().to_string()].cursor, Some(wanted), "a message it would read stops the carry");
+    }
+
+    /// A firing's name stays its own until its body returns, through a
+    /// handle it dropped: no `Left`, the save still holds it, another name
+    /// on the bus is refused, and the firing's next handle takes it back.
+    #[tokio::test]
+    async fn a_dropped_handle_leaves_the_name_with_its_firing() {
+        let bus = BusHandle::create();
+        let firing = Arc::new(FiringBuses::default());
+        let mut handle = firing_handle(&bus, "a", &firing);
+        handle.register("a").unwrap();
+        let joined = handle.registration.as_ref().unwrap().1;
+        let before = bus.inner.log_len();
+        drop(handle);
+        assert_eq!(bus.inner.log_len(), before, "no Left");
+        assert_eq!(firing.positions()[&bus.id().to_string()].registered, Some(Registration { name: "a".into(), joined_offset: joined }));
+        let mut other = firing_handle(&bus, "a", &firing);
+        assert_eq!(other.register("b"), Err(RegisterError::FiringHoldsAnother("a".into())));
+        let mut back = firing_handle(&bus, "a", &firing);
+        back.register("a").unwrap();
+        assert_eq!(back.registration.as_ref().unwrap().1, joined, "taken back at its first Joined offset");
+        assert_eq!(bus.inner.log_len(), before, "taking it back appends nothing");
+    }
+
+    /// A firing holds one name per bus: a second handle of it taking
+    /// another name is refused, and so is one taking another name while
+    /// the one it held over its pause is still its own.
+    #[tokio::test]
+    async fn a_firing_holds_one_name_per_bus() {
+        let bus = BusHandle::create();
+        let firing = Arc::new(FiringBuses::default());
+        let mut first = firing_handle(&bus, "a", &firing);
+        first.register("a").unwrap();
+        let mut second = firing_handle(&bus, "a", &firing);
+        assert_eq!(second.register("b"), Err(RegisterError::FiringHoldsAnother("a".into())));
+
+        let saved = std::collections::BTreeMap::from([(
+            bus.id().to_string(),
+            BusPosition { cursor: None, registered: Some(Registration { name: "held".into(), joined_offset: 0 }) },
+        )]);
+        let mut resumed = firing_handle(&bus, "held", &Arc::new(FiringBuses::resumed(saved)));
+        assert_eq!(resumed.register("other"), Err(RegisterError::FiringHoldsAnother("held".into())));
     }
 }

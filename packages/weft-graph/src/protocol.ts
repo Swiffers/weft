@@ -114,10 +114,12 @@ export type WeftType =
   // A Bus output connects only to a Bus input; the payloads are not
   // type-checked. Wires only (a live runtime handle takes no literal).
   | { kind: 'bus' }
-  // An access handle (a stored credential grant). Access connects only
-  // to Access; the grant itself is opaque to the type system.
-  // SYNC: access <-> crates/weft-core/src/weft_type.rs WeftType::Access
-  | { kind: 'access' }
+  // A connection (a stored credential grant). `Access[fal]` (`service`
+  // set) is a connection to one service, bare `Access` to any.
+  // `Access[fal]` fits `Access[fal]` and bare `Access`; bare `Access`
+  // fits only bare `Access`.
+  // SYNC: WeftType 'access' <-> crates/weft-core/src/weft_type.rs WeftType::Access
+  | { kind: 'access'; service?: string }
   // A handle on one endpoint of an infra node, the value an infra node
   // emits so other nodes reach it. Infra connects only to Infra. Wires
   // only (minted by an infra node, never typed as a literal).
@@ -378,7 +380,8 @@ function parseSingleType(s: string): WeftType {
   if (s === 'Access') return { kind: 'access' };
   if (s === 'Infra') return { kind: 'infra' };
 
-  // Parameterized: List[T], Generator[T], Secret[T], Dict[String, V]
+  // Parameterized: List[T], Generator[T], Secret[T], Dict[String, V],
+  // and Access[service], which takes a service's name rather than a type.
   const bracketPos = s.indexOf('[');
   if (bracketPos !== -1) {
     if (!s.endsWith(']')) refuse(`\`${s}\` opens a \`[\` it never closes at its end`);
@@ -388,6 +391,17 @@ function parseSingleType(s: string): WeftType {
     if (name === 'List') return { kind: 'list', inner: parseTypeOrThrow(inner) };
     if (name === 'Generator') return { kind: 'generator', inner: parseTypeOrThrow(inner) };
     if (name === 'Secret') return { kind: 'secret', inner: parseTypeOrThrow(inner) };
+    // SYNC: parseSingleType (Access arm) <-> crates/weft-core/src/weft_type.rs parse_single_type (Access arm)
+    if (name === 'Access') {
+      const service = inner.trim();
+      if (!/^[a-z0-9_]+$/.test(service)) {
+        refuse(
+          `\`${s}\`: \`Access[...]\` takes a service's name (lowercase letters, digits and `
+          + `underscores, like \`Access[google_drive]\`), and \`${service}\` is not one`,
+        );
+      }
+      return { kind: 'access', service };
+    }
     if (name === 'Dict') {
       const parts = splitTopLevel(inner, ',');
       if (parts.length !== 2) refuse(`\`${s}\`: a dict takes two types, \`Dict[String, V]\``);
@@ -405,7 +419,7 @@ function parseSingleType(s: string): WeftType {
       }
       return { kind: 'dict', value };
     }
-    refuse(`\`${name}[...]\` is not a type; the types that take one are List, Generator, Secret and Dict`);
+    refuse(`\`${name}[...]\` is not a type; the types that take one are List, Generator, Secret, Dict and Access`);
   }
 
   // Primitive
@@ -528,8 +542,10 @@ export function weftTypesEqual(a: WeftType, b: WeftType): boolean {
       return b.kind === 'named' && a.name === (b as Extract<WeftType, { kind: 'named' }>).name;
     case 'typevar':
       return b.kind === 'typevar' && a.name === (b as Extract<WeftType, { kind: 'typevar' }>).name;
+    case 'access':
+      return b.kind === 'access' && (a.service ?? null) === ((b as Extract<WeftType, { kind: 'access' }>).service ?? null);
     default:
-      // json_dict / json / bus / access / infra carry no payload.
+      // json_dict / json / bus / infra carry no payload.
       return true;
   }
 }
@@ -579,7 +595,7 @@ function renderType(t: WeftType, wire: boolean): string {
     case 'json_dict': return 'JsonDict';
     case 'json': return 'Json';
     case 'bus': return 'Bus';
-    case 'access': return 'Access';
+    case 'access': return t.service ? `Access[${t.service}]` : 'Access';
     case 'infra': return 'Infra';
     case 'generator': return `Generator[${renderType(t.inner, wire)}]`;
     case 'secret': return `Secret[${renderType(t.inner, wire)}]`;
@@ -674,6 +690,10 @@ export interface NodeFeaturesWire {
   /// input and the output follows.
   pairsAddedPorts?: boolean;
   isTrigger?: boolean;
+  /// The node checks its callers: its `auth` names a scheme, and its
+  /// `connection` field, picked on the install, holds what it checks.
+  // SYNC: checksCallers <-> crates/weft-core/src/node.rs NodeFeatures.checks_callers
+  checksCallers?: boolean;
   showDebugPreview?: boolean;
   /// Names the endpoint serving the node's `/live` HTTP route the
   /// body panel polls. Unset for a node that speaks only TCP
@@ -701,9 +721,15 @@ export interface NodeDefinition {
   // SYNC: typeParams <-> crates/weft-core/src/project.rs NodeDefinition.type_params
   typeParams?: TypeParamWire[];
   requiresInfra?: boolean;
-  /// Set on a node that exists once per instance of the program.
+  /// Set on a node that exists once per instance of the program at every
+  /// place it runs.
   // SYNC: perInstance <-> crates/weft-core/src/project.rs NodeDefinition.per_instance
   perInstance?: PerInstance;
+  /// The call paths (outermost site first) where a node inside an
+  /// included file reads an instance's value, when its places disagree;
+  /// absent when `perInstance` holds at every place.
+  // SYNC: perInstancePaths <-> crates/weft-core/src/project.rs NodeDefinition.per_instance_paths
+  perInstancePaths?: string[][];
   span?: Span;
   headerSpan?: Span;
   configSpans?: Record<string, ConfigFieldSpan>;
@@ -878,7 +904,8 @@ export interface GroupDefinition {
   description?: string | null;
   /// Literals written on the container's interface ports: `g.x = "hi"` from
   /// outside, or `_should_flow: false` in the braces. A wired value is an
-  /// ordinary edge and never appears here.
+  /// ordinary edge and never appears here. A loop's is empty: its sit on
+  /// its `LoopIn` alone, with their spans and file refs.
   portLiterals?: Record<string, unknown>;
   /// Where each `portLiterals` entry was written, and in which form, so an
   /// edit rewrites the value where it already lives.
@@ -932,6 +959,10 @@ export interface Broken {
   /// The node and group ids the problem is about; a cut keeping all of
   /// them needs it.
   parts: string[];
+  /// The places (`locatedKey`) it holds at, when only some; absent: every
+  /// place its parts run.
+  // SYNC: Broken.places <-> crates/weft-core/src/project.rs Broken.places
+  places?: string[];
   why: string;
   /// The part may stand for nodes the program cannot see (an included
   /// file that does not compile, a node whose type did not load).
@@ -969,6 +1000,10 @@ export interface Diagnostic {
   // group, the two ends for a wire); absent when it is about the program
   // as a whole.
   subjects?: string[];
+  // The places (`locatedKey`) the finding holds at, when only some of
+  // its subjects' places are wrong; absent: every place.
+  // SYNC: Diagnostic.places <-> crates/weft-core/src/node.rs Diagnostic.places
+  places?: string[];
 }
 
 /// Derived from the Widget union (never a second hand-kept list).
@@ -1003,6 +1038,10 @@ export interface InputSpec {
   /// (Access-typed inputs only); checked the same three places.
   // SYNC: InputSpec.requiresValues <-> crates/weft-core/src/node.rs InputSpec.requires_values
   requiresValues?: string[];
+  /// On an optional String input, a blank text is a value the node uses;
+  /// without it a blank text is no value at all.
+  // SYNC: InputSpec.keepsBlank <-> crates/weft-core/src/node.rs InputSpec.keeps_blank
+  keepsBlank?: boolean;
 }
 
 // SYNC: OutputSpec <-> crates/weft-core/src/node.rs OutputSpec
@@ -1090,6 +1129,13 @@ export interface CatalogEntry {
    *  is the app's credentials. Empty in the shipped catalog. */
   // SYNC: accessApps <-> crates/weft-core/src/node.rs NodeMetadata.access_apps
   accessApps?: Record<string, AppRegistration>;
+  /** On a node that checks its callers (`features.checksCallers`): the
+   *  recipe of the connection its `auth` reads, keyed by each word the
+   *  value is read by: a name `auth` takes (`api_keys`, `hmac_sha256`,
+   *  ...) or the `kind` of a check written as a record (`hmac`). Its
+   *  Connect panel follows `auth`. */
+  // SYNC: CatalogEntry.callerRecipes <-> crates/weft-cli/src/commands/describe_nodes.rs editor_entry
+  callerRecipes?: Record<string, AccessSpecWire>;
   /** The bound on each type variable the node's ports use, keyed by
    *  the variable (`{ "T": "Media" }`): what the variable may resolve to. */
   // SYNC: CatalogEntry.typeParams <-> crates/weft-core/src/node.rs NodeMetadata.type_params
@@ -1138,6 +1184,40 @@ export function isSecretMarker(value: unknown): boolean {
   const id = (payload as Record<string, unknown>).secretId;
   return fields.length === 1 && fields[0] === 'secretId' && typeof id === 'string' && UUID.test(id);
 }
+
+/** The on-wire sentinel key tagging the content of a file a built program
+ *  names instead of holding its text:
+ *  `{"__weft_content__": {"sha256": "<hex>", "type": "String", "path": "sql/a.sql"}}`. */
+// SYNC: CONTENT_MARKER_KEY <-> crates/weft-core/src/content.rs CONTENT_MARKER_KEY
+export const CONTENT_MARKER_KEY = '__weft_content__';
+
+/** What a content marker names: the file it was read from and the type
+ *  its text is cast to. */
+export interface ContentMarker {
+  sha256: string;
+  type: string;
+  path: string;
+}
+
+/** The content `value` is the marker of: an object holding the sentinel
+ *  key alone, whose payload holds a sha256, a type and a path and nothing
+ *  else. `null` for anything else, a malformed marker included. */
+// SYNC: contentMarker <-> crates/weft-core/src/content.rs ContentRef::from_value
+export function contentMarker(value: unknown): ContentMarker | null {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const keys = Object.keys(value);
+  if (keys.length !== 1 || keys[0] !== CONTENT_MARKER_KEY) return null;
+  const payload = (value as Record<string, unknown>)[CONTENT_MARKER_KEY];
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return null;
+  const fields = payload as Record<string, unknown>;
+  if (Object.keys(fields).length !== 3) return null;
+  const { sha256, type, path } = fields;
+  if (typeof sha256 !== 'string' || !SHA256.test(sha256) || typeof type !== 'string' || typeof path !== 'string') return null;
+  return { sha256, type, path };
+}
+
+/** A sha256 in the lowercase hex the backend names content by. */
+const SHA256 = /^[0-9a-f]{64}$/;
 
 /** A uuid in the hyphenated form the backend writes a `SecretId` in. */
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -1304,16 +1384,20 @@ export function isLanguagePort(name: string): boolean {
   return isGatePort(name) || name === ERROR_PORT;
 }
 
-// SYNC: NodeFiringStatus <-> crates/weft-core/src/run/firing.rs NodeFiringStatus
-/// Adding a state requires adding it on both sides; the UI lookup
-/// tables in `webview/lib/utils/status.ts` exhaust this union so
-/// drift compiles as an error. The earlier shape had ghost variants
-/// (`pending` / `suspended` / `accumulating`) the dispatcher never
-/// emitted; they painted states the engine could not produce and
-/// `suspended` doubled-up with the real `waiting_for_input` event.
+// SYNC: NodeFiringStatus <-> crates/weft-core/src/program.rs NodeStatus, catalog/logic/get_node_state/metadata.json (the `state` output's description)
+/// Where one firing stands, in the words `weft node-state` and
+/// `GetNodeState` use (`NodeStatus`), less `pending`: a firing the graph
+/// paints has started. A firing is `waiting` while a wait of its own is
+/// open, whether its worker holds the wait (a `wait_started` with no
+/// ending yet) or the run parked on it (its suspension names a token),
+/// and `paused` when it only paused with its run. Adding a state
+/// requires adding it on every side; the UI lookup tables in
+/// `webview/lib/utils/status.ts` exhaust this union so drift compiles as
+/// an error.
 export type NodeFiringStatus =
   | 'running'
-  | 'waiting_for_input'
+  | 'waiting'
+  | 'paused'
   | 'completed'
   | 'skipped'
   | 'failed'
@@ -1594,6 +1678,9 @@ export interface TriggerCopy {
   /// Whose: absent for the shared one.
   instance?: string;
   state: TriggerState;
+  /// Whether it is on: `on` or `behind`, said by the dispatcher from the
+  /// state so nothing here has to know which states are on.
+  on: boolean;
   mode: ActivationMode;
   /// For one taken down by something other than a person, what.
   downWith?: DownWith;
@@ -1607,6 +1694,17 @@ export interface TriggerCopy {
   version?: string;
   /// While it turns on: since when, and what its activation waits on.
   progress?: ChangeProgress;
+  /// The fires and calls dropped in the last minute or two.
+  dropped?: Dropped;
+}
+
+/// The fires and calls of a trigger dropped in the last minute or two:
+/// refused before any run started, which nothing tries again.
+// SYNC: Dropped <-> crates/weft-core/src/projects.rs Dropped
+export interface Dropped {
+  count: number;
+  /// Why the last one was dropped, as the door said it.
+  lastReason: string;
 }
 
 /// One trigger place of the program, with its state and each instance's
@@ -1640,6 +1738,8 @@ export interface InstanceInfraEntry {
   progress?: ChangeProgress;
   /// Applied from other infra than the source holds now.
   behind?: boolean;
+  /// The source declares its place no more (`InfraPlacementStatus.orphaned`).
+  orphaned?: boolean;
   /// The latest restart of its containers since weft last started it.
   lastRestart?: LastRestart;
 }
@@ -1915,8 +2015,11 @@ export type WirePayload =
 // SYNC: BusInspectorEvent 'message' <-> crates/weft-core/src/bus.rs WindowedBusMessage, extension-vscode/src/runFollower.ts DispatcherEvent 'bus_window' messages
 // SYNC: BusInspectorEvent 'window' totals <-> crates/weft-core/src/bus.rs BusWindowTotal, extension-vscode/src/runFollower.ts DispatcherEvent 'bus_window' totals
 export type BusInspectorEvent =
+  // SYNC: BusInspectorEvent 'joined' <-> crates/weft-journal/src/events.rs BusJoined, crates/weft-core/src/live_event.rs BusJoined, extension-vscode/src/runFollower.ts DispatcherEvent 'bus_joined'
   | { kind: 'joined'; busId: string; offset: number; name: string; atUnix: number }
-  | { kind: 'left'; busId: string; offset: number; name: string; atUnix: number }
+  /// A member left, and how its body returned: finished, or failed and why.
+  // SYNC: BusInspectorEvent 'left' <-> crates/weft-journal/src/events.rs BusLeft, crates/weft-core/src/live_event.rs BusLeft, extension-vscode/src/runFollower.ts DispatcherEvent 'bus_left'
+  | { kind: 'left'; busId: string; offset: number; name: string; end: StreamEnd; atUnix: number }
   | {
       kind: 'message';
       busId: string;
@@ -2030,6 +2133,8 @@ export type CorruptionSite =
   /// The run's birth gives values where its program says nothing is
   /// given, or misses one it says.
   | 'RunGiven'
+  /// A bus row names its bus by an id that is no bus id.
+  | 'Bus'
   | 'UndecodableRow'
   /// Not one row: the whole run. The code it ran is no longer
   /// recorded, so no value can be worked out from the journal. Shown
@@ -2077,6 +2182,16 @@ export interface LiveDataItem {
     payload?: unknown;
     confirm?: string;
   };
+  /// On a secret the node hands out once: the action kind pressed as soon
+  /// as the value is copied out, with `{ value }` as its payload, so the
+  /// node retires the value its reader now holds.
+  // SYNC: taken <-> crates/weft-core/src/live.rs LiveItem::taken, LiveItem::taken_press
+  taken?: string;
+  /// The line standing where such a secret was once it was handed over;
+  /// its button makes a new one.
+  // SYNC: handedOver <-> crates/weft-core/src/live.rs LiveItem::handed_over,
+  //       catalog/postgres/database/images/credential/bootstrap.py (password_item)
+  handedOver?: boolean;
 }
 
 /// State of one node's display. The dispatcher pushes one of these
@@ -2229,11 +2344,19 @@ export type CliPhase =
   /// happens on the dispatcher: without it the command looks hung. A
   /// resync sends it again each time the runs it waits for change, with
   /// `waitsFor`: `{ runId, sinceUnix }` per run on the old version, empty
-  /// once every run named before has ended. A run a worker accepted but
-  /// has not recorded yet is waited for without being listed, so an
-  /// empty list can still be waiting.
+  /// once every run named before has ended, and `turningOn`
+  /// (`ChangeProgress`) while it turns an owner's triggers back on; again
+  /// every half minute while neither changes, each time with
+  /// `elapsedSeconds`, how long it has been followed. A run a worker
+  /// accepted but has not recorded yet is waited for without being
+  /// listed, so an empty list can still be waiting.
   // SYNC: the drain_wait detail's waitsFor <-> crates/weft-cli/src/progress.rs Progress::resync_waits_for
   | 'drain_wait'
+  /// The run is being prepared, and what its start is doing, said once it
+  /// changes and every half minute while it lasts. Detail carries
+  /// `elapsedSeconds` and `doing` ("reading the results of seed run ...").
+  // SYNC: the run_starting detail <-> crates/weft-cli/src/progress.rs Progress::run_starting, packages/weft-graph/src/webview/lib/components/project/ActionBar.svelte (run_starting)
+  | 'run_starting'
   /// Something the person should know that is not a failure; the verb
   /// carries on and still ends `complete`. Detail carries `message`.
   | 'warning'
@@ -2432,6 +2555,11 @@ export interface InfraPlacementStatus {
   /// Its copy was applied from other infra than the source holds now:
   /// `weft infra upgrade --infra <node>` brings it up to date.
   behind?: boolean;
+  /// Its copy is live and the source declares its place no more: an
+  /// orphan, counted in `orphanedInfra`, that keeps running until
+  /// `weft infra stop` or `weft infra terminate` takes it down. Never
+  /// `behind` too.
+  orphaned?: boolean;
   /// The triggers whose cut contains it (each instance's too, for a
   /// shared one), by owner: what taking it down takes down with it.
   takesDown?: OwnerTriggers[];

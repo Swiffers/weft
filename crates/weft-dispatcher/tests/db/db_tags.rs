@@ -122,7 +122,7 @@ async fn tag_rows_are_ordered_by_write_and_idempotent(pool: Pool) {
 
     tag(&pool, first, &["user_7"], 10).await;
     tag(&pool, second, &["user_7", "batch_a"], 11).await;
-    // Re-tagging the first run (a body replayed after a durable wait) must not
+    // Re-tagging the first run (a body run again after a pause) must not
     // move it after the second in the order.
     tag(&pool, first, &["user_7"], 12).await;
 
@@ -188,6 +188,81 @@ async fn live_tagged_read_respects_the_project_wall_and_terminals(pool: Pool) {
     // The dispatcher's RunStore trait reads the same rows.
     let via_trait = store.live_tagged_runs(project, "user_7").await.unwrap();
     assert_eq!(via_trait, live);
+}
+
+/// Write the birth of an unrecorded run of `project` the way its
+/// worker writes one before a call names it (`weft_journal::unrecorded`),
+/// `then` after it in the same batch: its row, running under worker `w1`,
+/// or ended when `then` ends it.
+async fn worker_writes_unrecorded(pool: &Pool, project: Uuid, then: impl FnOnce(weft_core::RunId) -> Vec<RunEvent>) -> weft_core::RunId {
+    use weft_journal::frame::{Batch, BatchHead, RunHead};
+    use weft_journal::record::{Born, Fate, Written};
+    let run_id = weft_core::new_run_id();
+    let mut events = vec![RunEvent::RunStarted { given: Default::default(),
+        run_id,
+        project_id: project,
+        entry_node: "start".into(),
+        phase: weft_core::context::Phase::Fire,
+        definition_hash: Some("def-1".into()),
+        binary_hash: Some("bin-A".into()),
+        run_kind: weft_core::run::RunKind::Project,
+        source_version: None,
+        cut_from: None,
+        seed: None,
+        instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 1,
+        settings: weft_core::run_settings::RunSettings::new(weft_core::run_settings::Keeping::Fast, false).unwrap(),
+    }];
+    events.extend(then(run_id));
+    let rows: Vec<Vec<u8>> = events.iter().map(|event| weft_journal::stored::encode(std::slice::from_ref(event))).collect();
+    let head = BatchHead {
+        durable: true,
+        lane: 0,
+        runs: vec![RunHead {
+            run_id,
+            epoch: 1,
+            first_seq: 0,
+            row_sizes: rows.iter().map(|row| row.len() as u32).collect(),
+            born: Born::of(&events[0], weft_core::run_settings::KeepFor::WEFT_DEFAULT),
+            written: Written::of(&events),
+            secrets: Vec::new(),
+        }],
+        programs: Vec::new(),
+        events_version: weft_journal::stored::STORED_EVENTS.version(),
+    };
+    let batch = Batch { head, rows: rows.iter().map(Vec::as_slice).collect() };
+    let answers = weft_journal::record::record_batch(&pool.get().await.unwrap(), "w1", TENANT, "w1:0", &batch, &weft_access_store::seal_json)
+        .await
+        .unwrap();
+    assert_eq!(answers[0].fate, Fate::Accepted);
+    run_id
+}
+
+/// An unrecorded run that tags itself is found by a stop like any run:
+/// the birth its worker writes before the tag call is the row the live
+/// read joins on, the stop asks its worker to end it, and once it ended
+/// its tag rows go with its row when its keep runs out.
+#[weft_db_macros::test]
+async fn an_unrecorded_run_is_tagged_stopped_and_erased_with_its_tags(pool: Pool) {
+    let (store, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project).await;
+    let recorded = start_run(&store, project, weft_core::run::RunKind::Project).await;
+    let live = worker_writes_unrecorded(&pool, project, |_| Vec::new()).await;
+    let ended = worker_writes_unrecorded(&pool, project, |run_id| vec![RunEvent::RunCompleted { run_id, at_unix: 2 }]).await;
+    tag(&pool, recorded, &["user_7"], 1).await;
+    tag(&pool, live, &["user_7"], 2).await;
+    tag(&pool, ended, &["user_7"], 3).await;
+
+    let selected: Vec<_> = live_tagged_runs(&pool, project, "user_7").await.unwrap().iter().map(|t| t.run_id).collect();
+    assert_eq!(selected, vec![recorded, live], "the live unrecorded run is selected, the ended one is not");
+
+    let cause = CancelCause::Run { by: recorded, tag: Some("user_7".into()) };
+    let write = store.cancel_run(live, Some(&rig_project(project)), &cause).await.unwrap();
+    assert!(write.requested, "its worker drives it, so its worker is asked to end it: {write:?}");
+
+    assert_eq!(store.erase_expired(i64::MAX, 100).await.unwrap().0, 1, "the ended unrecorded run's keep ran out");
+    assert_eq!(tag_seq(&pool, ended, "user_7").await.unwrap(), None, "its tag rows went with its row");
+    assert!(tag_seq(&pool, live, "user_7").await.unwrap().is_some(), "a run not ended keeps its tags");
 }
 
 /// A tag stop's terminal names who asked and which tag matched, on the
@@ -604,7 +679,8 @@ async fn a_run_whose_program_does_not_read_is_indexed_by_its_words(pool: Pool) {
 
 /// A run whose record carries NUL characters (a scraped page in a node's
 /// output) is indexed like any other: the search finds it by the words
-/// around them, its queue drains, and the run beside it is found too.
+/// around them and by the node it ran, its queue drains, and the run
+/// beside it is found too.
 #[weft_db_macros::test]
 async fn a_run_carrying_nul_characters_is_indexed(pool: Pool) {
     let (store, projects) = setup(&pool).await;
@@ -616,6 +692,12 @@ async fn a_run_carrying_nul_characters_is_indexed(pool: Pool) {
     let queued: i64 = pool.scalar("SELECT count(*) FROM run_search_queue", &[]).await.unwrap();
     assert_eq!(queued, 0, "the queue drained");
     assert_eq!(found_carrying(&store, "clean@example.com").await, vec![clean]);
+    let through = weft_dispatcher::store::RunListQuery { limit: 10, node: Some("wait".into()), ..Default::default() };
+    let mut ran: Vec<_> = store.list_runs(TENANT, &through).await.unwrap().runs.into_iter().map(|s| s.run_id).collect();
+    ran.sort();
+    let mut both = vec![scraped, clean];
+    both.sort();
+    assert_eq!(ran, both, "found through the node it ran");
 }
 
 /// One ended run of `project`, whose record carries `word`.
@@ -661,8 +743,13 @@ async fn a_search_reads_programs_on_its_own_connection(pool: Pool) {
     let ada = ended_run_carrying(&store, project, "ada@example.com").await;
     assert_eq!(found_carrying(&store, "ada@example.com").await, vec![ada], "one connection is enough");
 
-    let first = ended_run_carrying(&store, project, "bob@example.com").await;
-    let second = ended_run_carrying(&store, project, "bob@example.com").await;
+    // Another project's program, which no search has read yet: the one
+    // `ada`'s search read stays in the dispatcher's cache of programs, and
+    // a program found there is never read from the store again.
+    let other = Uuid::new_v4();
+    seed_project(&projects, other).await;
+    let first = ended_run_carrying(&store, other, "bob@example.com").await;
+    let second = ended_run_carrying(&store, other, "bob@example.com").await;
     pool.execute("ALTER TABLE project_definition RENAME COLUMN project_json TO project_json_away", &[]).await.unwrap();
     let query = weft_dispatcher::store::RunListQuery { limit: 10, search: Some("bob@example.com".into()), ..Default::default() };
     store.list_runs(TENANT, &query).await.expect_err("the program read failed");
@@ -719,4 +806,45 @@ async fn a_flagged_ending_reads_its_instance_and_keeps_each_jobs_flag(pool: Pool
     tx.commit().await.unwrap();
     let tx = conn.transaction().await.unwrap();
     assert!(take_flagged(&tx, run_id).await.unwrap().is_none(), "nothing is left to do");
+}
+
+/// A run's summary carries its phase, and the listing keeps only the runs
+/// of the phase asked for: a run started by hand is a fire, and the run an
+/// activate starts to prepare a trigger is a trigger setup.
+#[weft_db_macros::test]
+async fn the_listing_says_each_runs_phase_and_filters_by_it(pool: Pool) {
+    use weft_core::context::Phase;
+    let (store, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project).await;
+    let fire = start_run(&store, project, weft_core::run::RunKind::Project).await;
+    let setup_run = weft_core::new_run_id();
+    let birth = RunEvent::RunStarted { given: Default::default(),
+        run_id: setup_run, project_id: project, entry_node: "start".into(), phase: Phase::TriggerSetup,
+        definition_hash: Some("def-1".into()), binary_hash: Some("bin-A".into()), run_kind: weft_core::run::RunKind::Project,
+        source_version: Some("source".into()), cut_from: None, seed: None,
+        instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 2,
+        settings: Default::default(),
+    };
+    let queued = Queued {
+        events: std::slice::from_ref(&birth), tenant: TENANT, keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT,
+        watch_end: false, stale: &[], spec: None, example: None, program: None,
+    };
+    assert!(store.queue_run(queued, false).await.unwrap());
+
+    let listed = |phase: Option<Phase>| {
+        let store = &store;
+        async move {
+            let query = weft_dispatcher::store::RunListQuery { limit: 10, project_id: Some(project), phase, ..Default::default() };
+            let mut runs: Vec<(weft_core::RunId, weft_core::primitive::Phase)> =
+                store.list_runs(TENANT, &query).await.unwrap().runs.into_iter().map(|s| (s.run_id, s.phase)).collect();
+            runs.sort_by_key(|(run, _)| *run);
+            runs
+        }
+    };
+    let mut both = vec![(fire, Phase::Fire), (setup_run, Phase::TriggerSetup)];
+    both.sort_by_key(|(run, _)| *run);
+    assert_eq!(listed(None).await, both, "each summary says its phase");
+    assert_eq!(listed(Some(Phase::Fire)).await, vec![(fire, Phase::Fire)]);
+    assert_eq!(listed(Some(Phase::TriggerSetup)).await, vec![(setup_run, Phase::TriggerSetup)]);
 }

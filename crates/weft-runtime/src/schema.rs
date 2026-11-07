@@ -15,13 +15,21 @@ use weft_task_store::{Document, SchemaGroup};
 /// The parts of the list, in dependency order: each role's groups, as
 /// that role's crate orders them, then the runtime's own. The runtime-file
 /// plane names no table outside its own group (its two `REFERENCES
-/// runtime_file(key)` stay inside it), and the copies' revisions
-/// (`crate::superseded`) none at all, so they go last.
+/// runtime_file(key)` stay inside it), and [`ROLE_REVISION`] none at all,
+/// so they go last.
 static PARTS: &[&[&SchemaGroup]] = &[
     weft_dispatcher::app::DISPATCHER_GROUPS,
     &[&weft_broker::runtime_store::GROUP],
-    &[&crate::superseded::GROUP],
+    &[&ROLE_REVISION],
 ];
+
+/// The `role_revision` table's group, which no longer has a table: the
+/// copies of a role once said there which revision of it was serving, and
+/// a copy of an older one stopped on its own. The install workflow now
+/// stops them (`.github/workflows/install-gcp.yml`). Its history drops the
+/// table from a database that has it, so the group stays, with nothing in
+/// it, as long as that history does.
+static ROLE_REVISION: SchemaGroup = SchemaGroup { name: "role_revision", tables: &[], ddl: &[], seed: &[], data_steps: &[] };
 
 /// Every schema group the install's database holds, in dependency order.
 pub fn groups() -> Vec<&'static SchemaGroup> {
@@ -58,14 +66,15 @@ pub fn documents() -> Vec<&'static Document> {
 
 static DOCUMENTS: &[Document] = &[
     // A connection's snapshot of its service's recipe, kept as long as the
-    // connection. Its events recipes are hashed into `events_recipe_hash`.
+    // connection. Its events recipes are hashed into `events_recipe_hash`,
+    // and a pasted connection made before ways records its one way in `way`.
     Document::of(
         &weft_core::AccessSpec::STORED,
         "access_grant",
         "spec",
         Encoding::Json,
         weft_access_store::SPEC_FILLS,
-        Some(weft_access_store::rehash_grant_recipes),
+        Some(weft_access_store::rederive_grant_columns),
     ),
     // The events recipes a service declared, kept under their hash.
     Document::of(
@@ -251,6 +260,30 @@ mod tests {
         assert!(names.contains(&"runtime_file"), "the broker's runtime-file plane is in the list");
         for document in documents() {
             assert!(tables.contains(&document.table), "document '{}': no schema group owns its table", document.name());
+        }
+    }
+
+    /// The boot carries a document column to a newer shape by walking its
+    /// table's primary key, so every table holding one declares a key; a
+    /// table without one would stop the boot the first time its document's
+    /// version moved.
+    #[test]
+    fn every_table_holding_documents_has_a_primary_key() {
+        let groups = groups();
+        for document in documents() {
+            let opening = format!("CREATE TABLE IF NOT EXISTS {} (", document.table);
+            let created = groups
+                .iter()
+                .flat_map(|g| g.ddl.iter())
+                .find_map(|ddl| ddl.find(&opening).map(|at| &ddl[at + opening.len()..]))
+                .unwrap_or_else(|| panic!("document '{}': no CREATE TABLE for '{}'", document.name(), document.table));
+            let statement = created.split("CREATE ").next().unwrap_or(created);
+            assert!(
+                statement.contains("PRIMARY KEY"),
+                "table '{}' holds document '{}' and declares no primary key",
+                document.table,
+                document.name()
+            );
         }
     }
 

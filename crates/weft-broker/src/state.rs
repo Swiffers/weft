@@ -102,18 +102,24 @@ pub struct BrokerState {
     /// neither a site nor the internet carries it (the network address
     /// when one is set): such a link says `public: false`.
     pub own_base_url: String,
+    /// See [`BrokerSettings::container_files_base`].
+    pub container_files_base: Option<String>,
     /// True iff the object store's own presigned links are reachable from
     /// the open internet (Cloud Storage): a link to a stored file for the
     /// outside is then the store's, straight, and never goes through the
     /// install. A local install never sets it.
     pub object_store_public_internet: bool,
+    /// Where this install runs: what decides whether a way to sign in
+    /// that keeps its credential on the person's own machine (a
+    /// local-only way) may be connected or opened here.
+    pub install: weft_core::install::InstallKind,
     /// What signs and reads the upload slots pages send files through
     /// (`weft_core::storage::slot`).
     pub slot_key: weft_core::storage::slot::SlotKey,
     /// See [`BrokerSettings::supervisor_booking`].
     pub supervisor_booking: Option<weft_task_store::drain::Booking>,
-    /// See [`BrokerSettings::aside`].
-    pub aside: weft_task_store::aside::StepAside,
+    /// See [`BrokerSettings::stopping`].
+    pub stopping: weft_task_store::stopping::Stopping,
     /// When the log last said a sender's calls do not read
     /// (`crate::wire`).
     pub unreadable_shapes: crate::wire::UnreadableShapes,
@@ -135,7 +141,13 @@ pub struct BrokerSettings {
     /// is the address, read live.
     pub internet: weft_platform_traits::config::InternetAddress,
     pub own_base_url: String,
+    /// Where the project's own containers reach the install's files door
+    /// (`InstallConfig::container_files_base`), when they do not reach the
+    /// store at the workers' address: a link for them goes through it.
+    pub container_files_base: Option<String>,
     pub object_store_public_internet: bool,
+    /// See [`BrokerState::install`].
+    pub install: weft_core::install::InstallKind,
     pub slot_key: weft_core::storage::slot::SlotKey,
     /// How long this process's platform lets one line live before cutting
     /// it, `None` when it never does (`crate::line::LineFanout::start`).
@@ -148,12 +160,11 @@ pub struct BrokerSettings {
     /// `('supervisor', SUPERVISOR_PASS_LOOP)`) as the broker answers its
     /// ownership sync, on a supervisor that scales to zero.
     pub supervisor_booking: Option<weft_task_store::drain::Booking>,
-    /// Whether this copy of the broker was replaced
-    /// (`weft_task_store::aside`): once it is, each of its lines takes no
-    /// new call, answers the ones in flight and closes, and its caller's
-    /// next call opens a line on a current copy (`crate::line`). Never set
-    /// on a machine.
-    pub aside: weft_task_store::aside::StepAside,
+    /// Whether this copy of the broker is stopping
+    /// (`weft_task_store::stopping`): once it is, each of its lines takes
+    /// no new call, answers the ones in flight and closes, and its
+    /// caller's next call opens a line on a running copy (`crate::line`).
+    pub stopping: weft_task_store::stopping::Stopping,
 }
 
 impl BrokerState {
@@ -222,10 +233,12 @@ impl BrokerState {
             app_provider: settings.app_provider,
             address,
             own_base_url: settings.own_base_url.trim_end_matches('/').to_string(),
+            container_files_base: settings.container_files_base.map(|base| base.trim_end_matches('/').to_string()),
             object_store_public_internet: settings.object_store_public_internet,
+            install: settings.install,
             slot_key: settings.slot_key,
             supervisor_booking: settings.supervisor_booking,
-            aside: settings.aside,
+            stopping: settings.stopping,
             unreadable_shapes: crate::wire::UnreadableShapes::default(),
         }))
     }

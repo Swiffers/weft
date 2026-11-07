@@ -39,7 +39,6 @@ You never trust a report you can re-verify for the cost of one command. If you c
 
 - No port renamed, added, or dropped; the one job is still the one job; no assembled `List` or `JsonDict` input.
 - A skim of `mod.rs`: no fallbacks, no swallowed errors, no retry loops, no orchestration inside the body; failures are loud.
-- **Every loop and every long wait watches `ctx.cancellation()`.** Stopping is cooperative: nothing kills a node mid-call, so a loop with no cancellation arm is a node that cannot be stopped by anything, and the only sign is a run that never ends.
 - The `live` tests are written, with the service named and fixtures declared, and [the report] names them as not run.
 
 **The half-arsing catalog.** Each of these fails [the review] and goes back as a redispatch with the specific finding:
@@ -55,7 +54,7 @@ You never trust a report you can re-verify for the cost of one command. If you c
 - **empty rig**: `tests()` returns an empty vec, or `tests.rs` does not exist, and [the report] did not say so. An access node is the one exception: its body is the `access_node!` macro, there is nothing of the smith's to test, and it ships with no `tests.rs` at all.
 - **flaky-dismissed**: an intermittently failing test waved off as flaky instead of chased to its race. A race in the node is the node's bug; a test made tolerant of it (a retry, a sleep, a longer timeout) fails [the review] on both counts.
 - **an output with no bound**: a port whose value grows with what the service answers or what the node is given (a list of results, a page of text, a response body, a transcript) and nothing that keeps it under the 100 KB wire limit: no cap input or `LIMIT`, no paging, no stored file in its place. [the report] names each such port and its bound, and a `fake` test emits the largest value the bound allows; a port missing from that list is the finding. The rule is under The wire limit.
-- **body smells**: `.ok()` discarding an error, a default value standing in for a missing input, a retry loop, orchestration inside the node, a database client or a process opened fresh on every run where `ctx.shared` would hold one, heavy work (a big parse, image or audio work, compression, hashing a large file) done inline instead of in `tokio::task::spawn_blocking`.
+- **body smells**: `.ok()` discarding an error, a default value standing in for a missing input, a retry loop, orchestration inside the node, a database client or a process opened fresh on every run where `ctx.pool` would hold one, a hand `tokio::select!` on the cancel flag, a Rust copy of a rule the metadata states, a blank filter on an optional text, heavy work (a big parse, image or audio work, compression, hashing a large file) done inline instead of in `tokio::task::spawn_blocking`.
 - **an infra output left unbaked**: an infra node's output that holds as long as the infra does (an address, a connection, a handle) with no `"baked": true`, so every run that reads it runs the node to make it again.
 - **a dead end in an image**: a state an infra container can sit in (a dead pairing, a lost credential, a revoked session) with no button on its display that leaves it, so the user's only way out is restarting or terminating the infra. Every such state gets an action, offered in every state; the rule is under Infra node.
 - **a marker in an outbound payload**: a `__weft_<kind>__` wrapper handed to a provider, a bridge, a form spec or a live item, instead of the plain URL, `data:` URL or `{ url, mimeType, filename }` that consumer reads; the rule is under A file input.
@@ -72,8 +71,9 @@ A new node goes beside the module that uses it under `src/`
 `nodes/` when several parts of the program share it, and is usable by its
 `type` name as soon as it is there; the build compiles its Rust directly.
 Its body may only `use` the `weft` crate, the crates its package declares
-in `deps.toml`, and code inside its own package; a sibling package's code is
-never on its path.
+in `deps.toml`, code inside its own package, and the shared code of a package
+its `package.toml` names in `uses` (below); any other package's code is never
+on its path.
 
 ## Anatomy
 
@@ -88,20 +88,28 @@ nodes/my_thing/
   tests.rs         optional: the node's own tests
 ```
 
-A package is a directory with `package.toml` (`[package] name`, shared
-`[dependencies]`); members are auto-detected as immediate subdirs holding a
+A package is a directory with `package.toml` (`[package] name`, an optional
+`uses` list, shared `[dependencies]`; any other key fails the load, naming it);
+members are auto-detected as immediate subdirs holding a
 `metadata.json`; shared `.rs` files at the package root are reached by
 members as `use super::<file>;`. A package root may hold a partial
 `metadata.json` of defaults every member inherits (key-by-key, member wins;
 `type`/`label`/`description` are never inherited). Never place any of this
 under `nodes/base_catalog/`: `weft catalog update` wipes it.
 
-Each package compiles as its own crate, so a project's node sees its own
-package's shared files and nothing under `nodes/base_catalog/`: you cannot
-`use` a stdlib helper such as `elevenlabs.rs`. If you need one function from
-a stdlib helper, copy it into your package's own shared file and say so in
-[the report]. If you need a whole capability, report it as a ctx feature the
-language is missing.
+Each package compiles as its own crate, so a node sees its own package's
+shared files and nothing else, until its package says otherwise. If it needs
+code another package already has (a stdlib helper such as the `elevenlabs`
+package's `elevenlabs.rs` included), the package names that package in its
+`package.toml`, `uses = ["elevenlabs"]`, and calls its shared files as a crate
+of that name (`use elevenlabs::elevenlabs;`), reaching whatever they make
+`pub`; the used package brings its own `[dependencies]`. Never reach for its
+nodes' `mod.rs`: a build compiles only the nodes a program uses. A `uses` that
+cannot be met (no package of that name loads, two packages using each other,
+a bare node folder with no `package.toml`, a name Rust refuses such as
+`my-tools`) leaves the package out with a reason naming its `package.toml`.
+If you need a whole capability no package has, report it as a ctx feature
+the language is missing.
 
 `weft`, `tokio`, `serde`, `serde_json`, `async-trait`, `anyhow` and `tracing`
 are always available without declaring them; anything else, `uuid` included,
@@ -119,11 +127,12 @@ Unknown keys are a loud parse error. Top level:
 | `outputs` | output ports |
 | `metadataPorts` | ports whose value you write here by hand and no run computes, each `{ "name", "type", "description", "value" }` (`description` optional). A wire leaving one is a metadata wire: the compiler writes the value into the input it points at, as if typed there, and the wire never runs. Their names share one namespace with `inputs` and `outputs` |
 | `types` | named type declarations, e.g. `"ChatHistory": "List[ChatMessage]"` |
-| `features` | flags: `pure` (the body does nothing outside its run beyond answering its caller and the run's own files: no network, connection, `ctx.run`, wait, tag, or storage beyond this run; a durable run starts it without waiting for the database and runs it again after a crash if it had sent nothing on and reads no stream. `Text`, `Switch` and `Reply` are pure, `HttpRequest` is not; an outside ctx call on a pure node fails, naming the flag), `isTrigger`, `canAddInputPorts` (an open-ended set of values arrives as ports the author declares inline; the body reads `ctx.inputs.custom()`), `canAddOutputPorts`, `join` (the node meets several branches and goes on with whichever arrived, as `FirstInOrder` does: the inputs a program adds are optional, it runs once everything it waits on arrived or closed, closes its output itself when nothing arrived, and needs no `_should_flow`), `customInputType`, `customOutputType` (the type every added output takes, as `customInputType` is for added inputs; a variable one of the node's inputs uses, `T`, types each added output as that input), `pairsAddedPorts` (each input a program adds comes with an output of the same name, which the compiler makes and the program never writes; an added output nothing reads fails the build; declared beside `canAddOutputPorts`, as `Dispatch` does), `oneOfRequired`, `showDebugPreview`, `liveEndpoint` (the endpoint serving this infra node's display, see [The display](#the-display)), `castPorts`, `hidden`, `answersCaller` (`"whole"`, `"stream"` or `"end"`: this node answers a live caller the way `Reply`, `Stream` or `Close` does; any custom node that answers the caller declares it, so the compiler counts it), `liveConnection` (`"http"` or `"websocket"`: this trigger holds a caller, as `Route` and `Socket` do), `addedPortsAreDataKeys` (under Spelling) |
+| `features` | flags: `pure` (the body does nothing outside its run beyond answering its caller and the run's own files: no network, connection, wait, tag, or storage beyond this run; a durable run starts it without waiting for the database and runs it again after a crash if it had sent nothing on and reads no stream. `Text`, `Switch` and `Reply` are pure, `HttpRequest` is not; an outside ctx call on a pure node fails, naming the flag), `isTrigger`, `canAddInputPorts` (an open-ended set of values arrives as ports the author declares inline; the body reads `ctx.inputs.custom()`), `canAddOutputPorts`, `join` (the node meets several branches and goes on with whichever arrived, as `FirstInOrder` does: the inputs a program adds are optional, it runs once everything it waits on arrived or closed, closes its output itself when nothing arrived, and needs no `_should_flow`), `customInputType`, `customOutputType` (the type every added output takes, as `customInputType` is for added inputs; a variable one of the node's inputs uses, `T`, types each added output as that input), `pairsAddedPorts` (each input a program adds comes with an output of the same name, which the compiler makes and the program never writes; an added output nothing reads fails the build; declared beside `canAddOutputPorts`, as `Dispatch` does), `oneOfRequired`, `showDebugPreview`, `liveEndpoint` (the endpoint serving this infra node's display, see [The display](#the-display)), `castPorts`, `hidden`, `answersCaller` (`"whole"`, `"stream"` or `"end"`: this node answers a live caller the way `Reply`, `Stream` or `Close` does; any custom node that answers the caller declares it, so the compiler counts it), `liveConnection` (`"http"` or `"websocket"`: this trigger holds a caller, as `Route` and `Socket` do), `addedPortsAreDataKeys` (under Spelling) |
 | `portsFromConfig` | ports derived from a config list: `{ "field", "matchInput", "specs": [{kind, keyField, catchAll?, addsInputs, addsOutputs}] }` |
 | `firesWith` | trigger only: EVERY field a firing can carry, name to weft type, `?` on the name for sometimes-present (`{"scheduledTime": "String", "caller?": "JsonDict"}`). Checked exactly: a firing missing a required field is refused, and so is one carrying a field you did not name. On a node without `features.isTrigger`, or with a type weft cannot parse, the node fails to load |
 | `display` | inline render: `{ "kind": "media" \| "link", "output" \| "input": "<port>" }` |
 | `validate` | declarative rules: `{ "when": {...}, "then": {message, level: "structural"\|"runtime", field} }` |
+| `lists` | named lists of text a rule of another node reads off this one when it is wired into that node: `{ "reservedToolNames": ["apply_patch"] }`. Names are camelCase, items are text; how a rule reads one is under the `validate` conditions below |
 | `requiresInfra`, `images`, `publishes` | infra nodes |
 | `service` | access nodes only, the connection recipe |
 | `claimsRoute` | a node that claims a public address: `pathField` names the input holding the route pattern, and the optional `methodField` the input holding the HTTP method. Leave `methodField` out and the node serves every method; with it set, a program that leaves that input empty serves every method too. Naming an input the node does not declare fails the load |
@@ -181,7 +190,9 @@ checks the name the program gives the node.
 
 Input entry: `name`, `type`, `required`, `accepts`,
 `widget`, `default`, `label`, `placeholder`, `description`, `requiresScopes`,
-`requiresValues`.
+`requiresValues`, `keepsBlank`. A blank
+optional `String` arrives absent (`opt` gives `None`, rules and `oneOfRequired`
+count it not given); `"keepsBlank": true` keeps one where blank means something.
 
 If an unwired input means something of its own (no `instance`: the program's
 own copy), leave it optional (no `required`): unwired, the node runs without
@@ -205,14 +216,19 @@ A `code` widget's `language` is one of `python`, `javascript`, `sql`, `json`;
 any other word fails to load. `json` also fits a `JsonDict` input
 (edited as JSON text); the others edit a `String`. A `number` widget with a whole `step`
 (`"step": 1`) takes whole numbers only: the compiler checks a written value
-and the runtime a wired one, so your body can cast it to an integer.
+and the runtime a wired one, so your body can cast it to an integer. A `datetime`
+is checked the same way, so read it as `ctx.inputs.get::<chrono::DateTime<chrono::Utc>>("at")?`.
 Output entry: `name`, `type`, `description` (an output has no `required`), `narrowable`, and on an infra node `baked` (see Infra node). If only the program knows an output's shape (a model's JSON answer, a request's body, a query's rows), type it broadly and set `"narrowable": true` (any type that fits inside `type`), or a type string (anything that fits inside that type, which may be wider than `type`): the program then declares what it holds (`-> (response: Verdict)`), and each value is checked against that at run time. Without it, a program can only restate the output's own type.
 
 A `validate` rule's `when` is a closed set of conditions, combined with
 `all`, `any` and `not`: the input and config checks (`input_satisfied`,
-`input_wired`, `output_wired`, `config_present`, `config_equals`, ...), plus
-the graph checks below. A rule never names another node's type: it selects
-nodes by a feature they declare, with `with: {feature: value}`.
+`input_wired`, and `value`: `{ "kind": "value", "field": "x" }` is "set", plus
+any of `nonempty`, `equals`, `oneOf`, `matches`, `count`, `range`, `length`,
+`unique`, `each`, `noneOf`, `noneMatch`; a list's fewest items is `not` of `count: { "min": 2 }`),
+plus the graph checks below. A rule a wired value leaves open is checked again
+on the value that arrives, so never repeat one in Rust. A connection input names
+its service in its type (`"type": "Access[fal]"`, a union for several);
+otherwise a rule selects nodes by a feature they declare, `with: {feature: value}`.
 
 - `run_reaches` (`direction: "downstream"` or `"upstream"`, `with`): the run
   this node is part of holds a node with that feature. `Route` checks
@@ -234,9 +250,35 @@ nodes by a feature they declare, with `with: {feature: value}`.
   `names: {"field": {}}` is a field written `node.field`, narrowed with
   optional `instanceFilled: true/false`. Wrap it in `not` to refuse a bad
   name. A wired name is not known yet, so the rule does not fire on it.
+- `local_install`: the program is built for a local install, one that runs
+  things on the machine weft runs on. Only a build for an install answers it:
+  the install's own, and `weft run` and `weft status`, which compile for the
+  install they talk to. `weft validate` and the editor build for none, so a
+  rule leaning on it does not fire there. A node a cloud install cannot run
+  without some input refuses it with `all` of `not local_install` and `not
+  input_wired` on that input (the agent nodes' rule on `computer`).
 
-`{with}`, `{perInstanceReason}` and `{names}` in the message name what the
-check found (`{perInstanceReason}` says why, path included: "it reads
+Every condition answers yes, no or not known yet, and `all`, `any` and `not`
+fold those answers. What the build can answer (the install kind) is settled
+there; only the part still unknown (a value a wire brings) is kept and asked
+again when the node fires, with the value in.
+
+`noneOf` (the value is none of these) and `noneMatch` (it is text no regex of
+these matches; a regex matches anywhere unless you anchor it, `"^mcp__"`)
+take a literal list, or a list another node declares under `lists`:
+`{ "list": "<name>", "ofNodeWiredInto": "<one of your inputs>" }`, the list
+of that name on the node wired into that input, followed back through groups,
+included files and a loop's way in. Nothing wired there reads as an empty
+list. A wired node that declares no list of that name fails the build
+(`list-not-declared`) unless you add `"optional": true`, and a listed regex
+that does not compile fails it too (`list-not-regex`). AskAgent's rules,
+reading `reservedToolNames` and `reservedToolNamePatterns` off the agent node
+wired into `agent`, are the worked case.
+
+`{with}`, `{perInstanceReason}`, `{names}`, `{noneOfFound}` and
+`{noneMatchFound}` (the values refused) and `{wiredNode}` (the node a list
+came from, with its type) in the message name what the check found
+(`{perInstanceReason}` says why, path included: "it reads
 'bridge'", "it sits inside group 'work', which receives 'bridge'"). Copy a real rule from `Route`, `Reply` or `StartInfra`
 before writing your own.
 
@@ -310,7 +352,8 @@ bag: `ctx.inputs.get::<T>("name")` returns the value however it arrived
 (wire, braces literal, assignment literal, or the declared `default`).
 
 You fail loudly, always: `WeftResult<()>`; `ctx.inputs.get(...)?` stamps its
-own errors; `node_bail!("message")` for conditions the node detects;
+own errors; `node_bail!("message")` for conditions the node detects
+(`input_bail!` when the fix is in the program, which `_error` does not catch);
 `.node_err("context")?` wraps an external error with context. A node body
 never names a `WeftError` variant and never falls back to a default: the
 failure is recorded in the journal where the user reads it. If you catch
@@ -339,27 +382,33 @@ node repeats, so you never write it again: `get_json` / `post_json` (send,
 refuse a non-success status quoting the provider's own words, parse),
 `json_call` for a request you prepared yourself, `checked_send` when the
 answer is not JSON, `require_ok_flag` for a service that answers 200 and says
-`ok: false` in the body, `cursor_paged` with a `CursorPaging` (its
-`past_cap_hint` tells the user what to narrow when the list runs past the page
-cap) for a cursor-paged list, and `required_str` for a field you cannot do
-without. To hand a stored file to a provider,
-`ctx.storage(scope).external_file(&file)` gives its link when the open
-internet can open it, else a `data:` URL of its bytes, with its mime type and
-filename; never write that fallback yourself. To emit a struct, use
+`ok: false` in the body, `cursor_paged` with a `CursorPaging` (its request
+closure takes the cursor: `param: Some("cursor")` for a query parameter, `None`
+when the closure puts it in the body), `required_str` for a field you cannot do
+without, and `client::url(API, &["files", id]).query("q", q).query_opt("pageToken", tok)`,
+which encodes every segment and value. To upload a stored file, stream it:
+`ctx.storage(scope).body(&file).await?` (`.len()` up front), then `.stored_body(body)` (`client::StoredBodyExt`) or
+a multipart `form.stored("file", body)`. `external_file(&file)` gives the
+file's link to a provider that fetches by link, or a `data:` URL. To emit a struct, use
 `NodeOutput::new().set_serialized(port, &value)?`.
 
-**Waiting on a provider's job** (a render, a dub, a crawl) is
-`ctx.await_signal(PollEndpoint { .. })`, never a sleep loop in the body,
-which holds a worker for the whole job. Submit inside `ctx.run`, then wait:
+**Waiting on a provider's job** (a render, a dub, a crawl) is a `state.wait`
+on `PollEndpoint`, never a sleep loop in the body, which holds a worker for
+the whole job. Keep the steps in the node's state (**Pausing**
+below), submit inside `state.once`, then wait:
 
 ```rust
 use weft::signal::{PollEndpoint, Predicate};
 
-let submitted = ctx.run("submit", || async {
+#[derive(Default, Serialize, Deserialize)]
+struct Render { submitted: Option<Value>, status: Option<Value> }
+
+let mut state = ctx.keep(Render::default()).await?;
+let submitted = state.once(|s| &mut s.submitted, async |_| {
     post_json(&http, &submit_url, &payload, "submitting the render").await
 }).await?;
 let id = submitted["request_id"].as_str().node_err("the submit answered no request_id")?;
-let status = ctx.await_signal(PollEndpoint {
+let status = state.wait(|s| &mut s.status, PollEndpoint {
     url: format!("{API}/requests/{id}/status"),
     interval_secs: 5,
     access: Some(weft::primitive::AccessRef::from(&account)),
@@ -370,52 +419,71 @@ let status = ctx.await_signal(PollEndpoint {
 
 The worker goes away while it waits. The first check runs at once, then
 every `interval_secs` (under 5 is refused); the first answer passing every
-filter is what `await_signal` returns, and checking stops. A failed check is
-tried again at the next one. The body then replays from the top, which is why
-the submit sits in `ctx.run`: without it the replay starts and pays for a
-second job. Filter on "not in flight" as above, so an unknown status ends the
-wait and your code can fail on it. `delta` is refused here. Read the
-stdlib's `nodes/base_catalog/ai/fal/fal.rs` (`run_queued`) for a whole worked case.
+filter lands in `status`, and checking stops. A failed check is tried again
+at the next one. The body then runs again from the top with the state it
+saved, so `once` hands back `submitted` without paying for a second job.
+Filter on "not in flight" as above, so an unknown status ends the wait and
+your code can fail on it. `delta` is refused here. Read the stdlib's
+`nodes/base_catalog/ai/fal/fal.rs` (`run_queued`) for a whole worked case.
 
 If the service can cancel a job, hand the wait its cancel call, so a run
 stopped while it waits stops the job and its bill too:
-`ctx.await_signal_with_cancel(PollEndpoint { .. }, CancelCall::put(cancel_url))`
-(`weft::signal::CancelCall`, also `post` and `delete`, and `.with_body(json)`).
-weft sends it once, with the wait's own `access`, when the run is cancelled
-while it waits, and never when the wait is answered or the run ends any
-other way. `run_queued` in that same file does it.
+`state.wait(|s| &mut s.status, PollEndpoint { .. }.cancel_with(CancelCall::put(cancel_url)))`
+(`weft::signal::{CancelCall, CancelWith}`; also `post`, `delete`, `.with_body(json)`),
+sent once through the wait's `access` only if the run is cancelled while it
+waits (`run_queued` does it). Something made at the provider that must not
+outlive the node (an upload) is registered right after it exists:
+`ctx.after_node(CancelCall::delete(url).always(), &account).await?`, sent
+once however the node ends, crash included (`rig.owed_calls()` in a test).
 
 You emit only through `ctx.pulse_downstream(NodeOutput::new().set(port, value))`;
 ports you did not emit are closed, which is the skip signal downstream. For
 user-added output ports use `ctx.fan_declared(...)`.
 
-**Share what is slow to build**: a client pool, a process. `ctx.shared(&access, |opened| async move { .. })` builds it the first time a run asks and hands every later run on that worker the same one; it is built again when the connection's values change, or after nobody used it for the project's idle window (300 seconds by default, `weft workers set --shared-idle-seconds`). The closure returns a `WeftResult` of the thing and you get a handle you use as the thing. `ctx.shared("name", |()| async { .. })` is the same when nothing is built from a connection, and `.with_limit(n)` before the `.await` lets at most `n` runs of a worker hold it at once. That never keeps a database under its limit, because any number of workers run a node at once. So have your pool close a connection after a few idle seconds (the Postgres nodes use 5) and never hand a run one idle for longer, because a Cloud Run copy has no CPU between requests to run your close timer, and leave the waiting to whatever sits in front of the database, such as a PostgresDatabase's pooler. If your node keeps a connection idle on purpose (one that `LISTEN`s), the database may close it (a PostgresDatabase does after a minute), so lift `idle_session_timeout` for that session when it connects, the way PostgresWatchQuery does. A database client opened on every run pays the connection each time; for a worked pool, go and read `nodes/base_catalog/postgres/postgres.rs`.
+**Share what is slow to build.** Connections go in `ctx.pool(&access, |opened| async move { dial(&opened).await }).max(20).idle_close(Duration::from_secs(5)).check(|c| !c.is_closed()).reset(|c| async move { clear(&c).await.map(|()| c) }).take().await?`: a `Lease` you use as the connection, given back when dropped (`lease.discard()` lets it go), and the wait for a free one ends on a cancel. Every ask of one pool gives the same settings. `.max` caps one worker, and any number of workers run a node, so it never keeps a database under its limit: keep `idle_close` to a few seconds (one idle longer is never handed out) and leave the waiting to whatever sits in front of the database, such as a PostgresDatabase's pooler. If your node keeps a connection idle on purpose (one that `LISTEN`s), the database may close it (a PostgresDatabase does after a minute), so lift `idle_session_timeout` for that session when it connects, the way PostgresWatchQuery does. One thing that is not a pool (a client, a loaded model) is `ctx.shared(&access, |opened| async move { .. })` (or a name and `|()|`): one per worker, built again when the connection changes or after the idle window (300 seconds, `weft workers set --shared-idle-seconds`).
 
-If the worker dies while your body runs, a fast run (the default) ends cancelled, and a durable run fails the node: its start was on record before the body began, so the next worker knows it was running and fails it rather than start it again. With `_error` wired, that failure goes to `_error` like any other. A node marked `pure` is the exception: a firing of it that had sent nothing on and read no stream runs again, since it did nothing anyone could see. The one other body weft starts again on purpose is one parked on `ctx.await_signal`, which replays from the top when its answer comes, so the work before the wait goes through `ctx.run(...)`, which
-gives back the recorded result. An emit on a port already sent before the wait does nothing on the replay, so a node can send `stats` at once, wait, then send `image`; what it cannot do is wait after yielding on or closing a stream output, which is refused. In a run that cannot pause (a route's caller on the line, `recorded: false`, a bus open), `ctx.await_signal` holds in your call instead and returns the answer without a replay; if the run stays quiet for its trigger's `holdSecs`, the call fails with `WeftError::WaitGaveUp`, which your node may match and handle (test it with `rig.signal_given_up()`).
+If the worker dies while your body runs, a fast run (the default) ends cancelled, and a durable run fails the node: its start was on record before the body began, so the next worker knows it was running and fails it rather than start it again. With `_error` wired, that failure goes to `_error` like any other. Two bodies are the exception. A firing of a `pure` node that had sent nothing on and read no stream runs again, since it did nothing anyone could see. And a firing that saved a state (below) runs again from its last save, and is handed again the stream items it took since.
 
-**Stopping is cooperative, and a node that ignores it cannot be stopped.**
-Nothing kills a node mid-call: a cancelled run (the caller left, a
-person pressed stop, a newer run stopped this one) only trips a flag, and
-the node is what acts on it. So anything that does not return promptly by
-itself watches that flag and returns when it trips:
+**Pausing: the state says where the node is.** A body that pauses does not carry on from the line it paused on. When the run picks back up, the body runs again from the top and gets back, at once, the last state it saved. That state is all it has to know where it was:
 
-```rust
-let cancel = ctx.cancellation();
-loop {
-    // ... one pass of the work ...
-    tokio::select! {
-        _ = tokio::time::sleep(interval) => {}
-        _ = cancel.cancelled() => return Ok(()),
-    }
-}
-```
+- `let mut state = ctx.keep(S::default()).await?;` first thing, once per firing (a second fails the node). `S` is any `Default + Serialize + Deserialize` struct, usually one `Option` field per step, and `state` reads and writes as `S`. A node with nothing to keep writes `ctx.keep(()).await?`.
+- `state.once(|s| &mut s.field, async |_| { .. }).await?` runs the work only while the field is empty, then stores the result and saves; a filled field hands its value back without running anything. Every call that must not happen twice goes in one. The one gap: a crash after the work returned and before the save landed runs it again. If the service on the other end must never see it twice (a payment), send
+`ctx.firing_key()` as its idempotency key: it is the same every time this
+firing's body runs again, and different on every loop iteration and in every
+other run (`format!("{}-refund", ctx.firing_key())` for a second such call).
+- `state.wait(|s| &mut s.field, signal).await?` is the same for a signal (a `Timer`, a `Form`, a `PollEndpoint`, ...): the answer lands in the field, read as its type (`Option<serde_json::Value>` keeps it raw). A wait somebody skipped ends the firing skipped.
+- `state.save().await?` writes the state now, after you change a field yourself.
+- Every call where the run can pause takes `&mut state`: `cursor.next(&mut state)`, `cursor.next_json(kind, &mut state)`, `bus.wait_for(name, &mut state)`, `gen.next(&mut state)`, `ctx.yield_downstream(output, &mut state)`, and the program-call helpers that wait (the tables below). So a node that reads a bus or a stream keeps a state, `()` if nothing else.
 
-Every loop that waits, every long external call, every read that could block
-for minutes. A node that loops without it keeps running after everything
-that asked for it is gone, and the only sign is a run that never ends. If
-you catch yourself writing a loop with no cancellation arm, stop and write:
-"Wait. Nothing else can stop this." Then add the arm.
+On resume, the body runs again from its top and knows where it was only from its state, so whatever the steps before decided (the branch taken) goes in the state too. The first time a run reaches a call where it can pause, it must not have read a bus or a stream directly (not through `state.read`) before it, except inside a `state.once` that finished; otherwise the node fails there, on its first run already. The runtime keeps the name the node holds on each bus and how many items it yielded, and re-yielding an item or re-emitting a port already sent sends nothing, so a node can send `stats`, wait, then send `image`.
+
+A run pauses when it is recorded and no caller is connected (a connected caller keeps the run on its worker, whatever `outlivesCaller` says). Open buses and streams do not stop it: once every running node waits, one of them on an answer from outside, and that has lasted the trigger's `pauseAfterSecs` (default 10), they all save together, and the next worker opens the buses again where they were. Until then `state.wait` stays open in your call, and an answer that comes goes straight into it: your body carries on from that line, never run again. Node tests never pause, but a second `rig.run(&Node, inputs)` on the same rig picks the firing up the way a resume does (its saved state back, each wait already answered handing back that answer), and `rig.saved_state(&Node)` shows what it last saved: test the resume that way. Where the run cannot pause, `state.wait` holds in your call: with a caller on the line, for as long as the caller stays; with none, if the run stays quiet for its trigger's `holdSecs`, the call fails with `WeftError::WaitGaveUp` (`0` refuses the wait at once, caller or not), which your node may match and handle (test it with `rig.signal_given_up()`).
+
+**Asking a person** is a `state.wait` on a `Form` built from data, so a
+node can ask what it only learned while it ran
+(`weft::signal::{ChoiceOption, Form, FormField}`):
+`Form::for_person(kind, title, description, fields)` with `FormField::display`,
+`display_image`, `chat_history` (a ChatHistory file shown as its messages),
+`decision` (with `.approve_label` / `.reject_label`), `choice` and `choices`
+(each option a `ChoiceOption::new(value, label)`, optionally `.described(text)`;
+the answer is the value), `text` and `long_text` (`.placeholder(text)`).
+`.required()` keeps Submit off until the field is answered, and
+`.answering_for(key)` makes a box a second way to answer field `key`. Read the
+submission with `schema.answers(&submission)?` (keep `form.schema.clone()`
+before the wait), then `.decision(key)?` or `.value::<T>(key)?`, each failing
+loudly on a wrong shape. A form with two fields under one key, a required field
+that only shows something, or an `answering_for` naming no field is refused
+when it is registered. `nodes/base_catalog/agents/answer_agent/mod.rs` builds
+one from an agent's question.
+
+**Stopping is cooperative.** A cancelled run (the caller left, a person
+pressed stop, a newer run stopped this one) trips a flag, and everything the
+ctx hands out (HTTP clients and their bodies, endpoint calls, storage, bus
+reads, sockets, a pool's wait) then ends with the cancelled error, which `?`
+carries out. Work of the node's own (a child process, a timer, a library's
+call) goes through `ctx.cancellation().race(child.wait()).await?`, or it runs
+on after everyone who asked is gone; `cancellation::is_cancel(&e)` spots a
+cancel that crossed a library.
 
 **Heavy work goes through `tokio::task::spawn_blocking`.** A body runs on
 the same few threads (one per CPU) as the worker's door and its other runs,
@@ -445,9 +513,9 @@ every older run of the project carrying the tag, waiting ones included (a
 run parked on a person or a timer never wakes); `StopSelf::Include` stops
 this run too. Tag first, then stop: a stop only reaches runs that put the
 tag on before this one did, so when two runs race, the later one survives.
-Both calls are safe to repeat when the body replays after a wait (a
+Both calls are safe to repeat when the body runs again after a pause (a
 repeated tag keeps its place in the order, a repeated stop finds its targets
-already ended), so neither goes through `ctx.run`. Pass any non-empty string
+already ended), so neither needs `state.once`. Pass any non-empty string
 as a tag, a chat id or an email included: the ctx keeps a valid tag
 (`[A-Za-z0-9_-]{1,64}`) as it is and turns anything else into one (other
 characters become `_`, plus a short fingerprint of the original), the same
@@ -463,7 +531,7 @@ and end in one call:
 
 | Call | Answers |
 |---|---|
-| `ctx.infra(node).instance(id).start()` | `()` once the instance's container runs (the run parks between looks); fails with its `failure` |
+| `ctx.infra(node).instance(id).start(&mut state)` | `()` once the instance's container runs (the run parks between looks); fails with its `failure` |
 | `.stop(take_down, stop_self)` / `.terminate(take_down, stop_self)` / `.wipe(take_down, stop_self)` / `.upgrade(take_down, stop_self)` | `InfraDownAnswer` from stop, terminate and wipe (`TakenDown`, `AlreadyDown` or `NoCopy`), `()` from upgrade. `take_down` is a `TakeDownChoice`, the answers of `weft deactivate` as optional fields (`door`, `door_for_minutes`, `held`, `running`): `TakeDownChoice::default()` takes every default, and `TakeDownChoice { running: Some(Running::Cancel), ..Default::default() }` changes one. `stop_self` is a `StopSelf` |
 | `.status()` | `Option<InfraCopy>`: `{ node, instance, status, failure }`, `None` when there is no container |
 | `ctx.infra(node).copies()` | `Vec<InfraCopy>`, the shared container and each instance's |
@@ -477,8 +545,8 @@ and end in one call:
 | `ctx.tokens().mint_for_instance(id, expires_in)` / `.instance(id).revoke()` | `MintedInstanceToken { id, token, expires_at_unix }` / `()` |
 
 The types are in `weft::program` (`InfraCopy`, `CostRecord`, `PaidBy`,
-`MintedInstanceToken`). Every call is journaled, so none goes through
-`ctx.run`. The `instances` package already wraps most of them (`CurrentInstance`,
+`MintedInstanceToken`). A call that must not be made twice when the body
+runs again goes in `state.once`. The `instances` package already wraps most of them (`CurrentInstance`,
 `StartInfra`, `ListInstanceInfra`, `InstanceCosts`, `SetInstanceValues`, ...), so check it before
 writing one. In the `fake` tier, `rig.instance("user-42")` makes the run a run
 for that instance, `rig.answer_program_call("weft.infra.status", json!(..))`
@@ -496,7 +564,7 @@ code and any one run:
 
 | Call | Answers |
 |---|---|
-| `ctx.project(id).code()`, or `ctx.code()` on its own project | a working copy's code: `.state()` (the working copy and its files, `path -> sha256`), `.file(path)`, `.read_text(path)`, `.write_text(path, text)`, `.remove(path)`, `.edit().text(..).stored(..).blob(path, hash)?.remove(..).expecting(hash).apply()` (every file lands or none does; `.blob` puts a file the owner already holds, by the sha256 `.state()` gave, with nothing downloaded, so copying another project's files, such as its `nodes/base_catalog/`, is one `.state()` and one `.apply()`; a hash that is no sha256 fails `.blob`, one the install does not hold refuses the write), `.checkpoint(label)`, `.switch_to(version)` / `.switch_to_run(run)` (what `weft branch` does, but `.switch_to` takes a full version id, never a label or a prefix; `.tree()` on the project gives a label's id), `.build().start()`, and `.run()` with a setter named after most `weft run` flags (`.example`, `.from`, `.emit`, `.target`, `.before`, `.group`, `.feed`, `.fire`, `.instance(id)?` (it checks the id's form), `.seed`, `.seed_run`, `.seed_until`, `.seed_before`, `.durable`, `.fast`, `.keep_for`, `.referenced`, `.root`; none for `--check`, `--save`, `--clear`, `--hold-secs` or `--detach`, and `.start()` returns once the run has started; `.example(name)` is the example name `weft run` takes), then `.start()`, which builds and starts the run. If you name no working copy with `.working_copy(id)`, it acts on the project's most recently changed folder: on a local install the files are written into that folder, and on a cloud install they reach it with the person's next `weft` command; a project with no folder uses the copy programs write into. `ctx.project(id).forget_working_copy(copy)` is `weft forget-copy`: the copy's files become a version (`saved`) and the copy is removed |
+| `ctx.project(id).code()`, or `ctx.code()` on its own project | a working copy's code: `.state()` (the working copy and its files, `path -> sha256`), `.file(path)`, `.read_text(path)`, `.write_text(path, text)`, `.remove(path)`, `.edit().text(..).stored(..).blob(path, hash)?.remove(..).expecting(hash).apply()` (every file lands or none does; `.blob` puts a file the owner already holds, by the sha256 `.state()` gave, with nothing downloaded, so copying another project's files, such as its `nodes/base_catalog/`, is one `.state()` and one `.apply()`; a hash that is no sha256 fails `.blob`, one the install does not hold refuses the write), `.checkpoint(label)`, `.switch_to(version)` / `.switch_to_run(run)` (what `weft branch` does, but `.switch_to` takes a full version id, never a label or a prefix; `.tree()` on the project gives a label's id), `.build().start(&mut state)`, and `.run()` with a setter named after most `weft run` flags (`.example`, `.from`, `.emit`, `.target`, `.before`, `.group`, `.feed`, `.fire`, `.instance(id)?` (it checks the id's form), `.seed`, `.seed_run`, `.seed_until`, `.seed_before`, `.durable`, `.fast`, `.keep_for`, `.referenced`, `.root`; none for `--check`, `--save`, `--clear`, `--hold-secs` or `--detach`, and `.start(&mut state)` returns once the run has started; `.example(name)` is the example name `weft run` takes), then `.start(&mut state)`, which builds and starts the run. If you name no working copy with `.working_copy(id)`, it acts on the project's most recently changed folder: on a local install the files are written into that folder, and on a cloud install they reach it with the person's next `weft` command; a project with no folder uses the copy programs write into. `ctx.project(id).forget_working_copy(copy)` is `weft forget-copy`: the copy's files become a version (`saved`) and the copy is removed |
 | `ctx.run_by_id(run)` | one run of any of the owner's projects: `.stop()`, `.wake(node)`, `.logs(n)`, `.events()...read()`, `.outputs(focus)`, `.detail()`, `.node_state(node)`, `.delete()` |
 
 On its own project a program cannot start a run (every run would start the
@@ -510,9 +578,26 @@ resync` and `weft rm`, all three work.
 ## The special shapes
 
 **Access node**: the whole body is `weft::access_node!(MyServiceAccessNode);`
-plus a `service` recipe in metadata (acquisition fields with `secret: true`,
-auth steps, a test URL, an identity template). The macro reads the `account`
-input and pulses it on `access`. It has no `tests.rs`: the macro is the whole
+plus a `service` recipe in metadata (auth steps, a test URL, an identity
+template, and how the credential is acquired). A pasted credential is
+`"acquisition": { "kind": "static", "ways": [...] }`: one way per way to sign
+in, each with an `id` (camelCase, left out when there is only one), a `label`
+(required when there are several), its `fields` (each one secret unless
+marked `"secret": false`), an optional `guide`, and `"localOnly": true` for a credential that
+must stay on the person's machine (a subscription's token), which a cloud
+install never offers and refuses to open. `weft connect` asks which way, or
+takes `--way <id>`. A node that hands each way's credential on differently
+reads which one it holds with `.way()` on what `ctx.open(&access).await?`
+answers (`None` for a connection made another way). If what is pasted is a login that expires
+(a login file with a refresh token), give its way a `renewal`, saying how to
+read the paste and how to renew it, and weft keeps it alive: no node ever
+writes tokens back (`nodes/base_catalog/agents/codex_access/metadata.json` is one to copy). If the
+service refuses the token a node was handed, that node calls
+`ctx.renew(&access).await?`, after opening the connection in the same firing
+(without that open the node fails), and gets the renewed values; weft renews
+once however many nodes ask at the same moment. The macro reads the `account`
+input (typed with its own service, `Access[google]` on GoogleAccess; the
+catalog refuses another) and pulses it on `access`. It has no `tests.rs`: the macro is the whole
 body, so there is nothing of yours to test, and the review does not ask for
 one. The test URL must pass whatever permissions the person ticked: when it
 needs a permission of its own to learn who the account is, declare that
@@ -538,13 +623,13 @@ each value sits in the token answer (`tokenPath`, `refreshTokenPath`,
 `expiresInPath` or `expiresPath`, `scopePath`), where an error answered with a
 `200` shows (`errorPath`, `okPath`), and `{{`/`}}` writes a literal brace in a
 template. A token that renews must say where its expiry is, or declare
-`neverExpires`; connecting refuses it otherwise. A gate that checks callers (a
-webhook signature, a bearer from an identity provider) is a `verify` block.
+`neverExpires`; connecting refuses it otherwise. A provider's signed pushes
+are checked by a `verify` block in the topic's `webhook`.
 For every key and its rules, go and read
 https://weavemindai.github.io/weft/connections/declaring-a-service.html and
 https://weavemindai.github.io/weft/connections/verifying-requests.html, and
 start from the catalog access node closest to the service (Slack's declares
-`okPath`, `HmacAuth` a `verify` block).
+`okPath`). A route's own callers are checked by its `auth` setting, never by a node.
 
 **Infra node**: `"requiresInfra": true`, plus `images` (dirs with a
 Dockerfile the CLI builds) and `publishes` (the service name it hands out).
@@ -552,7 +637,11 @@ Implement `async fn provision_infra(&self, ctx, input) -> WeftResult<InfraSpec>`
 returning the desired-state spec; the engine applies it, then calls `run`.
 
 **Bake every output that holds as long as the infra does** (an address, a
-connection, a handle): `"baked": true` on the output in `metadata.json`. A baked output is made when the infra is applied, and a run that reads nothing from your node but baked outputs uses the saved values instead of running it, so a route that queries a database never calls the database's side container. A run that also reads an output that moves on its own (a status, a phone number a bridge pairs later) runs your node, and a baked output your `run` sends nothing on then carries the saved value. weft bakes again every time the infra is applied, and on `weft infra rebake <node>`. In between, the container itself tells weft when a value changes (a reset button, a rotated password): it `POST`s `{"connection": {"password": "..."}}` to `$WEFT_VALUES_URL`, which weft sets on every container of the unit (`connection` changes values inside the connection your node published, `outputs` changes baked outputs by name). Only what your node already handed weft can change. The push answers `200` once weft has written the value, or `422` with a body naming the key or output it could not change. If the push came from a button and failed, answer the press with `{ "result": { "error": "..." } }` telling the person to run `weft infra rebake <node>`. The value itself never goes in the press's answer. The Postgres node's reset is the worked example (`nodes/base_catalog/postgres/database/images/credential/bootstrap.py`). Changing what `run` emits on a baked output is not noticed on its own: run `weft infra upgrade`, which rebuilds the infra against your current source and bakes again. A node that fails using a connection an infra node made says to run `weft infra rebake` on that node; your node's own error says only what the driver said.
+connection, a handle): `"baked": true` on the output in `metadata.json`. A baked output is made when the infra is applied, and a run that reads nothing from your node but baked outputs uses the saved values instead of running it, so a route that queries a database never calls the database's side container. A run that also reads an output that moves on its own (a status, a phone number a bridge pairs later) runs your node, and a baked output your `run` sends nothing on then carries the saved value. weft bakes again every time the infra is applied, and on `weft infra rebake <node>`. A bake runs your `run` as a setup: `ctx.is_setup()` is `true` there (and
+while the program's triggers are set up), `false` in every real run, so a body
+that would hold a session or a bus open for a run emits what the setup needs
+and returns (an output it sends nothing on closes, a `Bus` included);
+`rig.run_infra_setup(&MyNode, json!({..}))` runs it that way in a test. In between, the container itself tells weft when a value changes (a reset button, a rotated password): it `POST`s `{"connection": {"password": "..."}}` to `$WEFT_VALUES_URL`, which weft sets on every container of the unit (`connection` changes values inside the connection your node published, `outputs` changes baked outputs by name). Only what your node already handed weft can change. The push answers `200` once weft has written the value, or `422` with a body naming the key or output it could not change. If the push came from a button and failed, answer the press with `{ "result": { "error": "..." } }` telling the person to run `weft infra rebake <node>`. The value itself never goes in the press's answer. The Postgres node's reset is the worked example (`nodes/base_catalog/postgres/database/images/credential/bootstrap.py`). Changing what `run` emits on a baked output is not noticed on its own: run `weft infra upgrade`, which rebuilds the infra against your current source and bakes again. A node that fails using a connection an infra node made says to run `weft infra rebake` on that node; your node's own error says only what the driver said.
 
 Every field of the `InfraSpec` (the machine and its GPU, containers, probes, disks,
 endpoints), long jobs, kept files and the rig calls for all of it are in
@@ -665,9 +754,10 @@ shared-core ones included (a quarter CPU with `1Gi` is Compute Engine's
 `e2-micro`, about $6 a month). `kind` names the cloud's own machine type and
 skips the pick; keep it a last resort. A local install caps each container
 without limits of its own at `cpu` and `memory`. Whoever uses your node pays
-for that machine, so if the right size depends on their load, give the node
-inputs for it and read them into `machine` (the Postgres node takes `cpu`,
-`memory` and `machineType`).
+for that machine, so if the right size depends on their load, set
+`"features": { "machineInputs": { "cpu": "1", "memory": "2Gi" } }` (your
+defaults): weft adds checked `cpu`, `memory` and `machineType` inputs, and
+`machine: MachineShape::from_inputs(&input)?` reads them.
 
 If you need a GPU on a cloud install, the kinds weft attaches are
 `nvidia-l4` (1, 2, 4 or 8), `nvidia-tesla-t4` and `nvidia-tesla-p4` (1, 2
@@ -760,10 +850,52 @@ create it) and `read_only` does what it says.
 **Endpoints**: `Endpoint { name, target, expose }`. The target is
 `EndpointTarget::Unit { unit, container, port }` (`port` is the
 `ContainerPort` NAME) or `EndpointTarget::External { url }` for a service
-that already runs elsewhere. `expose` is `Expose::Project` (the default),
+that already runs elsewhere, `EndpointTarget::Process { unit, port }` for a
+process unit (below), or
+`EndpointTarget::Within { infra, path }` for a path inside another infra
+node's endpoint (a program your node started inside the `Computer` wired into
+it, which the computer's server passes on under `path`): `infra` is the
+`InfraHandle` on your input, nothing is started for it, every lookup follows
+where `infra` answers now, one hop only, and it is reached by the project's
+own workers only. `expose` is `Expose::Project` (the default),
 `Expose::SameNetwork` (above), or `Expose::Public { path }`, which serves
 HTTP through the install's front door at `/infra/<project>/<copy_id>/<path>`
 and is reachable from the internet.
+
+**A process instead of containers** runs one program on the person's own
+machine, as them, for what only that machine has (their login to a CLI,
+a folder of theirs). Only a local install has such a machine: a
+cloud install refuses the node before anything starts, so a node that offers
+another way (a `Computer` input) refuses the bad shape with a `local_install`
+rule. A unit runs containers or a process, never both, and a process unit
+takes no `machine`, `fs_group` or volume:
+
+```rust
+Unit {
+    name: "server".into(),
+    process: Some(
+        Process::new(vec!["python3".into(), "server.py".into()])
+            .with_file("server.py", include_str!("server.py"))
+            .with_ports(vec![ProcessPort::new("http", "PORT")])
+            .with_readiness(ProcessReadiness::http("http", "/health"))
+            .with_needs(vec![python3_need]),
+    ),
+    ..Default::default()
+}
+```
+
+It listens on `127.0.0.1` at the number weft puts in the port's variable,
+runs in a folder of its own with `files` written into it before every start,
+and is started again when it exits. Its `needs` are `Need`s as in deps.toml
+(`stage` run only), checked before it starts: a missing one fails the start,
+naming it and its `how`. Give one a `recipe` (`weft::needs::Recipe { folder:
+"<group>/<name>", script: <a bash script per Os>, bin, prelude }`) and weft
+installs it itself when the machine lacks it, without `sudo`, into
+`~/.local/share/weft/needs/<group>/<name>/`, once for every program and install on
+the machine, under a lock; system packages the script needs go in the need's
+`install`, and a missing one fails the start with the exact `sudo` command,
+which `weft deps-install` runs (then the recipes). The agent nodes
+(`nodes/base_catalog/agents/agent.rs`) are the worked case.
 
 The node reaches an endpoint at run time with
 `let api = ctx.endpoint("api").await?;`, which waits until something answers
@@ -774,8 +906,8 @@ there and hands back a handle: `api.url()`, `api.host_and_port()?`,
 answers the response as JSON (`EndpointMethod` is `weft::EndpointMethod`; GET
 and POST are the two it has). The path starts with `/`. A non-2xx answer, a
 network error or a body that is not JSON is an error. The call has no
-timeout of its own, so a call that waits on slow work never returns while a
-person presses stop: that is what the shape below is for.
+timeout of its own and holds the worker while it waits: slow work takes the
+shape below. `client::url(api.url(), &["media", id])` adds a path to it.
 
 The worker keeps what `ctx.endpoint`, `ctx.published_access`,
 `ctx.publish_access` and `ctx.open` answered from one run to the next (weft
@@ -813,33 +945,38 @@ one `call`, and never in a loop that sleeps in the body either: that holds a
 worker for the whole job. The container answers at once with a job id, runs
 the work in its own background thread, shows progress on its display (the
 `progress` item under [The display](#the-display)), and answers a status
-route. The node starts the job inside `ctx.run` and parks on that route:
+route. The node starts the job inside `state.once` and parks on that route
+with `state.wait`:
 
 ```rust
 use weft::EndpointMethod;
 use weft::signal::{PollEndpoint, Predicate};
 
+#[derive(Default, Serialize, Deserialize)]
+struct Job { started: Option<Value>, ended: Option<Value> }
+
+let mut state = ctx.keep(Job::default()).await?;
 let api = ctx.endpoint("api").await?;
-let job = ctx.run("start the job", || async {
+let job = state.once(|s| &mut s.started, async |_| {
     api.call(EndpointMethod::Post, "/jobs", Some(json!({ "prompt": prompt }))).await
 }).await?;
 let id = job["id"].as_str().ok_or_else(|| weft::node_error("the service answered no job id"))?;
-let state = ctx.await_signal(PollEndpoint {
+let ended = state.wait(|s| &mut s.ended, PollEndpoint {
     url: format!("{}/jobs/{id}", api.url()),
     interval_secs: 5,
     filters: vec![Predicate::neq("status", "running")],
     ..Default::default()
 }).await?;
-if state["status"] != "done" {
-    return Err(weft::node_error(format!("job {id} ended {state}")));
+if ended["status"] != "done" {
+    return Err(weft::node_error(format!("job {id} ended {ended}")));
 }
 ```
 
 The run parks and the worker goes away. The listener checks the route straight
 away, then every `interval_secs` (5 is the floor), and the first answer
-that passes the filters is what `await_signal` returns. The body then replays
-from the top, which is why the start is inside `ctx.run`: without it the
-replay would start a second job. `api.url()` is the address the workers
+that passes the filters lands in `ended`. The body then runs again from the
+top, and `once` hands back the job it already started instead of starting a
+second one. `api.url()` is the address the workers
 reach; the listener sits elsewhere on a local install, so before every check
 it asks for the same endpoint's address as weft's own roles reach it, and
 only this project's infra is looked up. The routes (`/jobs`, `/jobs/<id>`)
@@ -853,26 +990,30 @@ by giving up on a job whose status nobody has asked for in a few intervals
 terminating the infra stops it with everything else. To test the node, queue
 the answer with `rig.signal(json!({ "status": "done", "result": ... }))`.
 
-**Keeping a file past the run**: a file stored in `StorageScope::Run`
-with no keep is swept shortly after the run ends. If the file is what the
-node produced, pass a keep when you store it, the way a speech node does:
+**How long a file lives**: a file in `StorageScope::Run` is deleted with its
+run, when the run's record goes, and one in `StorageScope::Project` with the
+project. Any run in your account can read either for as long as it exists. A
+node that makes a file (a download, generated speech) stores it in the run
+scope with no deadline (`None`), so it lives as long as its run is kept, the
+way a speech node does:
 
 ```rust
-use weft::storage::{KeepTtl, StorageScope};
+use weft::storage::StorageScope;
 
 let file = ctx.storage(StorageScope::Run)
-    .put(bytes, "audio/mpeg", "speech.mp3", Some(KeepTtl::Default))
+    .put(bytes, "audio/mpeg", "speech.mp3", None)
     .await?;
 ```
 
-or keep one you already hold with
-`ctx.storage(StorageScope::Run).keep(&file, KeepTtl::Default).await?`
-(a keep cannot be taken back). `KeepTtl::Default` is 30 days,
-`KeepTtl::Secs { secs }` is a number of seconds, and both start again at every
-access; `KeepTtl::Never` lasts until `weft files rm` or `weft clean`. Files in
-the project, shared or instance scopes outlive runs anyway: there, `None` or
-`Never` means until deleted. A file the container itself needs to keep goes on
-a `Disk` volume instead.
+The last argument is a deadline: `Some(KeepTtl::Default)` deletes the file
+once nobody has touched it for 30 days, `KeepTtl::Secs { secs }` after that
+many idle seconds, either one or with its owner if that comes first; `None` or
+`KeepTtl::Never` gives none. `ctx.storage(..).keep(&file, ttl)` sets the
+deadline of a file you already hold (`KeepTtl::Never` takes it away). A
+deadline never moves a file: if a program needs one to outlive its run, it
+wires it through `KeepFile` (or your node `copy`s it into
+`StorageScope::Project`). A file the container itself needs to keep goes on a
+`Disk` volume instead.
 
 **The rig for an infra node** (`fake` tier):
 
@@ -902,6 +1043,8 @@ a `Disk` volume instead.
 `async fn setup_trigger(&self, ctx)`, called instead of `run` at activation,
 where the node registers its wake signal. Polling triggers carry an
 `intervalSecs` config; activation starts from now, history never replays.
+A `PollDelta` says its paging (`paging: Some(PollPaging::query("nextPageToken",
+"pageToken"))`, `PollPaging::body(..)` for a POST cursor, `None` for one page).
 Declare `firesWith` too: EVERY field the wake payload can carry, with `?` on
 the ones that only sometimes arrive. The engine checks a real firing (and a
 hand-typed `weft run --fire`) against it before your `run` even starts, and
@@ -959,10 +1102,10 @@ is the stored-file marker (`__weft_image__`, `__weft_video__`,
 `__weft_audio__` or `__weft_blob__`, the kind taken from the mime type), and
 it carries no link. A Rust node takes
 the input as a `FileHandle` (`let file: FileHandle =
-ctx.inputs.get("file")?;`) and reads it with
-`ctx.storage(StorageScope::Run).get_bytes(&file).await?`, which hands
-back `(meta, bytes)`: `meta.filename` and `meta.mime_type` are the file's
-details. If you want the details without the bytes,
+ctx.inputs.get("file")?;`). Only when the node needs the bytes themselves
+(text it parses, a hash) does it read them with
+`ctx.storage(StorageScope::Run).get_bytes(&file).await?`, `(meta, bytes)`;
+an upload streams (Calling a service). If you want the details without the bytes,
 `StoredFile::from_value(&value)?` reads the value into `.key`, `.mime_type`,
 `.filename` and `.size_bytes`. Never read `mimeType` off the raw JSON: it sits
 one level down, inside the kind marker. When something needs a link, make one:
@@ -1009,33 +1152,64 @@ them, and a `liveConnection` trigger already has them, so do not set both) and
 pass `journal: ctx.journal_policy()?`. Without it the default applies;
 `JournalPolicy::ephemeral()` keeps payloads out whatever anyone sets.
 
-A bus must end, because a reader parked on one that never ends waits for
-ever. It ends when the body of the firing that created or joined it
-returns: finished if the body returned `Ok`, failed with the error if it
-failed (a body that paused on a wait ends its buses failed too). Dropping a
-handle ends nothing. `bus.close()` ends it early, as finished; a failed end
-is never yours to write, you just return the error. A node that runs until
-the run ends waits on `ctx.cancellation()` and returns, and that return is
-what the reader downstream sees as the end of the feed.
+A bus must end, because a reader parked on one that never ends waits for ever.
+A bus ends once nobody is on it and no node can still join it. A member is
+any firing that registered a name on it (`open_bus`, `pending_bus`,
+`join_bus`), the creator no more than the others, and it leaves when its body
+returns, however it returns; a member leaving does nothing else, even when it
+failed. A node can still join while the bus's marker is on a wire to a node
+that has not started, in a loop that has not ended (what every iteration gets,
+a carried value, the list it goes over, a bus it gathered and hands on), or in
+the input of a firing that has not ended and has not used the bus yet
+(registered on it, opened its reader, waited on it). A skipped node holds
+nothing. Once nothing can join, the bus ends as its last member returned:
+finished if its body returned `Ok` (or if nobody ever joined), failed with its
+error if it failed, so the reader of a lone producer that died halfway reads a
+failure, never a short stream. A pause is not leaving: the next worker opens
+the bus again where it was, its members on it, and a resumed creator calling
+`open_bus` again gets the same bus (a crash, though, ends it failed). Dropping
+a handle is not leaving either. `bus.close()` ends it at once for everyone:
+finished while anybody is on it, and the way its last member left when nobody is,
+so a lone producer's failure survives a later close; a failed end is never
+yours to write, you return the error. A
+creator can return as soon as its own work is done: the nodes it handed the
+marker to still get to join, so it never waits for them first. A joiner calls
+`join_bus` before it reads or waits on the bus: once it read or waited without
+joining it no longer keeps the bus open, so with nobody else on it the bus can
+end first and the late `join_bus` is refused (`bus is closed; cannot
+register`).
+A node that stays on a bus while others use it and has nothing to read there
+(it holds a session for the run) waits with `bus.until_end(&mut state).await?`:
+it is no reader, so it keeps no place on the bus; it returns `Ok` once the bus
+ended finished and fails with `the bus ended failed: ...` otherwise. What ends
+that bus is a `CloseBus` the program puts after the last node sending on it.
+Without one, the waiting node is the last member of a bus only its own leaving
+could end: weft finds the run stuck, ends the bus failed, and the node fails.
+A node that sends on the same bus on every firing (each turn of a loop)
+calls `join_bus` every time: its name leaves when the body returns and the bus
+stays open for whoever is still on it. A body run again after a pause gets
+the same name back, and it also repeats every `send` it made before the
+pause, so keep in the state how far it got. One name has one member at a
+time, so two firings on the bus at once need two names. A bus that ended while
+the run was paused comes back ended: nothing new goes on it, and a reader
+comes to its end.
 
 If you want to read a bus the graph handed you, the choice is what you must not
 miss:
 
 | Call | Reach for it when |
 |---|---|
-| `ctx.join_bus(port, name)?`, then `bus.cursor()` | you take part in the exchange and want what is sent from now on |
-| `ctx.bus_from_input(port)?`, then `bus.cursor_from_start()` | you must not miss what was sent before you attached, or the producer may already have finished |
+| `ctx.join_bus(port, name)?`, then `bus.cursor()?` | you take part in the exchange and want what is sent from now on |
+| `ctx.bus_from_input(port)?`, then `bus.cursor_from_start()?` | you must not miss what was sent before you attached, or the producer may already have finished |
 
-A bus you join is held by your firing like one you created, so if your body
-fails, the bus ends failed; `bus_from_input` never ends it, which is what an
-observer wants (a debug tap, a reader streaming it out), because ending a
-feed the producer still owns is a bug. Read with `cursor.next().await` for
-every entry, or `cursor.next_json("<kind>").await` for one kind's payloads.
-`None` means the bus ended, and then `bus.end()` says how: a
-`Some(StreamEnd::Failed { error })` means the stream did not complete, so a
-reader translates it into its own protocol rather than presenting it as
-whole (`nodes/base_catalog/api/stream/mod.rs` calls `http.fail(..)` /
-`ws.fail(..)`).
+`join_bus` makes your firing a member like the creator, and `bus_from_input`
+registers nothing, so an observer (a debug tap, a reader streaming it out) is
+no member and keeps nothing open. To send on a `bus_from_input`
+handle, call `bus.register(name)` first, which is what `join_bus` does for
+you. Read with `cursor.next(&mut state).await?`
+for every entry, or `cursor.next_json("<kind>", &mut state).await?` for one
+kind's payloads. `None` means the bus finished; one that ended failed comes
+back as an error (`the bus ended failed: ...`) from that read.
 
 Do every bus read and wait on your own task, and never move a handle or a
 cursor into a `tokio::spawn`. The engine works out "everyone is stuck, close
@@ -1188,7 +1362,12 @@ when it is there (its first word looked up on the `PATH`), and
 `apk` and `brew`, keyed by distro like `debian_12` or `ubuntu_24_04`, or
 `default`. On a local install a program that uses the node is refused
 before it runs, activates or resyncs when a `run` check fails, naming `weft
-deps-install <NodeType>`; a node it does not use is never checked. A `build` need is not checked before the
+deps-install <NodeType>`; a node it does not use is never checked.
+`how` (optional) is the command that installs a program no package
+manager has (`curl -fsSL https://claude.ai/install.sh | bash`), said wherever
+the need is reported missing. A `recipe` is refused here: only an infra
+process's need may have one (under Infra node reference), since a worker
+never gets weft's install folder on its `PATH`. A `build` need is not checked before the
 package compiles, so a missing one shows as the package failing to compile
 and being left out. A cloud image installs the same packages, using the entry for its own
 package manager: the one for the image's distro, else that manager's

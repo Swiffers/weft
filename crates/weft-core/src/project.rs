@@ -24,12 +24,207 @@ pub mod coverage;
 /// weft wrote; `crate::stored` says how they run. A stored program keeps
 /// the hash it was written under through every step
 /// ([`hash::compute_definition_hash`] says why).
-pub const PROJECT_DEFINITION_UPGRADES: &[&[crate::stored::Op]] = &[&[
-    // Version 2: the service recipes a node carries moved with
-    // `AccessSpec`'s own version 2.
-    crate::stored::Op::Within { at: "nodes.*.publishedService", ops: crate::access::spec::ACCESS_SPEC_V2 },
-    crate::stored::Op::Within { at: "nodes.*.instanceService", ops: crate::access::spec::ACCESS_SPEC_V2 },
-]];
+pub const PROJECT_DEFINITION_UPGRADES: &[&[crate::stored::Op]] = &[
+    &[
+        // Version 2: the service recipes a node carries moved with
+        // `AccessSpec`'s own version 2.
+        crate::stored::Op::Within { at: "nodes.*.publishedService", ops: crate::access::spec::ACCESS_SPEC_V2 },
+        crate::stored::Op::Within { at: "nodes.*.instanceService", ops: crate::access::spec::ACCESS_SPEC_V2 },
+    ],
+    &[
+        // Version 3: the recipes moved with `AccessSpec`'s version 3, and
+        // a node's rules are written with the one `value` kind
+        // ([`upgrade::rules_to_value`]).
+        crate::stored::Op::Within { at: "nodes.*.publishedService", ops: crate::access::spec::ACCESS_SPEC_V3 },
+        crate::stored::Op::Within { at: "nodes.*.instanceService", ops: crate::access::spec::ACCESS_SPEC_V3 },
+        crate::stored::Op::Code { at: "nodes.*", run: upgrade::rules_to_value },
+    ],
+    &[
+        // Version 4: the recipes moved with `AccessSpec`'s version 4 (a
+        // pasted credential's fields became its one way to sign in).
+        crate::stored::Op::Within { at: "nodes.*.publishedService", ops: crate::access::spec::ACCESS_SPEC_V4 },
+        crate::stored::Op::Within { at: "nodes.*.instanceService", ops: crate::access::spec::ACCESS_SPEC_V4 },
+    ],
+];
+
+/// The [`Op::Code`](crate::stored::Op::Code) steps of
+/// [`PROJECT_DEFINITION_UPGRADES`], on a stored node's raw JSON.
+mod upgrade {
+    use serde_json::{json, Map, Value};
+
+    /// Version 3: every rule a node carries (`instanceRules.rules.*.when`,
+    /// `recheck.*.when`) says each `config_*` kind as the `value` kind
+    /// that means the same; a rule asking `input_source_type` (which the
+    /// `Access[service]` type replaced, checked when the program was
+    /// built) is dropped; and an input's `minItems` becomes the rule it
+    /// was, asked again on what arrives (`recheck`), which is the only
+    /// place a built program still needed it.
+    pub(super) fn rules_to_value(node: &mut Value) -> Result<(), String> {
+        let id = node.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+        if let Some(rules) = node.pointer_mut("/instanceRules/rules").and_then(Value::as_array_mut) {
+            convert_rules(rules)?;
+        }
+        let mut too_few = Vec::new();
+        for input in node.get_mut("inputs").and_then(Value::as_array_mut).into_iter().flatten() {
+            let Some(min) = input.as_object_mut().and_then(|input| input.remove("minItems")) else { continue };
+            let min = min.as_u64().ok_or_else(|| format!("an input's `minItems` is {min}, no count"))?;
+            let name = input.get("name").and_then(Value::as_str).unwrap_or_default();
+            too_few.push(json!({
+                "when": { "kind": "all", "of": [
+                    { "kind": "value", "field": name },
+                    { "kind": "not", "of": { "kind": "value", "field": name, "count": { "min": min } } }
+                ] },
+                "message": format!("'{id}' takes at least {min} item{} on '{name}'", if min == 1 { "" } else { "s" }),
+            }));
+        }
+        let object = node.as_object_mut().ok_or("a node is no object")?;
+        if let Some(rules) = object.get_mut("recheck").and_then(Value::as_array_mut) {
+            convert_rules(rules)?;
+        }
+        if !too_few.is_empty() {
+            let recheck = object.entry("recheck").or_insert_with(|| Value::Array(Vec::new()));
+            recheck.as_array_mut().ok_or("a node's `recheck` is no list")?.extend(too_few);
+        }
+        if object.get("recheck").and_then(Value::as_array).is_some_and(Vec::is_empty) {
+            object.remove("recheck");
+        }
+        Ok(())
+    }
+
+    /// Each rule's `when` converted, the rules asking `input_source_type`
+    /// left out.
+    fn convert_rules(rules: &mut Vec<Value>) -> Result<(), String> {
+        let mut kept = Vec::with_capacity(rules.len());
+        for mut rule in std::mem::take(rules) {
+            let when = rule.get_mut("when").ok_or("a rule has no `when`")?;
+            if convert(when)? {
+                kept.push(rule);
+            }
+        }
+        *rules = kept;
+        Ok(())
+    }
+
+    /// `cond` with every retired kind said as `value`, at any depth;
+    /// false when it asks `input_source_type`, and the rule goes.
+    fn convert(cond: &mut Value) -> Result<bool, String> {
+        let Some(object) = cond.as_object_mut() else { return Err("a condition is no object".into()) };
+        let kind = object.get("kind").and_then(Value::as_str).ok_or("a condition has no kind")?.to_string();
+        let mut take = |key: &str| object.remove(key);
+        let bounds = |min: Option<Value>, max: Option<Value>| {
+            let mut b = Map::new();
+            for (key, v) in [("min", min), ("max", max)] {
+                if let Some(v) = v.filter(|v| !v.is_null()) {
+                    b.insert(key.into(), v);
+                }
+            }
+            Value::Object(b)
+        };
+        let checks: Map<String, Value> = match kind.as_str() {
+            "all" | "any" => {
+                for part in object.get_mut("of").and_then(Value::as_array_mut).ok_or("`all`/`any` holds no list")? {
+                    if !convert(part)? {
+                        return Ok(false);
+                    }
+                }
+                return Ok(true);
+            }
+            "not" => return convert(object.get_mut("of").ok_or("`not` holds nothing")?),
+            "input_source_type" => return Ok(false),
+            "config_present" => Map::new(),
+            "config_nonempty" => [("nonempty".to_string(), Value::Bool(true))].into_iter().collect(),
+            "config_equals" => [("equals".to_string(), take("equals").unwrap_or(Value::Null))].into_iter().collect(),
+            "config_in_set" => [("oneOf".to_string(), take("values").unwrap_or_else(|| json!([])))].into_iter().collect(),
+            "config_matches" => [("matches".to_string(), take("regex").unwrap_or_default())].into_iter().collect(),
+            "config_item_count" => [("count".to_string(), bounds(take("min"), take("max")))].into_iter().collect(),
+            "config_in_range" => [("range".to_string(), bounds(take("min"), take("max")))].into_iter().collect(),
+            "config_items_fit" => {
+                let mut each = Map::new();
+                let length = bounds(take("minLength"), take("maxLength"));
+                if length.as_object().is_some_and(|b| !b.is_empty()) {
+                    each.insert("length".into(), length);
+                }
+                if let Some(regex) = take("regex").filter(|r| !r.is_null()) {
+                    each.insert("matches".into(), regex);
+                }
+                [("each".to_string(), Value::Object(each))].into_iter().collect()
+            }
+            "config_field_in_set" => {
+                let each = json!({ "key": take("key").unwrap_or_default(), "oneOf": take("values").unwrap_or_else(|| json!([])) });
+                [("each".to_string(), each)].into_iter().collect()
+            }
+            _ => return Ok(true),
+        };
+        let field = object.remove("field").ok_or_else(|| format!("a `{kind}` condition has no field"))?;
+        *object = [("kind".to_string(), json!("value")), ("field".to_string(), field)].into_iter().chain(checks).collect();
+        Ok(true)
+    }
+    #[cfg(test)]
+    mod tests {
+        use serde_json::json;
+
+        /// Each retired kind becomes the `value` rule meaning the same, at
+        /// any depth; a rule asking `input_source_type` goes; an input's
+        /// `minItems` becomes the recheck it was; and the node then reads
+        /// as today's.
+        #[test]
+        fn a_stored_nodes_rules_are_said_with_value() {
+            let then = json!({ "message": "m" });
+            let mut node = json!({
+                "id": "n",
+                "inputs": [{ "name": "texts", "portType": "List[String]", "minItems": 2 }, { "name": "mode", "portType": "String" }],
+                "instanceRules": { "rules": [
+                    { "when": { "kind": "all", "of": [
+                        { "kind": "config_present", "field": "mode" },
+                        { "kind": "not", "of": { "kind": "config_matches", "field": "mode", "regex": "^a" } },
+                        { "kind": "any", "of": [
+                            { "kind": "config_in_set", "field": "mode", "values": ["a"] },
+                            { "kind": "config_item_count", "field": "texts", "min": 1, "max": null },
+                            { "kind": "config_items_fit", "field": "texts", "maxLength": 9, "regex": "^x" },
+                            { "kind": "config_in_range", "field": "mode", "min": 0.5 },
+                            { "kind": "config_field_in_set", "field": "texts", "key": "role", "values": ["user"] },
+                            { "kind": "config_equals", "field": "mode", "equals": true },
+                            { "kind": "config_nonempty", "field": "mode" }
+                        ] }
+                    ] }, "then": then },
+                    { "when": { "kind": "not", "of": { "kind": "input_source_type", "port": "account", "equals": "SlackAccess" } }, "then": then }
+                ] },
+                "recheck": [{ "when": { "kind": "input_source_type", "port": "account", "oneOf": ["X"] }, "message": "gone" }]
+            });
+            super::rules_to_value(&mut node).unwrap();
+            assert_eq!(node["instanceRules"]["rules"], json!([
+                { "when": { "kind": "all", "of": [
+                    { "kind": "value", "field": "mode" },
+                    { "kind": "not", "of": { "kind": "value", "field": "mode", "matches": "^a" } },
+                    { "kind": "any", "of": [
+                        { "kind": "value", "field": "mode", "oneOf": ["a"] },
+                        { "kind": "value", "field": "texts", "count": { "min": 1 } },
+                        { "kind": "value", "field": "texts", "each": { "length": { "max": 9 }, "matches": "^x" } },
+                        { "kind": "value", "field": "mode", "range": { "min": 0.5 } },
+                        { "kind": "value", "field": "texts", "each": { "key": "role", "oneOf": ["user"] } },
+                        { "kind": "value", "field": "mode", "equals": true },
+                        { "kind": "value", "field": "mode", "nonempty": true }
+                    ] }
+                ] }, "then": then }
+            ]));
+            assert!(node["inputs"][0].get("minItems").is_none());
+            assert_eq!(node["recheck"], json!([{
+                "when": { "kind": "all", "of": [
+                    { "kind": "value", "field": "texts" },
+                    { "kind": "not", "of": { "kind": "value", "field": "texts", "count": { "min": 2 } } }
+                ] },
+                "message": "'n' takes at least 2 items on 'texts'"
+            }]));
+            let rules: Vec<crate::node::ValidationRule> = serde_json::from_value(node["instanceRules"]["rules"].clone()).expect("today's rules");
+            assert_eq!(rules.len(), 1);
+            let _: Vec<crate::rules::Recheck> = serde_json::from_value(node["recheck"].clone()).expect("today's rechecks");
+
+            let mut plain = json!({ "id": "p", "inputs": [], "recheck": [{ "when": { "kind": "input_source_type", "port": "a", "oneOf": [] }, "message": "x" }] });
+            super::rules_to_value(&mut plain).unwrap();
+            assert!(plain.get("recheck").is_none(), "a recheck left with nothing is dropped, as the type writes it");
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectDefinition {
@@ -72,6 +267,19 @@ pub struct ProjectDefinition {
     /// that compiles whole, and in every cut.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub broken: Vec<Broken>,
+    /// The install this program was compiled for: set by the install's
+    /// own version build and by a command comparing with it (`weft
+    /// status`), `None` for a compile for no install (`weft validate`,
+    /// the editor). A node's rule may ask which install it is
+    /// (`crate::node::Condition::LocalInstall`), and every reader of the
+    /// rules reads it here: the compile's checks and the rules it records
+    /// for the run ([`NodeDefinition::recheck`]), the build's gate, an
+    /// instance's check. On the program, so nothing hands the kind in
+    /// beside it and nothing can disagree with the compile that decided
+    /// its broken parts. Not hashed ([`hash::compute_definition_hash`]
+    /// says why).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<crate::install::InstallKind>,
     /// The wires that leave a metadata port ([`MetadataPort`]), kept only
     /// so the editor can say where the value written on an input came
     /// from. Enrich has already written
@@ -99,6 +307,22 @@ impl ProjectDefinition {
     pub fn hides_nodes(&self) -> bool {
         self.broken.iter().any(|part| part.hides)
     }
+
+    /// Every value this program writes: each node's config fields and port
+    /// literals, each group's port literals. Where a `@file` or `@asset`
+    /// is written, and where a build leaves the marker naming a file's
+    /// content (`crate::content`).
+    pub fn written_values(&self) -> impl Iterator<Item = &Value> {
+        self.nodes.iter().flat_map(NodeDefinition::written_values).chain(self.groups.iter().flat_map(|group| group.port_literals.values()))
+    }
+
+    /// [`Self::written_values`], to rewrite in place.
+    pub fn written_values_mut(&mut self) -> impl Iterator<Item = &mut Value> {
+        self.nodes
+            .iter_mut()
+            .flat_map(NodeDefinition::written_values_mut)
+            .chain(self.groups.iter_mut().flat_map(|group| group.port_literals.values_mut()))
+    }
 }
 
 /// One part of a program that does not compile
@@ -112,6 +336,15 @@ pub struct Broken {
     /// group, the two ends for a wire (a cut that keeps only one end does
     /// not carry the wire).
     pub parts: Vec<String>,
+    /// The places the problem holds at, when it holds at some of them
+    /// only: a finding about one place of a node inside a file included
+    /// at several sites (a shared trigger at one site reaching what is
+    /// per instance there). A cut needs the part only when it keeps one
+    /// of these places. Empty: at every place its parts run, which is
+    /// what a part stored before places were named meant too.
+    // SYNC: Broken.places <-> packages/weft-graph/src/protocol.ts Broken.places
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub places: Vec<Located>,
     /// What is wrong, as the compiler says it, with the file and line.
     pub why: String,
     /// The part may stand for nodes the program cannot see: an included
@@ -124,9 +357,13 @@ pub struct Broken {
 }
 
 impl Broken {
-    /// Whether a cut whose nodes and groups are `kept` needs this part.
-    pub fn needed_by(&self, kept: &std::collections::BTreeSet<&str>) -> bool {
-        !self.parts.is_empty() && self.parts.iter().all(|part| kept.contains(part.as_str()))
+    /// Whether a cut whose nodes and groups are `kept`, at the places
+    /// `kept_places`, needs this part: it keeps every one of its parts,
+    /// and, for a part that holds at some places only, one of those.
+    pub fn needed_by(&self, kept: &std::collections::BTreeSet<&str>, kept_places: &std::collections::BTreeSet<Located>) -> bool {
+        !self.parts.is_empty()
+            && self.parts.iter().all(|part| kept.contains(part.as_str()))
+            && (self.places.is_empty() || self.places.iter().any(|place| kept_places.contains(place)))
     }
 }
 
@@ -419,8 +656,9 @@ pub struct GroupDefinition {
     /// from outside, or `_should_flow: false` in the braces. A wired value
     /// is an ordinary edge and never appears here. What a member reads off
     /// a filled port reaches it over the wire whose source is the group
-    /// itself ([`Edge::via`]), sent when the group opens. A loop's sit on
-    /// its `LoopIn` instead, which delivers them like any node.
+    /// itself ([`Edge::via`]), sent when the group opens. A loop's is empty:
+    /// its sit on its `LoopIn` alone, which delivers them like any node and
+    /// which the editor reads them from for the loop box.
     // SYNC: port_literals <-> packages/weft-graph/src/protocol.ts GroupDefinition.portLiterals
     #[serde(default, rename = "portLiterals")]
     pub port_literals: std::collections::BTreeMap<String, Value>,
@@ -604,18 +842,30 @@ pub struct NodeDefinition {
     /// NodeMetadata.requires_infra at enrich time.
     #[serde(default, rename = "requiresInfra")]
     pub requires_infra: bool,
-    /// Whether this node exists once per instance of the program, and why:
-    /// `Marked` when the source says `@per_instance` in its braces (only an
-    /// infra node may, see `NodeMetadata::per_instance_eligible`), `Filled`
-    /// when one of its fields is written `@instance_filled`, `Derived` when
-    /// it reads a value that comes from a per-instance node, found by the
-    /// compiler along the wires. `None` for a node every instance shares. Written by the
-    /// lowering (the mark) and the compiler's propagation (the rest), and
-    /// only ever READ downstream: the runtime and the editor never
-    /// recompute it.
+    /// Whether this node exists once per instance of the program at every
+    /// place it runs, and why: `Marked` when the source says
+    /// `@per_instance` in its braces (only an infra node may, see
+    /// `NodeMetadata::per_instance_eligible`), `Filled` when one of its
+    /// fields is written `@instance_filled`, `Derived` when it reads a
+    /// value that comes from a per-instance node at each of its places,
+    /// found by the compiler along the wires. `None` for a node every
+    /// instance shares, or one per instance at some of its places only
+    /// ([`Self::per_instance_paths`]). Written by the lowering (the mark)
+    /// and the compiler's propagation (the rest), and only ever READ
+    /// downstream: the runtime and the editor never recompute it.
+    /// [`Self::per_instance_at`] is the one reading.
     // SYNC: per_instance <-> packages/weft-graph/src/protocol.ts NodeDefinition.perInstance
     #[serde(default, rename = "perInstance", skip_serializing_if = "Option::is_none")]
     pub per_instance: Option<crate::instance::PerInstance>,
+    /// The places (each a call path, outermost site first) where this node
+    /// reads a per-instance value, when its places disagree: a node inside
+    /// a file included both where an instance's value reaches it and where
+    /// none does is per instance (`Derived`) at the first place and shared
+    /// at the second. Empty when every place agrees, [`Self::per_instance`]
+    /// being the answer at all of them.
+    // SYNC: per_instance_paths <-> packages/weft-graph/src/protocol.ts NodeDefinition.perInstancePaths
+    #[serde(default, rename = "perInstancePaths", skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub per_instance_paths: std::collections::BTreeSet<Vec<String>>,
     /// Image source dirs built for this node. Mirrored from
     /// NodeMetadata.images at enrich time. A version build walks this to
     /// know which Dockerfiles to build (`weft-dispatcher::build`).
@@ -635,6 +885,12 @@ pub struct NodeDefinition {
     /// other node.
     #[serde(default, rename = "bakedOutputs", skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub baked_outputs: std::collections::BTreeSet<String>,
+    /// The named lists this node declares for other nodes' rules
+    /// (`crate::node::NodeMetadata::lists`), mirrored at enrich time, so
+    /// a rule of a node this one is wired into reads them off the program
+    /// (`crate::node::ValueList::Wired`). Empty on every node declaring none.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub lists: std::collections::BTreeMap<String, Vec<String>>,
     /// The recipe for the service this node publishes a connection to
     /// (`ctx.publish_access`), resolved from the catalog at enrich
     /// time from the node metadata's `publishes` name. Carried on the
@@ -658,6 +914,13 @@ pub struct NodeDefinition {
     /// is at hand. Resolved at enrich time from the catalog.
     #[serde(default, rename = "instanceRules", skip_serializing_if = "Option::is_none")]
     pub instance_rules: Option<InstanceRules>,
+    /// The node's rules the compiler could not decide, because their
+    /// answer leans on a value that arrives on a wire: each is checked on
+    /// the values that arrived, before the body runs
+    /// ([`crate::rules::recheck`]). Empty for every other node, which
+    /// then pays nothing for it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recheck: Vec<crate::rules::Recheck>,
     /// Full source range of the node declaration (including config
     /// block if present). Set by the parser.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -899,6 +1162,24 @@ impl NodeDefinition {
         TypesAt { own: Own::Node(self), place: self.place_of(path).map(|index| &self.place_types[index]) }
     }
 
+    /// Whether this node exists once per instance at the place `path`
+    /// reaches (an include call path, outermost site first; empty at the
+    /// top), and why: its own mark, which holds at every place, or
+    /// `Derived` where it reads an instance's value there.
+    pub fn per_instance_at<S: AsRef<str>>(&self, path: &[S]) -> Option<crate::instance::PerInstance> {
+        self.per_instance.or_else(|| {
+            self.per_instance_paths
+                .iter()
+                .any(|p| p.len() == path.len() && p.iter().zip(path).all(|(a, b)| a == b.as_ref()))
+                .then_some(crate::instance::PerInstance::Derived)
+        })
+    }
+
+    /// Whether this node exists once per instance at any place it runs.
+    pub fn per_instance_somewhere(&self) -> bool {
+        self.per_instance.is_some() || !self.per_instance_paths.is_empty()
+    }
+
     /// Which [`Self::place_types`] entry is the place `path` reaches,
     /// `None` when the node's own types are the types there.
     pub fn place_of<S: AsRef<str>>(&self, path: &[S]) -> Option<usize> {
@@ -922,6 +1203,25 @@ impl NodeDefinition {
     /// and after the normalization reads the same value.
     pub fn written_value(&self, key: &str) -> Option<&Value> {
         self.port_literals.get(key).or_else(|| self.config.get(key))
+    }
+
+    /// Every value this node writes: its config fields and its port
+    /// literals, the two homes [`Self::written_value`] reads.
+    pub fn written_values(&self) -> impl Iterator<Item = &Value> {
+        self.config.as_object().into_iter().flat_map(|o| o.values()).chain(self.port_literals.values())
+    }
+
+    /// [`Self::written_values`], to rewrite in place.
+    pub fn written_values_mut(&mut self) -> impl Iterator<Item = &mut Value> {
+        self.config.as_object_mut().into_iter().flat_map(|o| o.values_mut()).chain(self.port_literals.values_mut())
+    }
+
+    /// [`Self::written_value`], to rewrite in place.
+    pub fn written_value_mut(&mut self, key: &str) -> Option<&mut Value> {
+        match self.port_literals.get_mut(key) {
+            Some(value) => Some(value),
+            None => self.config.get_mut(key),
+        }
     }
 
     /// The source entry of `written_value`'s home, same two-home rule.
@@ -1073,6 +1373,12 @@ pub struct InputDefinition {
         skip_serializing_if = "Option::is_none"
     )]
     pub requires_values: Option<Vec<String>>,
+    /// A blank text on this optional String input is a value (mirrored
+    /// from the metadata's `keepsBlank`); without it a blank is absent
+    /// ([`crate::run::ready::blank_is_absent`]).
+    // SYNC: InputDefinition.keeps_blank <-> packages/weft-connect/src/core/wire.ts InputDefinition.keepsBlank
+    #[serde(default, rename = "keepsBlank", skip_serializing_if = "std::ops::Not::not")]
+    pub keeps_blank: bool,
 }
 
 /// A node's port types at one place it runs ([`NodeDefinition::place_types`]):
@@ -1172,6 +1478,7 @@ impl InputDefinition {
             from_spec: false,
             requires_scopes: None,
             requires_values: None,
+            keeps_blank: false,
         }
     }
 
@@ -1633,6 +1940,16 @@ impl ProgramIndex {
         &self.scopes
     }
 
+    /// The frames the node at `place` fires at when the run itself puts it
+    /// there (a kick, a value handed to it, its standing in): one call
+    /// frame per site on its path, and iteration 0 of each loop the program
+    /// holds only part of the body of ([`scopes::Scope::entered`]),
+    /// outermost first ([`scopes::ScopeIndex::frames_at`]).
+    pub fn frames_at(&self, project: &ProjectDefinition, place: &Located) -> LoopFrames {
+        let scope = self.node(project, &place.id).and_then(|node| node.scope.last());
+        self.scopes.frames_at(scope.map(String::as_str), &place.path)
+    }
+
     /// Whether the node `node_id` exists at `frames`: every node does,
     /// except under a site a cut runs only part of the body of
     /// ([`GroupKind::Call`]'s `runs`), where only the places it lists do.
@@ -1800,6 +2117,7 @@ mod address_tests {
             defaults: Default::default(),
             given: Default::default(),
             broken: Vec::new(),
+            install: None,
             metadata_wires: Vec::new(),
         };
         let (node, path) = resolve_address(&project, "");
@@ -2050,12 +2368,14 @@ pub fn infra_reached(program: &ProjectDefinition) -> std::collections::BTreeSet<
         .collect()
 }
 
-/// Whether the node `id` exists once per instance (`@per_instance`): every
-/// copy of it (its infra, its trigger's activation) is an instance's, and
-/// none is shared. Asked of a place by its `id`, of a spelled place
-/// after `resolve_address`.
-pub fn is_per_instance(project: &ProjectDefinition, id: &str) -> bool {
-    project.nodes.iter().any(|n| n.id == id && n.per_instance.is_some())
+/// Whether the node at `place` exists once per instance there: every copy
+/// of it (its infra, its trigger's activation) is an instance's, and none
+/// is shared. Asked of a place, since a node inside a file included at
+/// several sites can be per instance at one and shared at another
+/// ([`NodeDefinition::per_instance_at`]); of a spelled place after
+/// `resolve_address`.
+pub fn is_per_instance(project: &ProjectDefinition, place: &Located) -> bool {
+    project.nodes.iter().any(|n| n.id == place.id && n.per_instance_at(&place.path).is_some())
 }
 
 /// A node's validation rules, for checking an instance's values on it.
@@ -2134,7 +2454,7 @@ impl DeclaredInfra {
     pub fn of(project: &ProjectDefinition) -> Self {
         let places = infra_place_spellings(project)
             .into_iter()
-            .map(|(spelled, place)| (spelled, is_per_instance(project, &place.id)))
+            .map(|(spelled, place)| (spelled, is_per_instance(project, &place)))
             .collect();
         Self { places, hides: project.hides_nodes() }
     }
@@ -2222,10 +2542,12 @@ mod trigger_dependency_tests {
             features: NodeFeatures { is_trigger, ..Default::default() },
             requires_infra,
             per_instance: None,
+            per_instance_paths: Default::default(),
             images: vec![],
             published_service: None,
             instance_service: None,
             instance_rules: None,
+            recheck: Vec::new(),
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -2237,7 +2559,7 @@ mod trigger_dependency_tests {
             file_refs: Default::default(),
             include_path: None,
             include_contents: None,
-            fires_with: Default::default(), baked_outputs: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
             source_file: None,
         }
     }
@@ -2267,6 +2589,7 @@ mod trigger_dependency_tests {
             defaults: Default::default(),
             given: Default::default(),
             broken: Vec::new(),
+            install: None,
             metadata_wires: Vec::new(),
         }
     }
@@ -2457,6 +2780,27 @@ mod trigger_dependency_tests {
         assert_eq!(deps(&p, "one.door"), vec!["one.svc".to_string(), "top_db".to_string()]);
         assert_eq!(deps(&p, "two.door"), vec!["two.svc".to_string()]);
     }
+
+    /// An infra node inside a file included twice is two placements, one
+    /// per call: each is its own place, spelled through its site (`one.svc`,
+    /// `two.svc`, never the file's own id), running under that call's frame,
+    /// and a bare `svc` names neither and is refused with the spelling
+    /// that works.
+    #[test]
+    fn a_file_included_twice_has_one_infra_placement_per_call() {
+        let p = program_with_two_sites();
+        let at = |site: &str| Located::new("Bridge.svc", vec![site.to_string()]);
+        assert_eq!(infra_places(&p), vec![at("one"), at("two"), Located::top("top_db")]);
+        assert_eq!(infra_reached(&p), ["one.svc", "two.svc", "top_db"].map(String::from).into());
+        let index = ProgramIndex::build(&p);
+        for site in ["one", "two"] {
+            assert_eq!(index.frames_at(&p, &at(site)), vec![crate::frames::Frame::Call { site: site.into() }]);
+            let named = places::named(&graph::ProjectGraph::new(&p), &format!("{site}.svc")).expect("a placement is named through its site");
+            assert_eq!(named.into_place(), at(site));
+        }
+        let refused = places::named(&graph::ProjectGraph::new(&p), "svc").map(|_| ()).unwrap_err();
+        assert!(refused.contains("site.svc"), "{refused}");
+    }
 }
 
 #[cfg(test)]
@@ -2480,6 +2824,7 @@ mod project_wire_tests {
             defaults: Default::default(),
             given: Default::default(),
             broken: Vec::new(),
+            install: None,
             metadata_wires: Vec::new(),
         };
         let v = serde_json::to_value(&p).unwrap();
@@ -2521,6 +2866,7 @@ mod project_wire_tests {
             from_spec: false,
             requires_scopes: None,
             requires_values: None,
+            keeps_blank: false,
         };
         let node = NodeDefinition {
             id: "g.n".into(),
@@ -2535,12 +2881,13 @@ mod project_wire_tests {
             inputs: vec![input.clone()],
             outputs: vec![],
             features: Default::default(),
-            requires_infra: false, per_instance: None,
+            requires_infra: false, per_instance: None, per_instance_paths: Default::default(),
             images: vec![],
-            fires_with: Default::default(), baked_outputs: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
             published_service: None,
             instance_service: None,
             instance_rules: None,
+            recheck: Vec::new(),
             span: Some(Span::single_line(1, 0, 5)),
             header_span: Some(Span::single_line(1, 0, 3)),
             config_spans: Default::default(),
@@ -2605,6 +2952,7 @@ mod project_wire_tests {
             defaults: Default::default(),
             given: Default::default(),
             broken: Vec::new(),
+            install: None,
             metadata_wires: vec![edge],
         };
         let v = serde_json::to_value(&p).unwrap();
@@ -2674,11 +3022,13 @@ mod project_wire_tests {
             features: Default::default(),
             requires_infra,
             per_instance: None,
+            per_instance_paths: Default::default(),
             images: vec![],
-            fires_with: Default::default(), baked_outputs: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
             published_service: None,
             instance_service: None,
             instance_rules: None,
+            recheck: Vec::new(),
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -2705,6 +3055,7 @@ mod project_wire_tests {
             defaults: Default::default(),
             given: Default::default(),
             broken: Vec::new(),
+            install: None,
             metadata_wires: Vec::new(),
         }
     }
@@ -2724,6 +3075,35 @@ mod project_wire_tests {
             node_with_infra("c", true),
         ]);
         assert!(has_infra(&with_infra), "one infra node flips it true");
+    }
+
+    /// A node per instance at some of its places carries those places, on
+    /// the wire as `perInstancePaths`, and answers per place; a stored node
+    /// without the key reads as before (its mark, or none, at every place).
+    #[test]
+    fn a_per_instance_mark_is_read_per_place() {
+        use crate::instance::PerInstance;
+        let mut carry = node_with_infra("Carry.carry", false);
+        carry.per_instance_paths = [vec!["space.mine".to_string()]].into();
+        let json = serde_json::to_value(&carry).unwrap();
+        assert_eq!(json["perInstancePaths"], serde_json::json!([["space.mine"]]));
+        assert!(json.get("perInstance").is_none());
+        let back: NodeDefinition = serde_json::from_value(json).unwrap();
+        assert_eq!(back.per_instance_paths, carry.per_instance_paths);
+        assert_eq!(back.per_instance_at(&["space.mine"]), Some(PerInstance::Derived));
+        assert_eq!(back.per_instance_at(&["shared"]), None);
+        assert_eq!(back.per_instance_at::<&str>(&[]), None);
+        assert!(back.per_instance_somewhere());
+        let project = project_with_nodes(vec![back]);
+        assert!(is_per_instance(&project, &Located::new("Carry.carry", vec!["space.mine".to_string()])));
+        assert!(!is_per_instance(&project, &Located::new("Carry.carry", vec!["shared".to_string()])));
+
+        let mut older = serde_json::to_value(node_with_infra("bridge", true)).unwrap();
+        older["perInstance"] = serde_json::json!("marked");
+        let older: NodeDefinition = serde_json::from_value(older).unwrap();
+        assert!(older.per_instance_paths.is_empty());
+        assert_eq!(older.per_instance_at(&["any", "path"]), Some(PerInstance::Marked));
+        assert_eq!(older.per_instance_at::<&str>(&[]), Some(PerInstance::Marked));
     }
 
     #[test]
@@ -2760,9 +3140,9 @@ mod project_wire_tests {
     #[test]
     fn a_program_hiding_nodes_proves_no_copy_gone() {
         let mut project = project_with_nodes(vec![node_with_infra("db", true)]);
-        project.broken = vec![Broken { parts: vec!["db".into()], why: "a wire".into(), hides: false }];
+        project.broken = vec![Broken { parts: vec!["db".into()], places: Vec::new(), why: "a wire".into(), hides: false }];
         assert!(DeclaredInfra::of(&project).gone("other", false), "a wire hides no node");
-        project.broken.push(Broken { parts: vec!["lib".into()], why: "lib.weft does not parse".into(), hides: true });
+        project.broken.push(Broken { parts: vec!["lib".into()], places: Vec::new(), why: "lib.weft does not parse".into(), hides: true });
         let declared = DeclaredInfra::of(&project);
         assert!(project.hides_nodes());
         assert!(!declared.gone("other", false), "it may be inside lib.weft");
@@ -2928,8 +3308,8 @@ mod setup_cut_tests {
             &[("a", &[], "b"), ("trig", &[], "out")],
         );
         p.broken = vec![
-            Broken { parts: vec!["a".into(), "b".into()], why: "src/main.weft:3:1 a.v cannot feed b.v".into(), hides: false },
-            Broken { parts: vec!["g".into()], why: "src/main.weft:5:1 the group g is broken\nsecond line".into(), hides: false },
+            Broken { parts: vec!["a".into(), "b".into()], places: Vec::new(), why: "src/main.weft:3:1 a.v cannot feed b.v".into(), hides: false },
+            Broken { parts: vec!["g".into()], places: Vec::new(), why: "src/main.weft:5:1 the group g is broken\nsecond line".into(), hides: false },
         ];
         assert!(setup_cut(&p, &places(&["a"])).is_ok(), "a alone does not carry the wire");
         let refused = setup_cut(&p, &places(&["b"])).unwrap_err();
@@ -2947,13 +3327,32 @@ mod setup_cut_tests {
         );
         let (dissolved, _) = setup_cut(&fed, &places(&["g.c"])).unwrap();
         assert!(dissolved.groups.is_empty(), "the cut keeps no scope for g: {:?}", dissolved.groups);
-        fed.broken = vec![Broken { parts: vec!["g".into()], why: "a stream through g's port".into(), hides: false }];
+        fed.broken = vec![Broken { parts: vec!["g".into()], places: Vec::new(), why: "a stream through g's port".into(), hides: false }];
         assert!(setup_cut(&fed, &places(&["g.c"])).unwrap_err().contains("a stream through g's port"));
         let fire = compute_trigger_fire(&p, "trig", &serde_json::Value::Null, None, &Default::default()).unwrap();
         assert!(fire.program.broken.is_empty(), "a cut carries nothing broken");
-        p.broken.push(Broken { parts: vec!["out".into()], why: "out did not load".into(), hides: true });
+        p.broken.push(Broken { parts: vec!["out".into()], places: Vec::new(), why: "out did not load".into(), hides: true });
         let refused = compute_trigger_fire(&p, "trig", &serde_json::Value::Null, None, &Default::default()).unwrap_err();
         assert!(refused.starts_with("a fire of 'trig' cannot run") && refused.contains("out did not load"), "{refused}");
+    }
+
+    /// A broken part stored before parts named their places reads as
+    /// broken at every place, as it meant; one naming a place is needed
+    /// only by a cut that keeps that place.
+    #[test]
+    fn a_broken_part_names_its_places_and_an_older_one_holds_everywhere() {
+        let older: Broken = serde_json::from_value(serde_json::json!({ "parts": ["Lib.tick"], "why": "lib.weft:3:1 nope" })).unwrap();
+        assert!(older.places.is_empty());
+        let kept_ids = std::collections::BTreeSet::from(["Lib.tick"]);
+        let at = |site: &str| Located::new("Lib.tick", vec![site.to_string()]);
+        assert!(older.needed_by(&kept_ids, &std::collections::BTreeSet::from([at("one")])));
+        assert!(older.needed_by(&kept_ids, &std::collections::BTreeSet::from([at("two")])));
+        let placed = Broken { places: vec![at("one")], ..older };
+        let json = serde_json::to_value(&placed).unwrap();
+        assert_eq!(json["places"], serde_json::json!(["one/Lib.tick"]));
+        assert_eq!(serde_json::from_value::<Broken>(json).unwrap(), placed);
+        assert!(placed.needed_by(&kept_ids, &std::collections::BTreeSet::from([at("one")])));
+        assert!(!placed.needed_by(&kept_ids, &std::collections::BTreeSet::from([at("two")])));
     }
 
     /// A trigger is kicked at the top wherever it sits; the copies around

@@ -50,10 +50,11 @@ pub struct InfraNodeRow {
     pub applied_spec_hash: Option<String>,
     pub applied_at_unix: Option<i64>,
     /// Endpoint name → where the project's workers and weft's own roles
-    /// reach it (a URL, or `tcp://host:port`). `BTreeMap`: callers resolve endpoints by
-    /// name, and a deterministic order keeps any "first" semantics
-    /// stable.
-    pub endpoints: BTreeMap<String, String>,
+    /// reach it (a URL, or `tcp://host:port`), or the endpoint of another
+    /// node it lives inside, which [`reach`] follows. `BTreeMap`: callers
+    /// resolve endpoints by name, and a deterministic order keeps any
+    /// "first" semantics stable.
+    pub endpoints: BTreeMap<String, weft_core::infra::EndpointRecord>,
     /// Endpoint name → the path a `Public` endpoint answers at on the
     /// front door (`/infra/<project>/<copy_id>/<declared path>`), for
     /// that kind of endpoint only. A path, not a URL: the front door's
@@ -128,6 +129,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     tables: &["infra_node", "infra_unit"],
     ddl: &[
         r#"CREATE TABLE IF NOT EXISTS infra_node (
+            -- The key the boot walks `health_rules_json`'s rows by when it
+            -- carries them to a newer shape: the natural key holds a
+            -- nullable `instance_id`, so it cannot be the primary key.
+            id                  BIGSERIAL PRIMARY KEY,
             project_id          UUID NOT NULL,
             node_id             TEXT NOT NULL,
             copy_id             TEXT NOT NULL DEFAULT '',
@@ -703,11 +708,11 @@ fn parse_row(row: db::Row) -> anyhow::Result<InfraNodeRow> {
     let applied_spec_hash: Option<String> = row.try_get("applied_spec_hash")?;
     let applied_at_unix: Option<i64> = row.try_get("applied_at_unix")?;
     let endpoints_json = row.try_get::<_, db::JsonText<Value>>("endpoints_json")?.0;
-    let endpoints: BTreeMap<String, String> = serde_json::from_value(endpoints_json)
+    let endpoints: BTreeMap<String, weft_core::infra::EndpointRecord> = serde_json::from_value(endpoints_json)
         .map_err(|e| {
             anyhow::anyhow!(
                 "infra_node.endpoints_json for project={project_id} node={node_id} \
-                 is not a string-to-string map: {e}"
+                 is not a map of endpoint names to where each answers: {e}"
             )
         })?;
     let public_paths_json = row.try_get::<_, db::JsonText<Value>>("public_paths_json")?.0;

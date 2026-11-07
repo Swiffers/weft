@@ -18,9 +18,11 @@
 //! looks (`GET /projects/{id}/follow/{task}`, [`followed`]), each of which
 //! says where the activation is ([`progress`]). Anything else that asks
 //! outside a task's claim waits on the task's end in its own process
-//! ([`through_task`]). A program's call, a resync and the maintenance lift
-//! activate under the claim of the task they already run in, and never
-//! come here.
+//! ([`through_task`]). A program's call and a resync activate under the
+//! claim of the task they already run in, and never come here. The
+//! maintenance lift's bring-back always comes here, one task per owner,
+//! whether the lift's own task or a resync's request brings it back
+//! (`crate::maintenance`).
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -57,6 +59,8 @@ pub enum TaskAsker {
     /// `ActivateAsker::Rearm`: the instance's change it re-arms with, or
     /// none when what is stored already is the answer (a pick change).
     Rearm { change: Option<InstanceChange> },
+    /// `ActivateAsker::Lift`: bringing back what a maintenance left down.
+    Lift,
 }
 
 /// An instance's change of values a re-arm sets its triggers up with and
@@ -71,9 +75,9 @@ pub struct InstanceChange {
 }
 
 impl TaskAsker {
-    /// `asker` as a task carries it. A resync's drive and the maintenance
-    /// lift only ever activate under the claim of their own task, so one
-    /// of them here is weft's own bug, said as such.
+    /// `asker` as a task carries it. A resync's drive only ever activates
+    /// under the claim of its own task, so one here is weft's own bug,
+    /// said as such.
     fn of(asker: &ActivateAsker<'_>) -> Result<Self, ActivateError> {
         Ok(match asker {
             ActivateAsker::Outside => TaskAsker::Outside,
@@ -97,10 +101,11 @@ impl TaskAsker {
                     }
                 },
             },
-            ActivateAsker::Resync(_) | ActivateAsker::Lift => {
+            ActivateAsker::Lift => TaskAsker::Lift,
+            ActivateAsker::Resync(_) => {
                 return Err(ActivateError::Failed(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "a resync or the maintenance lift activated outside the task that drives it; this is a bug in weft".into(),
+                    "a resync activated outside the task that drives it; this is a bug in weft".into(),
                 ))
             }
         })
@@ -178,6 +183,7 @@ impl TaskExecutor<DispatcherState> for ActivateExecutor {
                 let rearm = Rearm { overlay: change.as_ref().map(|change| &change.overlay), store };
                 crate::api::project::activate_with(state, id, request, ActivateAsker::Rearm(&rearm)).await.map(|answer| answer.0)
             }
+            TaskAsker::Lift => crate::api::project::activate_with(state, id, request, ActivateAsker::Lift).await.map(|answer| answer.0),
         };
         Ok(serde_json::to_value(Ended::from(ended))?)
     }
@@ -259,21 +265,22 @@ pub(crate) fn followed(result: Option<Value>) -> Result<Value, (StatusCode, Stri
 /// waits on (`weft_core::infra::wire::ChangeProgress`), read off the rows
 /// it claimed; `None` while it drives none (before its claim, between two
 /// owners, after it landed).
-pub(crate) async fn progress(state: &DispatcherState, id: uuid::Uuid, task: uuid::Uuid) -> anyhow::Result<Option<Value>> {
+pub(crate) async fn progress(
+    state: &DispatcherState,
+    id: uuid::Uuid,
+    task: uuid::Uuid,
+) -> anyhow::Result<Option<weft_core::infra::wire::ChangeProgress>> {
     let rows = state.activations.list(id).await?;
     let now = crate::lease::now_unix();
     let driving = rows
         .iter()
         .filter(|a| a.driver_task == Some(task))
         .find_map(|a| Some((a.activating?, a.lifecycle.activating_run_id?)));
-    Ok(match driving {
-        Some((activating, run)) => Some(serde_json::to_value(weft_core::infra::wire::ChangeProgress {
-            since_unix: activating.since_unix,
-            as_of_unix: now,
-            waiting: Some(activating.step.waiting(run)),
-        })?),
-        None => None,
-    })
+    Ok(driving.map(|(activating, run)| weft_core::infra::wire::ChangeProgress {
+        since_unix: activating.since_unix,
+        as_of_unix: now,
+        waiting: Some(activating.step.waiting(run)),
+    }))
 }
 
 #[cfg(test)]

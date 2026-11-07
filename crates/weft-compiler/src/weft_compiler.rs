@@ -409,6 +409,20 @@ pub fn compile_lenient(
     include_mode: IncludeMode,
     source_name: Option<&str>,
 ) -> (ProjectDefinition, Vec<SourceError>) {
+    compile_lenient_reading(source, project_id, fs, include_mode, source_name, None)
+}
+
+/// [`compile_lenient`], handing every `@file` it reads into a field to
+/// `reads`: the build's compile, which names each by its content once
+/// the program is checked (`crate::file_ref::name_contents`).
+pub(crate) fn compile_lenient_reading(
+    source: &str,
+    project_id: Uuid,
+    fs: CompileFs,
+    include_mode: IncludeMode,
+    source_name: Option<&str>,
+    reads: Option<&mut Vec<crate::file_ref::ContentRead>>,
+) -> (ProjectDefinition, Vec<SourceError>) {
     let mut errors = Vec::new();
 
     // Parse (the parser already builds a partial ParseState alongside errors).
@@ -438,7 +452,7 @@ pub fn compile_lenient(
     // a group's inputs and an include site's arguments). Resolve them once
     // here, using each field's recorded source file rather than whichever
     // include was visited last.
-    crate::file_ref::resolve_project_file_refs(&mut project, &fs, &mut errors);
+    crate::file_ref::resolve_project_file_refs(&mut project, &fs, &mut errors, reads);
     (project, errors)
 }
 
@@ -3921,6 +3935,7 @@ fn flatten(state: ParseState, bodies: Bodies, project_id: Uuid, errors: &mut Vec
         defaults: Default::default(),
         given: Default::default(),
         broken: Vec::new(),
+        install: None,
         metadata_wires: Vec::new(),
     }
 }
@@ -4006,6 +4021,14 @@ fn collect_group_definitions(
     // parser's rescope pass).
     let node_ids: Vec<String> = group.nodes.iter().map(|n| n.id.clone()).collect();
     let child_group_ids: Vec<String> = group.child_groups.iter().map(|g| g.id.clone()).collect();
+    // A loop's literals sit on its `LoopIn` alone (`push_loop_boundaries`),
+    // which every reader, the editor's loop box included, takes them from.
+    let is_loop = matches!(group.kind, GroupKind::Loop { .. });
+    let (port_literals, port_literal_spans) = if is_loop {
+        Default::default()
+    } else {
+        (group.port_literals.iter().map(|(k, v)| (k.clone(), v.clone())).collect(), group.port_literal_spans.clone())
+    };
 
     out.push(weft_core::GroupDefinition {
         id: group.id.clone(),
@@ -4026,15 +4049,15 @@ fn collect_group_definitions(
         header_span: group.header_span,
         source_file: group.source_file.clone(),
         description: group.description.clone(),
-        port_literals: group.port_literals.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-        port_literal_spans: group.port_literal_spans.clone(),
+        port_literals,
+        port_literal_spans,
         // Written by enrich, where a metadata wire lands on a port.
         port_literal_types: Default::default(),
         // A `@file` / `@asset` literal on a port is resolved with the
         // program's other file references (`crate::file_ref`).
         file_refs: Default::default(),
         // A loop's bounds sit on its two boundaries, which carry its ports.
-        type_params: if matches!(group.kind, GroupKind::Loop { .. }) { Vec::new() } else { group.type_params.clone() },
+        type_params: if is_loop { Vec::new() } else { group.type_params.clone() },
         // Resolved per place by enrich.
         place_types: Vec::new(),
     });
@@ -4254,12 +4277,13 @@ fn push_loop_boundaries(group: &ParsedGroup, nodes: &mut Vec<NodeDefinition>) {
         place_types: Vec::new(),
         scope: boundary_scope.clone(),
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::In }),
-        requires_infra: false, per_instance: None,
+        requires_infra: false, per_instance: None, per_instance_paths: Default::default(),
         images: Vec::new(),
-        fires_with: Default::default(), baked_outputs: Default::default(),
+        fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
         published_service: None,
         instance_service: None,
         instance_rules: None,
+        recheck: Vec::new(),
         span: None,
         // The loop's header is where a diagnostic about either
         // boundary points: the boundaries are the header's two
@@ -4347,12 +4371,13 @@ fn push_loop_boundaries(group: &ParsedGroup, nodes: &mut Vec<NodeDefinition>) {
         place_types: Vec::new(),
         scope: boundary_scope.clone(),
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::Out }),
-        requires_infra: false, per_instance: None,
+        requires_infra: false, per_instance: None, per_instance_paths: Default::default(),
         images: Vec::new(),
-        fires_with: Default::default(), baked_outputs: Default::default(),
+        fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
         published_service: None,
         instance_service: None,
         instance_rules: None,
+        recheck: Vec::new(),
         span: None,
         header_span: group.header_span,
         config_spans: Default::default(),
@@ -4426,11 +4451,13 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         // The mark only; enrich checks the node may carry it and the
         // propagation adds every node that reads from one.
         per_instance: pn.per_instance.then_some(weft_core::instance::PerInstance::Marked),
+        per_instance_paths: Default::default(),
         images: Vec::new(),
-        fires_with: Default::default(), baked_outputs: Default::default(),
+        fires_with: Default::default(), baked_outputs: Default::default(), lists: Default::default(),
         published_service: None,
         instance_service: None,
         instance_rules: None,
+        recheck: Vec::new(),
         span: pn.span,
         header_span: pn.header_span,
         config_spans: pn.config_spans.clone(),

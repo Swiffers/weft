@@ -17,7 +17,7 @@ use weft_task_store::db::Client as _;
 
 use super::{answered, failed, stop_asker, Actor, Refused};
 use crate::api::project::{
-    activate_with, coherent_definition, deactivate_scope, end_unfinished_activation, instances_with_triggers_on, keys_by_owner,
+    activate_with, as_registered, coherent_definition, deactivate_scope, end_unfinished_activation, instances_with_triggers_on, keys_by_owner,
     keys_to_take_down, on_another_binary, on_another_binary_refusal, prepare_trigger_setup, refuse_unrunnable, require_action,
     require_registered_build, require_trigger_infra, resolve_scope, run_trigger_setup, ActivateAsker, ActivateError, Desired, StatusError,
     Unrunnable,
@@ -400,13 +400,11 @@ pub(crate) async fn resync(state: &DispatcherState, actor: &Actor, id: uuid::Uui
 
     // 1. Which triggers: the scope's, as the registered build has them, of
     //    which the ones on and behind it are refreshed and the ones off
-    //    are named in the answer.
-    let registered = state
-        .projects
-        .project(id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
-        .ok_or((StatusCode::NOT_FOUND, "project not found".to_string()))?;
+    //    are named in the answer. One read of it serves every check
+    //    below.
+    let (program, runnable) = coherent_definition(state, id).await?;
+    let loaded = as_registered(&program, &runnable);
+    let registered = &*loaded.program;
     let activations = state
         .activations
         .list(id)
@@ -419,11 +417,10 @@ pub(crate) async fn resync(state: &DispatcherState, actor: &Actor, id: uuid::Uui
         true => instances_with_triggers_on(state, id).await?,
         false => Vec::new(),
     };
-    let keys = request.scope.resolve(&registered, &on).map_err(|why| (StatusCode::BAD_REQUEST, why))?;
+    let keys = request.scope.resolve(registered, &on).map_err(|why| (StatusCode::BAD_REQUEST, why))?;
     let internal = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("running hashes: {e:#}"));
     let binary_hash = state.projects.running_binary_hash(id).await.map_err(internal)?;
-    let definition_hash = state.projects.running_definition_hash(id).await.map_err(internal)?;
-    let desired = Desired::registered(state, id, &registered, binary_hash.as_deref(), definition_hash.as_deref()).await?;
+    let desired = Desired::registered(state, id, &loaded, binary_hash.as_deref()).await?;
     let row = |key: &weft_core::activation::ActivationKey| activations.iter().find(|a| &a.key == key);
     // Off: never turned on, or down. One being switched on is not.
     let off: Vec<weft_core::activation::ActivationKey> = keys
@@ -472,17 +469,17 @@ pub(crate) async fn resync(state: &DispatcherState, actor: &Actor, id: uuid::Uui
     //    worker runs it, what it left out included). Every owner is
     //    checked before the first comes down. Each activate below re-reads
     //    and re-checks; this is what keeps the project whole.
-    require_action(state, id, &["resync"]).await?;
-    let (_, runnable) = coherent_definition(state, id).await?;
+    require_action(state, id, &loaded, &["resync"]).await?;
     for owner in &owners {
-        require_trigger_infra(state, id, &registered, &owner.keys(&owner.on)).await?;
+        require_trigger_infra(state, id, registered, &owner.keys(&owner.on)).await?;
         refuse_unrunnable(state, id, &runnable, &owner.keys(&owner.on)).await.map_err(|unrunnable| match unrunnable {
             Unrunnable::Cannot(why) => (StatusCode::UNPROCESSABLE_ENTITY, format!("{why}\n{RESYNC_TOOK_NOTHING_DOWN}")),
             Unrunnable::Lacks(why) => (StatusCode::PRECONDITION_FAILED, format!("{why}\n{RESYNC_TOOK_NOTHING_DOWN}")),
             Unrunnable::Unchecked(failed) => failed,
         })?;
     }
-    crate::install_picks::require_activation_picks(state, id, &registered).await?;
+    crate::install_picks::require_activation_picks(state, id, registered).await?;
+    refuse_what_cannot_come_up(state, id, &behind).await?;
     let brought_back = bring_back().await?;
 
     // 3. Write the resync down and enter the project's `resyncing`
@@ -531,6 +528,68 @@ pub(crate) async fn resync(state: &DispatcherState, actor: &Actor, id: uuid::Uui
     };
     crate::transition::publish_transition_changed(state, id).await;
     Ok(ResyncAnswer::UnderWay { task, brought_back })
+}
+
+/// Refuse, before a resync takes anything down, when a signal of the
+/// triggers it brings back (`keys`, as each is registered now) could not
+/// come up again on this install: the listener's kinds say which and why
+/// (a provider subscription that needs the provider to call in, on an
+/// install the internet cannot reach), and the refusal names each. It
+/// checks the signal registered now: the bring-back's setup captures its
+/// signal again on the new build, which may change what decides this (a
+/// topic, a connection), and that is only known once the triggers are
+/// down; the bring-back's own registration refuses it then.
+async fn refuse_what_cannot_come_up(state: &DispatcherState, id: uuid::Uuid, keys: &[weft_core::activation::ActivationKey]) -> Result<(), Refused> {
+    let internal = |what: &str, e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}"));
+    let signals = state.registrations.signal_list_for_project(id).await.map_err(|e| internal("the triggers' signals", e))?;
+    let mut asked = Vec::new();
+    // Whose each asked signal is, to name it in a refusal: one trigger of
+    // several instances is asked once per instance.
+    let mut owners: std::collections::BTreeMap<String, weft_core::instance::InstanceId> = std::collections::BTreeMap::new();
+    for signal in signals.into_iter().filter(|s| !s.is_resume) {
+        let Some(trigger) = signal.activation_trigger.clone() else { continue };
+        let key = weft_core::activation::ActivationKey::new(trigger, weft_core::instance::Owner::from_instance(signal.instance.clone()));
+        if !keys.contains(&key) {
+            continue;
+        }
+        let spec = signal.spec().map_err(|e| internal(&format!("the signal of '{}'", signal.node_id), e))?;
+        if let Some(instance) = &signal.instance {
+            owners.insert(signal.token.clone(), instance.clone());
+        }
+        asked.push(weft_core::signal::listener_protocol::CheckSignal {
+            for_instance: signal.instance.clone().map(|instance| weft_core::instance::InstanceScope { project_id: id, instance }),
+            token: signal.token,
+            tenant_id: signal.tenant_id,
+            node_id: signal.node_id,
+            spec,
+        });
+    }
+    if asked.is_empty() {
+        return Ok(());
+    }
+    let refused = state.listener.check(asked).await.map_err(|e| internal("ask the listener whether the triggers can come back", e))?;
+    if refused.is_empty() {
+        return Ok(());
+    }
+    Err((StatusCode::PRECONDITION_FAILED, cannot_come_up_refusal(&refused, &owners)))
+}
+
+/// What a resync answers when signals of the triggers it would bring back
+/// could not come up on this install: each, with whose it is (`owners`,
+/// by token, for an instance's), with why, and that nothing was taken
+/// down.
+fn cannot_come_up_refusal(
+    refused: &[weft_core::signal::listener_protocol::CheckRefused],
+    owners: &std::collections::BTreeMap<String, weft_core::instance::InstanceId>,
+) -> String {
+    let each: Vec<String> = refused
+        .iter()
+        .map(|r| {
+            let whose = owners.get(&r.token).map(|instance| format!(" of instance {instance}")).unwrap_or_default();
+            format!("'{}'{whose} could not come back on this install: {}", r.node_id, r.why)
+        })
+        .collect();
+    format!("{}\nThe resync took nothing down. Do what the message above says, then run `weft resync` again.", each.join("\n"))
 }
 
 /// What a resync refused for a build that cannot run its triggers adds,
@@ -586,6 +645,28 @@ pub(crate) async fn resume_resync(state: &DispatcherState, actor: &Actor, id: uu
 }
 
 #[cfg(test)]
+mod cannot_come_up_tests {
+    /// Each signal that could not come back is named with why, and the
+    /// answer says nothing was taken down.
+    #[test]
+    fn a_resync_that_cannot_bring_a_trigger_back_names_it_and_took_nothing_down() {
+        let refused = |token: &str| weft_core::signal::listener_protocol::CheckRefused {
+            token: token.into(),
+            node_id: "inbox".into(),
+            why: "this trigger needs 'slack' to deliver events TO your weft".into(),
+        };
+        let owners = std::collections::BTreeMap::from([("t2".to_string(), weft_core::instance::InstanceId::new("ada").unwrap())]);
+        let said = super::cannot_come_up_refusal(&[refused("t1"), refused("t2")], &owners);
+        assert_eq!(
+            said,
+            "'inbox' could not come back on this install: this trigger needs 'slack' to deliver events TO your weft\n\
+             'inbox' of instance ada could not come back on this install: this trigger needs 'slack' to deliver events TO your weft\n\
+             The resync took nothing down. Do what the message above says, then run `weft resync` again."
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::tenant::TenantId;
@@ -615,7 +696,7 @@ mod tests {
     #[test]
     fn a_program_cannot_resync_its_own_project() {
         let (own, other) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
-        let program = Actor::Program { tenant: TenantId::local(), project: own, run: uuid::Uuid::now_v7() };
+        let program = Actor::Program { tenant: TenantId::local(), project: own, run: uuid::Uuid::now_v7(), call: uuid::Uuid::now_v7() };
         let (status, why) = refuse_own_resync(&program, own).unwrap_err();
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(why.contains("would wait on itself"), "{why}");

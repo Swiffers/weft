@@ -3,13 +3,18 @@
 //! once instead of once per file. nextest still runs each test in its own
 //! process.
 
+mod access_types;
 mod broken_parts;
 mod computer_includes;
 mod enrich_tests;
+mod file_contents;
 mod fires_with;
 mod gated_fire;
 mod highlighting_vocabulary;
 mod include_cuts;
+mod install_rules;
+mod none_of_lists;
+mod loop_cuts;
 mod metadata_ports;
 mod infra_image_enum;
 mod node_test_sweep;
@@ -17,6 +22,7 @@ mod parser_multiline_object;
 mod parser_tests;
 mod passthrough_include;
 mod per_instance;
+mod rechecks;
 mod rig;
 mod start_feeders;
 mod test_crate_emit;

@@ -170,6 +170,20 @@ pub async fn forget_copies(pool: &Pool, project_id: uuid::Uuid, instance: Option
     Ok(())
 }
 
+/// Forget the maintenance's mark on `triggers`, `instance`'s triggers of
+/// project `project_id` that are still down with it: the lift has nothing
+/// to bring back for them (the program no longer has them).
+pub async fn forget_marks(pool: &Pool, project_id: uuid::Uuid, instance: Option<&InstanceId>, triggers: &[String]) -> anyhow::Result<()> {
+    pool.execute(
+        "UPDATE trigger_activation SET went_down_with = NULL \
+         WHERE project_id = $1 AND trigger = ANY($2) AND instance_id IS NOT DISTINCT FROM $3 \
+           AND went_down_with = 'maintenance' AND status = 'inactive'",
+        &[&project_id, &triggers, &instance.map(InstanceId::as_str)],
+    )
+    .await?;
+    Ok(())
+}
+
 /// Every copy the maintenance stopped and the lift has not started yet.
 pub async fn recorded_copies(pool: &Pool) -> anyhow::Result<Vec<RecordedCopy>> {
     let rows: Vec<(uuid::Uuid, String, Option<String>)> = pool
@@ -393,7 +407,7 @@ pub async fn follow(
     if kind.as_deref() != Some(weft_task_store::TaskKind::MaintenanceLift.as_str()) {
         return Err((StatusCode::NOT_FOUND, format!("no lift {task} to follow (a finished one is forgotten after an hour)")));
     }
-    let outcome = weft_task_store::terminal::wait_for_terminal(&state.pg_pool, &state.signals, task, hold.hold())
+    let outcome = weft_task_store::terminal::wait_for_terminal_before(&state.pg_pool, &state.signals, task, hold.hold(&state.stopping))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("follow the lift: {e:#}")))?;
     match outcome.status {
@@ -481,13 +495,14 @@ async fn fence(state: &DispatcherState, id: uuid::Uuid) -> anyhow::Result<()> {
 /// node keeps up on a plain stop included (`force`): nothing of the old
 /// install keeps running. Disks are kept, as on any stop.
 async fn stop_copies(state: &DispatcherState, id: uuid::Uuid, take_down: &TakeDown, went: &mut ProjectWentDown) -> Result<(), String> {
-    let Some(project) = state.projects.project(id).await.map_err(|e| format!("{e:#}"))? else { return Ok(()) };
+    let Some(registered) = state.registered(id).await.map_err(|e| format!("{e:#}"))? else { return Ok(()) };
+    let project = &*registered.program;
     if crate::api::project::infra_setup_in_flight(state, id, None).await.map_err(|e| format!("{e:#}"))? {
         went.refused.push("its infra is being started; wait for it or cancel it (`weft infra cancel`), then run `weft maintenance on` again".into());
     }
     // Read as `weft status` reads them: a stop already asked for reads
     // `stopping` and is left to land, a start asked for `provisioning`.
-    let observed = crate::infra_node::observe(&state.pg_pool, id, &project).await.map_err(|e| format!("{e:#}"))?;
+    let observed = crate::infra_node::observe(&state.pg_pool, id, project).await.map_err(|e| format!("{e:#}"))?;
     let being_started = |node: &str, instance: Option<&InstanceId>| {
         format!(
             "infra copy {} is being started; wait for it or cancel it (`weft infra cancel`), then run `weft maintenance on` again",
@@ -511,7 +526,7 @@ async fn stop_copies(state: &DispatcherState, id: uuid::Uuid, take_down: &TakeDo
         // record would leave a copy nothing brings back.
         record_copies(&state.pg_pool, id, instance.as_ref(), &nodes, now).await.map_err(|e| format!("{e:#}"))?;
         let stop = crate::infra_lifecycle_command::Teardown::Stop { force: true };
-        match crate::api::infra::take_copies_down(state, id, &project, instance.as_ref(), &nodes, stop, take_down, crate::take_down::TakeDownAsker::Outside).await {
+        match crate::api::infra::take_copies_down(state, id, &registered, instance.as_ref(), &nodes, stop, take_down, crate::take_down::TakeDownAsker::Outside).await {
             Ok(_) => went.copies.extend(nodes.into_iter().map(|node| CopyRef { node, instance: instance.clone() })),
             Err((_, why)) => went.refused.push(format!("stopping {}: {why}", nodes.join(", "))),
         }
@@ -779,15 +794,16 @@ async fn start_copies(
     setups: &tokio::sync::Semaphore,
     lifted: &mut ProjectLifted,
 ) -> anyhow::Result<()> {
-    let Some(project) = state.projects.project(id).await? else { return Ok(()) };
+    let Some(registered) = state.registered(id).await? else { return Ok(()) };
+    let project = &*registered.program;
     // Read as `weft status` reads them: a copy whose stop has not landed
     // yet reads `stopping`, so it is started again rather than taken for
     // one that runs.
-    let observed = crate::infra_node::observe(&state.pg_pool, id, &project).await?;
+    let observed = crate::infra_node::observe(&state.pg_pool, id, project).await?;
     let mut done = Vec::new();
     let mut to_start = Vec::new();
     for node in nodes {
-        let declared = crate::api::infra::resolve_infra_nodes(&project, std::slice::from_ref(node), instance).is_ok();
+        let declared = crate::api::infra::resolve_infra_nodes(project, std::slice::from_ref(node), instance).is_ok();
         match (observed.status_of(node, instance), declared) {
             (None, _) => {
                 lifted.skipped.push(format!("infra copy {} was terminated during the maintenance", copy_words(node, instance)));
@@ -816,7 +832,7 @@ async fn start_copies(
     let started = async {
         let begun = {
             let _turn = setups.acquire().await.expect("a lift's semaphore is never closed");
-            crate::api::infra::begin_sync(state, id, &Default::default(), instance, &to_start, false, crate::api::infra::SyncKind::Lift)
+            crate::api::infra::begin_sync(state, id, &registered, &Default::default(), instance, &to_start, false, crate::api::infra::SyncKind::Lift)
                 .await
                 .map_err(|e| e.into_parts().1)?
         };
@@ -842,13 +858,50 @@ async fn start_copies(
 
 /// Bring back `triggers`, `owner`'s marked triggers of project `id`, on the
 /// registered build. The claim clears their mark; a failure puts it back.
+/// A marked trigger the registered program no longer has (renamed or
+/// removed since) is skipped and its mark forgotten, as a copy the program
+/// no longer has is ([`start_copies`]): kept, it would fail the whole
+/// owner's activation, its live triggers included, on every lift and
+/// resync.
+///
+/// Each owner's activation is its own `activate` task, whoever brings it
+/// back (the lift's task, a resync's request): the task's claim rests on
+/// that owner's setup run alone, so the owners a lift brings back side by
+/// side never share one claim's rest, and a resync's request, which holds
+/// no claim, brings back the same way.
 async fn bring_back(state: &DispatcherState, id: uuid::Uuid, owner: &Owner, triggers: Vec<String>, lifted: &mut ProjectLifted) {
+    let (triggers, gone) = match state.registered(id).await {
+        Ok(Some(registered)) => {
+            let project = &*registered.program;
+            let declared: std::collections::BTreeSet<String> = weft_core::project::trigger_places(project)
+                .iter()
+                .map(|place| weft_core::project::address_of(project, &place.id, &place.path))
+                .collect();
+            triggers.into_iter().partition::<Vec<String>, _>(|trigger| declared.contains(trigger))
+        }
+        Ok(None) => (triggers, Vec::new()),
+        Err(e) => {
+            let words = weft_core::activation::OwnerTriggers { owner: owner.clone(), triggers }.words();
+            lifted.failed.push(format!("triggers {words}: the registered program: {e:#}"));
+            return;
+        }
+    };
+    if !gone.is_empty() {
+        let words = weft_core::activation::OwnerTriggers { owner: owner.clone(), triggers: gone.clone() }.words();
+        match forget_marks(&state.pg_pool, id, owner.instance(), &gone).await {
+            Ok(()) => lifted.skipped.push(format!("triggers {words} are no triggers of the program any more")),
+            Err(e) => lifted.failed.push(format!("triggers {words} are no triggers of the program any more, and forgetting them failed: {e:#}")),
+        }
+    }
+    if triggers.is_empty() {
+        return;
+    }
     let words = weft_core::activation::OwnerTriggers { owner: owner.clone(), triggers: triggers.clone() }.words();
     let request = weft_core::activation::ActivateRequest {
         scope: weft_core::activation::ActivationScope::of_owner(triggers, owner),
         ..Default::default()
     };
-    match crate::api::project::activate_with(state, id, request, crate::api::project::ActivateAsker::Lift).await {
+    match crate::task_kinds::activate::through_task(state, id, request, &crate::api::project::ActivateAsker::Lift).await.map(Json) {
         Ok(Json(answer)) => lifted.turned_on.extend(answer.turned_on),
         Err(error) => {
             let (_, why) = <(StatusCode, String)>::from(error);

@@ -13,11 +13,12 @@ use std::collections::HashMap;
 use axum::http::StatusCode;
 
 use weft_core::frames::{loop_indices, FiringLocation, Located, LoopFrames};
-use weft_core::primitive::{AwaitedEntryKind, LoopInstanceKey, LoopTerminationReason, RunSnapshot};
+use weft_core::primitive::{LoopInstanceKey, LoopTerminationReason, RunSnapshot};
 use weft_core::program::{NodeState, NodeStatus};
-use weft_core::project::places::{members_in, scopes_around, state_place, StatePlace};
+use weft_core::project::graph::ProjectGraph;
+use weft_core::project::places::{enclosing_loops, every_place, members_in, named, scopes_around, state_place, Named, StatePlace};
 use weft_core::project::scopes::ScopeCopy;
-use weft_core::project::{loop_in_id, loop_out_id, ProjectDefinition};
+use weft_core::project::{loop_in_id, loop_out_id, ProgramIndex, ProjectDefinition};
 use weft_core::run::scope::ScopeState;
 use weft_core::run::{firing_at, NodeFiringStatus};
 use weft_core::signal::listener_protocol::LastAnswer;
@@ -40,17 +41,31 @@ pub async fn read(state: &DispatcherState, project_id: uuid::Uuid, run_id: RunId
     let program = crate::projection::registered_program(state, run_id, &owner).await.map_err(internal("the run's program"))?
         .or_why(run_id)
         .map_err(|why| (StatusCode::CONFLICT, why))?;
-    let place = state_place(&program, spelled).map_err(|why| (StatusCode::BAD_REQUEST, why))?;
     let (cut, snapshot) = crate::projection::run_snapshot(state, run_id).await.map_err(internal("the run's record"))?;
+    let place = place_in_run(&program, &cut, spelled).map_err(|why| (StatusCode::BAD_REQUEST, why))?;
     if !in_run(&cut, &snapshot, &place) {
         return Err((StatusCode::BAD_REQUEST, format!("run {run_id} runs only part of its program, and '{spelled}' is not in that part")));
     }
-    let seen = seen_at(&program, &snapshot, &place);
+    let seen = seen_at(&program, &cut, &snapshot, &place);
     let live = match &seen.waiting_on {
         Some(token) => wait_answer(state, token).await?,
         None => None,
     };
     Ok(NodeState { status: seen.status, live, error: seen.error })
+}
+
+/// The place `spelled` names (read against the whole `program`) whose
+/// state the run of `cut` can tell ([`state_place`]), and a node inside
+/// loops `cut` holds only part of the body of: that run never launched
+/// them, it ran inside iteration 0 of each, so the node fired once there.
+pub(crate) fn place_in_run(program: &ProjectDefinition, cut: &ProjectDefinition, spelled: &str) -> Result<StatePlace, String> {
+    state_place(program, spelled).or_else(|why| {
+        let Ok(Named::Node(place)) = named(program, spelled) else { return Err(why) };
+        let index = ProgramIndex::build(cut);
+        let loops = enclosing_loops(&ProjectGraph::new(cut), &place);
+        let entered = !loops.is_empty() && loops.iter().all(|around| index.scopes().get(&around.id).is_some_and(|scope| scope.entered));
+        if entered && every_place(cut).contains(&place) { Ok(StatePlace::Node(place)) } else { Err(why) }
+    })
 }
 
 /// Whether `place` is part of the run whose program is `cut` (the part of
@@ -70,15 +85,10 @@ pub(crate) fn in_run(cut: &ProjectDefinition, snapshot: &RunSnapshot, place: &St
 /// (`snapshot`): what tells two iterations waiting at one node apart.
 pub(crate) fn wait_iterations(snapshot: &RunSnapshot, place: &Located) -> HashMap<String, Vec<u32>> {
     snapshot
-        .awaited_sequences
+        .recorded_waits
         .iter()
         .filter(|(at, _)| Located::at(at.node_id.clone(), &at.frames) == *place)
-        .flat_map(|(at, entries)| {
-            entries.iter().filter_map(move |entry| match &entry.kind {
-                AwaitedEntryKind::Await { token, .. } => Some((token.clone(), loop_indices(&at.frames))),
-                _ => None,
-            })
-        })
+        .flat_map(|(at, waits)| waits.iter().map(move |wait| (wait.token.clone(), loop_indices(&at.frames))))
         .collect()
 }
 
@@ -97,35 +107,40 @@ impl Seen {
     }
 }
 
-/// [`Seen`] for `place` in `snapshot`: pure, so every status is pinned
-/// by a test without a database.
-pub(crate) fn seen_at(project: &ProjectDefinition, snapshot: &RunSnapshot, place: &StatePlace) -> Seen {
+/// [`Seen`] for `place` in `snapshot`, the record of a run of `cut` (a
+/// cut of `project`, or `project` itself): pure, so every status is
+/// pinned by a test without a database.
+pub(crate) fn seen_at(project: &ProjectDefinition, cut: &ProjectDefinition, snapshot: &RunSnapshot, place: &StatePlace) -> Seen {
+    let index = ProgramIndex::build(cut);
     match place {
-        StatePlace::Node(place) => node_seen(project, snapshot, place),
-        StatePlace::Loop(place) => loop_seen(project, snapshot, place),
+        StatePlace::Node(place) => node_seen(project, snapshot, place, index.frames_at(cut, place), |scope| {
+            ScopeCopy::new(scope.id.clone(), index.scopes().frames_at(Some(&scope.id), &scope.path))
+        }),
+        StatePlace::Loop(place) => {
+            let entry = Located::new(loop_in_id(&place.id), place.path.clone());
+            loop_seen(project, snapshot, place, index.frames_at(cut, &entry))
+        }
     }
 }
 
-fn node_seen(project: &ProjectDefinition, snapshot: &RunSnapshot, place: &Located) -> Seen {
-    let frames = place.frames();
+/// What the record says of the node at `place`, which fires at `frames`;
+/// `copy_of` is the copy of a scope around it the run would decide.
+// SYNC: node_seen <-> extension-vscode/src/runFollower.ts firingStatus
+fn node_seen(project: &ProjectDefinition, snapshot: &RunSnapshot, place: &Located, frames: LoopFrames, copy_of: impl Fn(&Located) -> ScopeCopy) -> Seen {
     // A node outside every loop fires once in a run; a seeded run holds the
     // firing it took over under its own id too.
     let Some(firing) = firing_at(&snapshot.firings, &place.id, snapshot.run_id, &frames) else {
         // Not fired yet: it never will when a scope around it (a group, a
         // site, the included file's body) decided not to run, before the
         // skip reached the node itself.
-        let graph = weft_core::project::graph::ProjectGraph::new(project);
+        let graph = ProjectGraph::new(project);
         let skipped = scopes_around(&graph, place).into_iter().any(|scope| {
-            let copy = ScopeCopy::new(scope.id.clone(), scope.frames());
-            snapshot.scopes.get(&copy).is_some_and(|record| matches!(record.state, ScopeState::Skipped { .. }))
+            snapshot.scopes.get(&copy_of(&scope)).is_some_and(|record| matches!(record.state, ScopeState::Skipped { .. }))
         });
         return Seen::of(if skipped { NodeStatus::Skipped } else { NodeStatus::Pending });
     };
     let pending_wait = || {
-        snapshot.awaited_sequences.get(&FiringLocation::new(place.id.clone(), frames.clone()))?.iter().rev().find_map(|entry| match &entry.kind {
-            AwaitedEntryKind::Await { token, ended: None } => Some(token.clone()),
-            _ => None,
-        })
+        snapshot.recorded_waits.get(&FiringLocation::new(place.id.clone(), frames.clone()))?.iter().rev().find(|wait| wait.ended.is_none()).map(|wait| wait.token.clone())
     };
     match firing.status() {
         // A wait the worker holds leaves its firing running: the wait on
@@ -134,9 +149,13 @@ fn node_seen(project: &ProjectDefinition, snapshot: &RunSnapshot, place: &Locate
             Some(token) => Seen { status: NodeStatus::Waiting, waiting_on: Some(token), error: None },
             None => Seen::of(NodeStatus::Running),
         },
-        NodeFiringStatus::WaitingForInput => {
-            Seen { status: NodeStatus::Waiting, waiting_on: firing.callback_id.clone().or_else(pending_wait), error: None }
-        }
+        // Parked: on a wait of its own (the record's, or one still on
+        // record with no ending), else only because its run paused with
+        // it inside, which names nothing to wait on.
+        NodeFiringStatus::WaitingForInput => match firing.callback_id.clone().or_else(pending_wait) {
+            Some(token) => Seen { status: NodeStatus::Waiting, waiting_on: Some(token), error: None },
+            None => Seen::of(NodeStatus::Paused),
+        },
         NodeFiringStatus::Completed => Seen::of(NodeStatus::Completed),
         NodeFiringStatus::Failed => Seen { status: NodeStatus::Failed, waiting_on: None, error: firing.error.clone() },
         NodeFiringStatus::Skipped => Seen::of(NodeStatus::Skipped),
@@ -150,15 +169,14 @@ fn node_seen(project: &ProjectDefinition, snapshot: &RunSnapshot, place: &Locate
 /// second its failure was recorded at (the journal's precision); failures
 /// in the same second are taken boundaries first, then in the order of
 /// the loop's members.
-fn loop_seen(project: &ProjectDefinition, snapshot: &RunSnapshot, place: &Located) -> Seen {
-    let parent_frames = place.frames();
+fn loop_seen(project: &ProjectDefinition, snapshot: &RunSnapshot, place: &Located, parent_frames: LoopFrames) -> Seen {
     let key = LoopInstanceKey { group_id: place.id.clone(), parent_frames: parent_frames.clone(), run_id: snapshot.run_id };
     let Some(instance) = snapshot.loop_runtime.get(&key) else { return Seen::of(NodeStatus::Pending) };
     match &instance.terminated {
         None => Seen::of(NodeStatus::Running),
         Some(LoopTerminationReason::Cancelled) => Seen::of(NodeStatus::Cancelled),
         Some(LoopTerminationReason::Failed) => {
-            let graph = weft_core::project::graph::ProjectGraph::new(project);
+            let graph = ProjectGraph::new(project);
             let inside = |frames: &LoopFrames| frames.len() > parent_frames.len() && frames.starts_with(&parent_frames);
             let boundaries = [loop_in_id(&place.id), loop_out_id(&place.id)];
             let members = members_in(&graph, &place.id, &place.path);
@@ -226,7 +244,7 @@ mod tests {
     fn seen(events: &[RunEvent], spelled: &str) -> Seen {
         let project = program();
         let snapshot = weft_journal::fold_to_snapshot(RUN, Arc::new(project.clone()), events);
-        seen_at(&project, &snapshot, &state_place(&project, spelled).unwrap())
+        seen_at(&project, &project, &snapshot, &state_place(&project, spelled).unwrap())
     }
 
     fn started(node: &str) -> RunEvent {
@@ -240,7 +258,7 @@ mod tests {
             frames: vec![],
             token: token.into(),
             spec: SignalSpec::of_kind("poll_endpoint", json!({ "url": "https://x/status" })),
-            call_index: 0,
+            wait_index: 0,
             at_unix: 2,
         }
     }
@@ -273,9 +291,21 @@ mod tests {
     fn a_node_with_a_wait_on_record_and_no_ending_waits() {
         let held = seen(&[started("a"), registered("a", "t1")], "a");
         assert_eq!((held.status, held.waiting_on.as_deref()), (NodeStatus::Waiting, Some("t1")));
-        let suspended = RunEvent::NodeSuspended { run_id: RUN, node_id: "a".into(), frames: vec![], token: "t1".into(), at_unix: 3 };
+        let suspended = RunEvent::NodeSuspended { run_id: RUN, node_id: "a".into(), frames: vec![], token: Some("t1".into()), at_unix: 3 };
         let paused = seen(&[started("a"), registered("a", "t1"), suspended], "a");
         assert_eq!((paused.status, paused.waiting_on.as_deref()), (NodeStatus::Waiting, Some("t1")));
+    }
+
+    /// A firing parked only because its run paused with it inside (a bus
+    /// read, a stream pull) has no wait of its own to name: it reads
+    /// paused. One whose own wait is still on record with no ending when
+    /// the run pauses waits on that wait all the same.
+    #[test]
+    fn a_node_parked_only_by_its_run_pausing_reads_paused() {
+        let with_run = |node: &str| RunEvent::NodeSuspended { run_id: RUN, node_id: node.into(), frames: vec![], token: None, at_unix: 3 };
+        assert_eq!(seen(&[started("a"), with_run("a")], "a"), Seen::of(NodeStatus::Paused));
+        let holding = seen(&[started("a"), registered("a", "t1"), with_run("a")], "a");
+        assert_eq!((holding.status, holding.waiting_on.as_deref()), (NodeStatus::Waiting, Some("t1")));
     }
 
     /// Each wait a node registered is read off the record with the loop
@@ -288,7 +318,7 @@ mod tests {
             frames: vec![weft_core::frames::Frame::Loop { index }],
             token: token.into(),
             spec: SignalSpec::of_kind("poll_endpoint", json!({ "url": "https://x/status" })),
-            call_index: 0,
+            wait_index: 0,
             at_unix: 2,
         };
         let project = program();
@@ -341,10 +371,32 @@ mod tests {
         };
         let snapshot = weft_journal::fold_to_snapshot(RUN, Arc::new(project.clone()), &[started]);
         let place = state_place(&project, "inside").unwrap();
-        assert_eq!(seen_at(&project, &snapshot, &place).status, NodeStatus::Skipped);
+        assert_eq!(seen_at(&project, &project, &snapshot, &place).status, NodeStatus::Skipped);
         assert!(state_place(&project, "off").unwrap_err().contains("is a group"));
         let refusal = state_place(&project, "c").unwrap_err();
         assert!(refusal.contains("inside loop 'g'") && refusal.contains("read the loop 'g'"), "{refusal}");
+    }
+
+    /// A run of part of a loop's body (its cut holds neither of the loop's
+    /// ends) never launched the loop: a node of that part fired once,
+    /// inside iteration 0, and reads like a node outside every loop. In a
+    /// run that holds the loop, it is refused as ever.
+    #[test]
+    fn a_node_of_a_run_of_part_of_its_loops_body_reads_its_one_firing() {
+        let registered = program();
+        let mut cut = program();
+        cut.nodes.retain(|node| node.id == "c");
+        let inside = vec![weft_core::frames::Frame::Loop { index: 0 }];
+        let events = [
+            RunEvent::NodeStarted { run_id: RUN, node_id: "c".into(), frames: inside.clone(), at_unix: 1 },
+            RunEvent::NodeCompleted { run_id: RUN, node_id: "c".into(), frames: inside, at_unix: 2 },
+        ];
+        let snapshot = weft_journal::fold_to_snapshot(RUN, Arc::new(cut.clone()), &events);
+        let place = place_in_run(&registered, &cut, "c").expect("a node of the part the run ran");
+        assert!(in_run(&cut, &snapshot, &place));
+        assert_eq!(seen_at(&registered, &cut, &snapshot, &place).status, NodeStatus::Completed);
+        let refusal = place_in_run(&registered, &registered, "c").unwrap_err();
+        assert!(refusal.contains("read the loop 'g'"), "{refusal}");
     }
 
     /// A loop reads whole: pending before it starts, running while it goes,
@@ -356,11 +408,11 @@ mod tests {
         let project = program();
         let place = state_place(&project, "g").unwrap();
         let mut snapshot = weft_journal::fold_to_snapshot(RUN, Arc::new(project.clone()), &[]);
-        assert_eq!(seen_at(&project, &snapshot, &place).status, NodeStatus::Pending);
+        assert_eq!(seen_at(&project, &project, &snapshot, &place).status, NodeStatus::Pending);
         let key = LoopInstanceKey { group_id: "g".into(), parent_frames: vec![], run_id: RUN };
         let config = LoopConfig { parallel: false, over: vec![], carry: vec![], max_iters: None, trim_on_mismatch: false };
         snapshot.loop_runtime.ensure(key.clone(), config, LoopItemSource::DoneDriven, None, vec![]);
-        assert_eq!(seen_at(&project, &snapshot, &place).status, NodeStatus::Running);
+        assert_eq!(seen_at(&project, &project, &snapshot, &place).status, NodeStatus::Running);
 
         let mut failed = snapshot.clone();
         failed.loop_runtime.terminate(&key, LoopTerminationReason::Failed).unwrap();
@@ -370,9 +422,9 @@ mod tests {
             RunEvent::NodeFailed { run_id: RUN, node_id: "c".into(), frames: inside, error: "bad item".into(), gave_up_wait: false, at_unix: 2 },
         ];
         failed.firings = weft_journal::fold_to_snapshot(RUN, Arc::new(project.clone()), &events).firings;
-        assert_eq!(seen_at(&project, &failed, &place), Seen { status: NodeStatus::Failed, waiting_on: None, error: Some("bad item".into()) });
+        assert_eq!(seen_at(&project, &project, &failed, &place), Seen { status: NodeStatus::Failed, waiting_on: None, error: Some("bad item".into()) });
 
         snapshot.loop_runtime.terminate(&key, LoopTerminationReason::DoneVoted).unwrap();
-        assert_eq!(seen_at(&project, &snapshot, &place).status, NodeStatus::Completed);
+        assert_eq!(seen_at(&project, &project, &snapshot, &place).status, NodeStatus::Completed);
     }
 }

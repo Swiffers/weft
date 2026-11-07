@@ -20,7 +20,7 @@
       "required": true,
       "widget": {
         "kind": "number",
-        "min": 0,
+        "min": 1,
         "step": 1
       },
       "label": "Largest file (MB)",
@@ -59,18 +59,18 @@
         ]
       },
       "label": "Store in",
-      "description": "`project`: every later run can read the file. `instance`: this run's instance's files. `run`: the run that receives it, swept when that run ends."
+      "description": "`project`: deleted with the project. `instance`: this run's instance's files, deleted by hand, at a deadline, or with the project. `run`: the run that receives it, deleted with that run (once its record goes). Any run can read it either way."
     },
     {
       "name": "ttlDays",
       "type": "Number",
       "widget": {
         "kind": "number",
-        "min": 0,
+        "min": 1,
         "step": 1
       },
-      "label": "Keep for (days, 0 = forever)",
-      "description": "How long the received file lives since its last access; 0 never expires. Empty: a project or instance file lives until deleted, a run file goes with its run."
+      "label": "Deadline (idle days, empty or 0 = none)",
+      "description": "The received file is deleted once nobody has touched it for this many days, or with its run or project if that comes first. Empty or 0: no deadline, it lives as long as its scope says."
     }
   ],
   "outputs": [

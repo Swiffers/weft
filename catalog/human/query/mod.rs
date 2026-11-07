@@ -1,17 +1,24 @@
 //! HumanQuery: pauses mid-run waiting for a human form
-//! submission. Single body: `run` builds a Form signal with
-//! `is_resume=true`, awaits its fire, maps the submission to outputs.
+//! submission. Single body: `run` builds a Form signal, waits on it,
+//! maps the submission to outputs. The submission is all the state
+//! keeps: a body run again after the pause comes back to the wait, which
+//! hands it over.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+use weft::signal::{ConfigForm, Form};
 use weft::{RunContext, Node, NodeManifest, WeftResult};
-
-use super::form_helpers::{
-    build_form, form_specs, map_response_to_ports, parse_form_fields,
-};
 
 #[derive(NodeManifest)]
 pub struct HumanQueryNode;
+
+/// Whether the form came back, and what it said.
+#[derive(Default, Serialize, Deserialize)]
+struct Asked {
+    submission: Option<Value>,
+}
 
 #[cfg(feature = "node-tests")]
 mod tests;
@@ -24,8 +31,7 @@ impl Node for HumanQueryNode {
     }
 
     async fn run(&self, ctx: RunContext) -> WeftResult<()> {
-        let raw_fields = parse_form_fields(ctx.inputs.object()?)?;
-        let specs = form_specs(self.manifest())?;
+        let config = ConfigForm::of(self.manifest(), &ctx.inputs)?;
 
         // Project the node's DATA inputs into a flat {key: value} map so
         // display / prefilled / source=input fields can lift them out by
@@ -39,10 +45,17 @@ impl Node for HumanQueryNode {
         // A stored file among the prefills parks as it is: the listener
         // hands the consumer its facts, and the files door hands out a
         // fresh link each time the form is shown.
-        let prefill = serde_json::Value::Object(input_obj);
+        let prefill = Value::Object(input_obj);
 
-        let form = build_form(&ctx.inputs, specs, "human-query", &prefill)?;
-        let submission = ctx.await_signal(form).await?;
-        ctx.pulse_downstream(map_response_to_ports(&submission, &raw_fields, specs)?).await
+        let form = Form::for_person(
+            "human-query",
+            ctx.inputs.opt("title")?,
+            ctx.inputs.opt("description")?,
+            config.fields(&prefill)?,
+        );
+        let schema = form.schema.clone();
+        let mut state = ctx.keep(Asked::default()).await?;
+        let submission = state.wait(|s| &mut s.submission, form).await?;
+        ctx.pulse_downstream(config.outputs(&schema.answers(&submission)?)?).await
     }
 }

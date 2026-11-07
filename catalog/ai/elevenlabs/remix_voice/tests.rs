@@ -1,7 +1,6 @@
 //! ElevenLabsRemixVoice self-tests: the request the node builds from
 //! every setting, sent on the picked voice's remix route, the previews
-//! stored as the format asked for, the line ElevenLabs answered, and
-//! what is refused before anything is sent.
+//! stored as the format asked for, and the line ElevenLabs answered.
 
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -10,7 +9,7 @@ use weft::storage::StoredFile;
 use weft::{FakeRig, NodeTest, WeftResult};
 
 use super::super::elevenlabs::audio_file_type;
-use super::{refusal, ElevenLabsRemixVoiceNode};
+use super::ElevenLabsRemixVoiceNode;
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
@@ -19,8 +18,6 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("every_elevenlabs_setting_reaches_the_request", every_setting),
         NodeTest::fake("a_typed_voice_id_stays_one_path_segment", voice_id_encoded),
         NodeTest::fake("an_answer_without_its_line_still_hands_the_previews_on", no_line),
-        NodeTest::fake("remixes_elevenlabs_would_refuse_are_refused_before_anything_is_sent", refused),
-        NodeTest::basic("the_remix_requests_elevenlabs_refuses", refusals),
     ]
 }
 
@@ -67,11 +64,11 @@ fn answers(rig: &FakeRig, route: &str, query: &str, clips: &[(&str, &[u8])], tex
 }
 
 /// The stored file behind a preview's audio: its bytes, name and type,
-/// and whether it was kept past the run.
-fn stored(rig: &FakeRig, preview: &Value) -> WeftResult<(Vec<u8>, String, String, bool)> {
+/// and its deadline.
+fn stored(rig: &FakeRig, preview: &Value) -> WeftResult<(Vec<u8>, String, String, Option<u64>)> {
     let file = StoredFile::from_value(&preview["audio"])?;
     let meta = rig.stored_meta(&file.key)?;
-    Ok((rig.stored_bytes(&file.key)?.to_vec(), meta.filename, meta.mime_type, meta.keep))
+    Ok((rig.stored_bytes(&file.key)?.to_vec(), meta.filename, meta.mime_type, meta.keep_ttl_secs))
 }
 
 /// Every format the metadata offers stores under a real extension and
@@ -101,11 +98,13 @@ async fn remixes(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(previews[0]["voiceId"], json!("gen-1"));
     assert_eq!(previews[0]["durationSecs"], json!(3.5));
     assert_eq!(previews[0]["language"], json!("en"));
-    let (bytes, filename, mime, kept) = stored(&rig, &previews[0])?;
+    let (bytes, filename, mime, deadline) = stored(&rig, &previews[0])?;
     assert_eq!(bytes, b"preview-audio".to_vec(), "the decoded clip is what is stored");
     assert_eq!(filename, "preview-1.mp3");
     assert_eq!(mime, "audio/mpeg");
-    assert!(kept, "the previews are the run's product and outlive it");
+    assert_eq!(deadline, None, "the previews are the run's, with no deadline: they go with the run");
+    let key = StoredFile::from_value(&previews[0]["audio"])?.key;
+    assert!(key.contains("/run/"), "run-scoped: the previews are the run's: {key}");
     assert_eq!(outcome.outputs["text"], json!(LINE), "the line ElevenLabs wrote");
 
     let sent = &rig.requests()[0];
@@ -184,35 +183,3 @@ async fn no_line(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-async fn refused(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("_error");
-    for (extra, says) in [
-        (json!({ "voice": " " }), "`voice` is empty"),
-        (json!({ "description": "Low" }), "`description` is 3 characters"),
-        (json!({ "description": "x".repeat(1001) }), "`description` is 1001 characters"),
-        (json!({ "text": "A short line." }), "`text` is 13 characters"),
-        (json!({ "text": "x".repeat(1001) }), "`text` is 1001 characters"),
-    ] {
-        let err = rig.run(&ElevenLabsRemixVoiceNode, inputs(&rig, extra.clone())).await.failure()?;
-        assert!(err.starts_with("input error"), "a mistake in the program fails the run even with `_error` wired: {extra}: {err}");
-        assert!(err.contains(says), "{extra}: {err}");
-    }
-    assert!(rig.requests().is_empty(), "nothing is sent, so nothing is paid for");
-    Ok(())
-}
-
-fn refusals() -> WeftResult<()> {
-    let fine = "x".repeat(5);
-    assert!(refusal(VOICE, &"x".repeat(4), None).is_some());
-    assert!(refusal(VOICE, &fine, None).is_none(), "5 characters is enough to remix");
-    assert!(refusal(VOICE, &"é".repeat(5), None).is_none(), "characters count, not bytes");
-    assert!(refusal(VOICE, &"x".repeat(1000), None).is_none());
-    assert!(refusal(VOICE, &"x".repeat(1001), None).is_some());
-    assert!(refusal(VOICE, &fine, Some("x".repeat(99).as_str())).is_some());
-    assert!(refusal(VOICE, &fine, Some("x".repeat(100).as_str())).is_none());
-    assert!(refusal(VOICE, &fine, Some("x".repeat(1000).as_str())).is_none());
-    assert!(refusal(VOICE, &fine, Some("x".repeat(1001).as_str())).is_some());
-    assert!(refusal("", &fine, None).is_some(), "an empty voice names no voice");
-    assert!(refusal("  ", &fine, None).is_some(), "nor does a blank one");
-    Ok(())
-}

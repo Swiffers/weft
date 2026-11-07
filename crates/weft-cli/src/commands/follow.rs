@@ -220,11 +220,13 @@ fn format_event(value: &Value) -> String {
             short(value.get("runId")),
             value.get("entryNode").and_then(|v| v.as_str()).unwrap_or("?")
         ),
-        "node_suspended" => format!(
-            "… suspended at {} token={}",
-            value.get("node").and_then(|v| v.as_str()).unwrap_or("?"),
-            short(value.get("token"))
-        ),
+        "node_suspended" => {
+            let node = value.get("node").and_then(|v| v.as_str()).unwrap_or("?");
+            match value.get("token").filter(|token| !token.is_null()) {
+                Some(token) => format!("… suspended at {node} token={}", short(Some(token))),
+                None => format!("… paused at {node} (with its run)"),
+            }
+        }
         "run_completed" => format!("✓ completed run={}", short(value.get("runId"))),
         "run_failed" => format!(
             "✗ failed run={}: {}",
@@ -262,7 +264,7 @@ fn short(v: Option<&serde_json::Value>) -> String {
 
 /// How long to wait before looking again at a task when the install could
 /// not be reached, or answered that it cannot serve right now.
-const TASK_LOOK_AGAIN_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+pub(crate) const TASK_LOOK_AGAIN_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Follow task `task` of project `project_id` (a resync, a deactivate's
 /// wait for its runs) until it ends, and answer what it ended with
@@ -300,6 +302,7 @@ pub async fn follow_at(
     mut going: impl AsyncFnMut(Option<Value>) -> anyhow::Result<()>,
 ) -> anyhow::Result<Value> {
     let path = format!("{follow}?wait_ms={}", look.as_millis());
+    let client = client.waiting_up_to(look);
     loop {
         match client.get_json(&path).await {
             Ok(answer) => match crate::client::read_answer(answer, "the task's state")? {
@@ -370,6 +373,7 @@ mod tests {
             "run_started" => json!({ "entryNode": "n", "phase": "fire" }),
             "run_completed" => json!({ "outputs": {} }),
             "run_cancelled" => json!({ "reason": "stopped" }),
+            "run_failed" => json!({ "error": "this run fails on purpose" }),
             "node_started" => json!({ "node": "n", "frames": [], "input": { "in": 7 }, "closedPorts": [] }),
             other => panic!("no fixture for {other}"),
         };
@@ -405,6 +409,20 @@ mod tests {
             assert_eq!(*server.requests.lock().unwrap(), vec!["with_values=true"], "the values come written in");
         }
     );
+
+    /// `weft run` follows its run to the end and exits the way `weft
+    /// wait` does: a run that failed ends the follow in the failed
+    /// outcome, whose exit code is not zero, and one that completed in
+    /// the completed one.
+    #[tokio::test]
+    async fn a_followed_run_ends_in_how_the_run_ended() {
+        let failed = server(vec![vec![event("journal:0:0:0", "run_started", 1), event("journal:1:0:0", "run_failed", 1)]]).await;
+        let outcome = follow_run_id(&failed.client, None, "a", None).await.unwrap();
+        assert_eq!(outcome, Outcome::Failed);
+        assert_ne!(outcome.code(), 0);
+        let completed = server(vec![vec![event("journal:0:0:0", "run_started", 1), event("journal:1:0:0", "run_completed", 1)]]).await;
+        assert_eq!(follow_run_id(&completed.client, None, "a", None).await.unwrap(), Outcome::Completed);
+    }
 
     weft_core::stress_test!(
         name: a_run_follower_whose_stream_drops_goes_on_past_the_last_event_it_read,
@@ -524,6 +542,14 @@ mod tests {
         assert_eq!(line, "$ billing cost unknown");
         let line = format_event(&json!({"kind":"cost_reported","service":"billing","amountUsd":0.0}));
         assert_eq!(line, "$ billing +0.0000");
+    }
+
+    #[test]
+    fn a_node_paused_with_its_run_says_so_where_a_wait_names_its_token() {
+        let waiting = json!({ "kind": "node_suspended", "node": "ask", "token": "abcdefghijk" });
+        assert_eq!(format_event(&waiting), "… suspended at ask token=abcdefgh");
+        let paused = json!({ "kind": "node_suspended", "node": "read", "token": null });
+        assert_eq!(format_event(&paused), "… paused at read (with its run)");
     }
 
     #[test]

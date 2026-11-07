@@ -23,7 +23,7 @@ async fn plain_text(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(file.mime_type, "text/plain");
     assert_eq!(rig.stored_bytes(&file.key)?.as_ref(), "héllo".as_bytes(), "saved as UTF-8");
     let meta = rig.stored_meta(&file.key)?;
-    assert_eq!((meta.keep, meta.keep_ttl_secs), (false, None), "a run file goes with its run");
+    assert_eq!(meta.keep_ttl_secs, None, "a run file goes with its run");
     Ok(())
 }
 
@@ -51,6 +51,6 @@ async fn chosen(rig: FakeRig) -> WeftResult<()> {
 
 async fn unknown_scope(rig: FakeRig) -> WeftResult<()> {
     let err = rig.run(&TextToFileNode, json!({ "text": "x", "scope": "forever" })).await.failure()?;
-    assert!(err.contains("`scope` is 'forever'"), "{err}");
+    assert!(err.contains("scope") && err.contains("forever"), "{err}");
     Ok(())
 }

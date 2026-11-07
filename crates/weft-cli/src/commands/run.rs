@@ -19,9 +19,9 @@
 use anyhow::{bail, Context};
 use weft_core::run_flags::{apply_run_flags, spec_from_flags, RunFlags};
 use weft_core::run_spec::judge::{judge, Verdict};
-use weft_core::run_spec::{Refusal, RunSpec};
+use weft_core::run_spec::RunSpec;
 use weft_core::builds::RunPreview;
-use weft_core::versions::{RunShape, RunStarted, VersionRunRequest};
+use weft_core::versions::{RunShape, RunStarted, RunStarting, StartRun, StartingRun, VersionRunRequest};
 
 use super::Ctx;
 use crate::progress::ActionVerb;
@@ -160,7 +160,9 @@ async fn prepare_check(ctx: &Ctx, args: &RunArgs) -> anyhow::Result<(weft_core::
     seed_bounds_need_a_seed(args)?;
     let project = ctx.project()?;
     let mut spec = spec_for(ctx, args)?;
-    let definition = match weft_compiler::hash::load_program_with_diagnostics(project) {
+    // Compiled for the install, so what is broken is what its build finds.
+    let install = ctx.install_kind().await?;
+    let definition = match weft_compiler::hash::load_program_with_diagnostics(project, Some(install)) {
         Ok((definition, _)) => definition,
         Err(weft_compiler::hash::CompileLoadError::Read(msg)) => bail!("{msg}"),
         Err(weft_compiler::hash::CompileLoadError::Diagnostics(diags)) => {
@@ -349,6 +351,9 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     if let (Some(name), Some(spec)) = (&args.save, &mut spec) {
         spec.name = name.clone();
     }
+    // Before `--save` writes it: an example whose cut is refused is not
+    // kept.
+    refuse_before_building(project, ctx.install_kind().await?, spec.as_ref(), &args)?;
     if let Some(name) = &args.save {
         let spec = spec.as_ref().expect("saving constructs a run spec");
         if super::versions::read_spec_if_present(project, name)?.is_some_and(|existing| existing.is_frozen()) {
@@ -383,7 +388,7 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     };
     let path = format!("/projects/{}/versions/runs", handle.id);
     progress.dispatcher_call_start(&path);
-    let started = start_run(&handle.client, &path, &body).await?;
+    let started = start_run(&handle.client, progress, &handle.id, body).await?;
     let run_id = started.run_id;
     progress.dispatcher_call_done(serde_json::json!({ "runId": run_id, "projectId": handle.id }));
 
@@ -413,28 +418,85 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     Ok(outcome.exit_code())
 }
 
+/// Refuse a run whose cut the folder's program cannot make before anything
+/// is built: where it starts and ends (a loop it holds one end of, a node
+/// no program has), and the bounds of its seed, walked here the way the
+/// install walks them, so a refused cut costs no build. Only the cut: the
+/// rest of what can stop a run (an input it gets nothing for, a value that
+/// does not read) needs the run's values, which the install resolves, and
+/// it judges the whole run again before it builds any image. A program
+/// that does not compile as a whole is the build's to report, with its
+/// diagnostics.
+fn refuse_before_building(
+    project: &weft_compiler::project::Project,
+    install: weft_core::install::InstallKind,
+    spec: Option<&RunSpec>,
+    args: &RunArgs,
+) -> anyhow::Result<()> {
+    // Compiled for the install the run goes to: a part its build finds
+    // broken is a cut it refuses.
+    let Ok((definition, _)) = weft_compiler::hash::load_program_with_diagnostics(project, Some(install)) else {
+        return Ok(());
+    };
+    let graph = weft_core::project::graph::ProjectGraph::new(&definition);
+    let seed = weft_core::run_spec::judge::seed_bounds(&args.seed_until, &args.seed_before);
+    for bounds in spec.map(RunSpec::bounds).into_iter().chain(seed) {
+        if let Err(why) = weft_core::project::cut::walk(&graph, &bounds) {
+            bail!("the run cannot start:\n{why}");
+        }
+    }
+    Ok(())
+}
+
 /// [`judge`] over what `weft run` was asked: whether it seeds, and the
 /// bounds of the seed.
 fn judge_run(definition: &weft_core::ProjectDefinition, spec: Option<&RunSpec>, args: &RunArgs) -> Verdict {
     judge(definition, spec, args.seed.is_some(), &args.seed_until, &args.seed_before)
 }
 
-/// Start the run, turning the resolver's 422 into its lines: every
-/// missing input at once, each naming the three ways to satisfy it.
+/// Start the run: hand `request` to the task that starts it, under an id
+/// made here (asked again under the same id while the install is out of
+/// reach, so it is started once), and follow that task, saying what it is
+/// doing whenever that changes and every [`crate::progress::SAY_AGAIN_EVERY`]
+/// meanwhile. The resolver's 422 reads as its lines: every missing input
+/// at once, each naming the three ways to satisfy it.
+// SYNC: start_run <-> weft_core::versions::StartRun
 pub async fn start_run(
     client: &crate::client::DispatcherClient,
-    path: &str,
-    body: &VersionRunRequest,
+    progress: &crate::progress::Progress,
+    project_id: &str,
+    request: VersionRunRequest,
 ) -> anyhow::Result<RunStarted> {
-    let (status, text) = client.post_json_status(path, &serde_json::to_value(body)?).await.context("start run")?;
-    match status {
-        200..=299 => serde_json::from_str(&text).context("parse run response"),
-        422 => {
-            let refusal: Refusal = serde_json::from_str(&text).context("parse the refusal")?;
-            bail!("the run cannot start:\n{refusal}")
+    let ask = serde_json::to_value(StartRun { task: uuid::Uuid::now_v7(), request })?;
+    let path = format!("/projects/{project_id}/versions/runs");
+    let asked = std::time::Instant::now();
+    let starting: StartingRun = loop {
+        match client.post_json(&path, &ask).await {
+            Ok(answer) => break crate::client::read_answer(answer, "the task starting the run")?,
+            Err(e) => {
+                let why = super::ensure::look_again_after(e).map_err(|e| e.context("start run"))?;
+                progress.warn(&format!("could not hand the run to the install just now ({why}); asking again"));
+                tokio::time::sleep(super::follow::TASK_LOOK_AGAIN_AFTER).await;
+            }
         }
-        _ => bail!("{}", crate::client::refusal_text(&text).unwrap_or_else(|| format!("dispatcher returned {status}"))),
-    }
+    };
+    // Nothing said yet reads as no stage: the start reads what the run
+    // starts with, which takes moments.
+    let mut said = crate::progress::SaidLast::announced(None, std::time::Duration::ZERO);
+    let answer = super::follow::follow_task(client, progress, project_id, starting.task, async |stage| {
+        let stage: Option<RunStarting> = stage.map(serde_json::from_value).transpose().context("read where the run's start is")?;
+        let elapsed = asked.elapsed();
+        if let Some(Some(stage)) = said.hear(stage, elapsed) {
+            progress.run_starting(stage, elapsed);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| match crate::client::refusal(&e).map(|refused| refused.status()) {
+        Some(reqwest::StatusCode::UNPROCESSABLE_ENTITY) => anyhow::anyhow!("the run cannot start:\n{e}"),
+        _ => e.context("start run"),
+    })?;
+    crate::client::read_answer(answer, "the run it started")
 }
 
 /// The one line a run ends its start with: what was inherited and
@@ -589,6 +651,19 @@ mod tests {
         assert_eq!(example_in_version(root, "/home/me/shop/examples/chain.json").unwrap(), "examples/chain.json");
         assert!(format!("{:#}", example_in_version(root, "/tmp/chain.json").unwrap_err()).contains("outside the project"));
         assert!(example_in_version(root, "../chain.json").is_err());
+    }
+
+    /// `--seed-until` and `--seed-before` bound a seed, so either one
+    /// without `--seed` is refused before anything is read, saved or built.
+    #[test]
+    fn seed_bounds_without_a_seed_are_refused() {
+        let before = RunArgs { seed_before: vec!["out".into()], ..Default::default() };
+        let why = seed_bounds_need_a_seed(&before).unwrap_err().to_string();
+        assert!(why.contains("--seed-before") && why.contains("need --seed"), "{why}");
+        let until = RunArgs { seed_until: vec!["mid".into()], ..Default::default() };
+        assert!(seed_bounds_need_a_seed(&until).is_err());
+        assert!(seed_bounds_need_a_seed(&RunArgs { seed: Some(String::new()), ..before }).is_ok());
+        assert!(seed_bounds_need_a_seed(&RunArgs::default()).is_ok());
     }
 
     /// The build is held to the run it is for: what it starts with, and

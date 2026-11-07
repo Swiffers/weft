@@ -4,6 +4,731 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-11-06 (0.2.291)
+
+**What breaks after this update:**
+
+**A pasted connection now offers ways to log in.** An access node of your
+own that declares `acquisition: { "kind": "static", "fields": [...] }` no
+longer loads: its fields go into a way, and its guide moves from
+`ownPage.guide` onto the way:
+
+```json
+"acquisition": { "kind": "static", "ways": [
+  { "fields": [{ "name": "key", "label": "API key" }],
+    "guide": { "link": "https://...", "steps": ["Create a key.", "Paste it below."] } }
+] }
+```
+
+A service can offer several ways (a subscription and an API key, say), each
+with its own `id`, `label`, fields and guide, and mark a way `localOnly`: it
+is offered only on a local install, and a cloud install refuses a connection
+made with it. Your connections are carried over by the update, and so is one
+you copy in from an older weft with `weft migrate connections`: each is
+recorded as made with the one way, `default`. `weft connect` asks which way
+when there are several, or takes `--way <id>`, and the connect form in the
+editor and the browser shows the choice. For the whole shape, go and read
+[pasting a key](docs/src/connections/declaring-a-service.md#pasting-a-key).
+
+**If a project keeps its own copy of the standard nodes, run `weft catalog
+update` and then `weft resync` in its folder after `weft maintenance off`.**
+The copy under `nodes/base_catalog/` still has its access nodes in the old
+shape above, so they no longer load, and a project using one stays down after
+`weft maintenance off`. `weft catalog update` replaces the copy with this
+weft's (any edit you made in there is lost), and `weft resync` builds the
+project again.
+
+**A bus now ends once nobody is on it and no node can still join it, not when
+the node that made or joined it returns.** Every node that registered a name
+on a bus (`open_bus`, `pending_bus`, `join_bus`) is a member until its body
+returns, and then its name leaves and nothing else happens, even if it failed.
+A node can still join while the bus's marker is on a wire to a node that has
+not started, in a loop that has not ended, or in the input of a node that is
+still running (or paused on a wait) and has not used the bus yet. When the bus ends, it ends finished, or failed with the
+error of the last member to leave if that one failed. A node
+that makes a bus can return at once, and the nodes it handed the bus to still
+get to join it. Two kinds of node need a change:
+
+- One that relied on its return to end a bus another node is still on (a
+  guest whose exit told the host the conversation was over): call
+  `bus.close()` before it returns, or put a `CloseBus` after it in the graph.
+- One that reads or waits on a bus before joining it: call `join_bus` first.
+  Once your node reads or waits on the bus, it no longer keeps the bus open, so
+  the bus can end before you join, and the join is refused with `bus is closed; cannot
+  register`.
+
+For the whole rule, go and read
+[how a bus ends](docs/src/nodes/streams-and-buses.md#how-a-bus-ends).
+
+**A `package.toml` with a key weft does not know no longer loads.** It holds
+`[package]` with `name` and `uses`, and `[dependencies]`; anything else (a
+misspelled `use`, say) leaves the package's nodes out, and a program using
+one fails naming the key (``unknown field `use` ``).
+
+**For your own nodes:**
+
+- `ctx.open(&access).await?.way()` says which way a connection was made with.
+- `ctx.renew(&access)` renews a connection whose values the service refused:
+  once however many nodes ask, and only while the connection still holds what
+  your firing was handed, so a provider whose refresh token rotates can be
+  shared by many nodes. For how, go and read
+  [when the service refuses the values](docs/src/connections/using-one-in-a-node.md#when-the-service-refuses-the-values).
+- A pasted login that expires (a login file holding a refresh token) can be
+  kept alive by weft: give its way a `renewal`, and weft renews it like a
+  sign-in. Tokens that say their expiry only inside themselves are read with
+  `jwtExpiry`. For both, go and read
+  [a pasted login weft keeps alive](docs/src/connections/declaring-a-service.md#a-pasted-login-weft-keeps-alive).
+- `bus.until_end(&mut state)` waits for a bus to end, pausing like a read,
+  for a node that stays on a bus it has nothing to read on. It is in
+  [how a bus ends](docs/src/nodes/streams-and-buses.md#how-a-bus-ends) too.
+- `ctx.is_setup()` says whether the body runs in a setup (right after its
+  infra is applied) or a real run, and `ctx.firing_key()` is the same every
+  time a firing's body runs again and different on every loop iteration and
+  run: send it to a service that must not see your call twice. For both, go
+  and read [which firing am I](docs/src/nodes/ctx.md#which-firing-am-i).
+- An infra unit can be one process on the machine weft runs on
+  (`Unit.process`, local install only), with the programs it needs checked
+  before it starts. A need of it can carry a `recipe`, and weft then installs
+  the program itself, once, into a folder every install on the machine
+  shares; `weft deps-install` runs those recipes too. For how, go and read
+  [a process on your machine](docs/src/nodes/infrastructure.md#a-process-on-your-machine).
+- An endpoint can live inside another infra node's endpoint
+  (`EndpointTarget::Within`), for a server a node starts inside a Computer.
+  For how, go and read
+  [a server inside another infra node](docs/src/nodes/infrastructure.md#a-server-inside-another-infra-node).
+- A rule can ask whether the program is built for a local install
+  (`{ "kind": "local_install" }`); `weft validate` and the editor leave it
+  unanswered. If a rule mixes that with a value a wire brings, the build
+  settles what it can and the rest is checked again when the node fires. For
+  how, go and read
+  [a rule that asks which install](docs/src/nodes/metadata.md#a-rule-that-asks-which-install).
+- A node can declare named lists (`lists` in its `metadata.json`), and a
+  node it is wired into can refuse a value found in one:
+  `"noneOf": { "list": "reservedToolNames", "ofNodeWiredInto": "agent" }`
+  reads the list off whichever node is wired into its `agent` input, and
+  `noneMatch` refuses a text one of a list's regexes matches (a list marked
+  `"optional": true` may be left out by the node wired in). A value
+  that arrives on a wire is checked when the node fires. For how to write
+  the rule and its message, go and read
+  [a list another node declares](docs/src/nodes/metadata.md#a-list-another-node-declares).
+- A package can call another package's Rust code: name it in `uses = [...]`
+  in `package.toml`. For how, go and read
+  [packaging](docs/src/nodes/packaging.md#using-another-packages-code).
+- If your node builds the form it asks a person at run time, `weft::signal`
+  has it as data (`Form::for_person`, `FormField::choice` with
+  `ChoiceOption`, `.required()`, `.answering_for(key)`), and `ConfigForm`
+  builds one from a node's own settings, as HumanQuery does. For how, go and
+  read [asking a person](docs/src/nodes/triggers.md#asking-a-person).
+- A `[[needs]]` entry can say how to get a program no package manager has
+  (`how = "curl -fsSL ... | bash"`), which the person reads where the need is
+  reported missing, in place of "install it by hand".
+- `state.wait(field, FirstOf::either(a, b))` waits on two signals and ends
+  with whichever answers first, taking the other down (a form withdrawn once
+  what it asks about needs no answer). For how, go and read
+  [waiting on whichever comes first](docs/src/nodes/durable-execution.md#waiting-on-whichever-comes-first).
+
+**The rest:**
+
+**Weft drives coding agents.** `ClaudeCode`, `Codex` and 23 more agent nodes,
+one conversation each, on your machine or inside a Computer: `AskAgent`
+talks to the agent, `AnswerAgent` puts its questions and permission requests
+to a person, `CloseBus` on the agent node's `stream` ends that node's part of the run, and
+`nodes/base_catalog/agents/conversation.weft` is a ready loop of them. In an existing project,
+run `weft catalog update` to get them. For how, go and read
+[Driving a coding agent](docs/src/build/coding-agents.md).
+
+**`CloseBus` ends a bus**, for a bus that outlives the nodes sending on it:
+put it after the last of them. While anybody is on the bus it ends finished;
+if nobody is on it any more, it ends the way its last member left, so a
+producer that failed still reads as failed.
+
+**A bus that ended while its run was paused stays ended after the pause.**
+A node handed its marker afterwards reads it to its end, and the node that
+made it gets it back, instead of failing with "not a live bus".
+
+**The browser extension shows a conversation in a form**, message by
+message, shows a choice's options with their descriptions, and keeps Submit
+off until every required field has an answer.
+
+**A Computer forwards requests to a program started in it**, at
+`/apps/<name>/`, for a node that runs a server inside the computer. If the
+program also wrote down how it starts, the computer starts it again each time
+the computer starts.
+
+**Terminating a node that lives inside another removes it from there.**
+`weft infra terminate` of an agent node deletes its whole conversation, on
+your machine and inside a computer, where weft asks the computer to remove it
+(`DELETE /apps/<name>`); `weft infra stop` keeps everything. For what stays
+and why, go and read
+[stop and terminate](docs/src/build/coding-agents.md#stop-keeps-the-conversation-terminate-deletes-it).
+
+## 2026-11-03 (0.2.290)
+
+**What breaks after this update:**
+
+**A node picks up after a pause from a state it saves, instead of running
+its body again over a record of what it did.** `ctx.run` and
+`ctx.await_signal` are gone. A node that waits now keeps a state and waits
+through it:
+
+```rust
+#[derive(Default, Serialize, Deserialize)]
+struct Approval { posted: Option<Posted>, manager: Option<Value> }
+
+let mut state = ctx.keep(Approval::default()).await?;
+let posted = state.once(|s| &mut s.posted, async |_| post_buttons(&ctx).await).await?;
+let manager = state.wait(|s| &mut s.manager, form).await?;
+```
+
+`once` runs its work only while its field is empty, `wait` waits only while
+its field is empty, and both save the state. A wait with a call to make if
+the run is cancelled is `state.wait(field, kind.cancel_with(call))`. Your own
+nodes need this change before they build again.
+
+**Every call where a run can pause takes the state.** Bus reads
+(`cursor.next(&mut state)`, `next_json`, `next_message`, `next_bytes`),
+`bus.wait_for(name, &mut state)`, stream pulls (`gen.next(&mut state)`,
+`try_next(&state)`, `drain(&mut state)`) and `ctx.yield_downstream(output, &mut
+state)`, and the program-call helpers that wait in a loop (`infra.start`,
+`request_start`, `rebake`, `follow_command`, a build or run that follows,
+`resync`, `resume_resync`, `remove`). A node whose work cannot be picked up
+from the middle (a provider session, an answer to a caller) passes
+`&mut ctx.hold()` instead: while a `ctx.hold()` value of the firing exists,
+no wait of that firing pauses (its `state.wait` and helpers' waits included);
+each waits open in its call, as in a run that cannot pause, up to the
+trigger's `holdSecs` with nobody on the line, then gives up. `ctx.create_bus` now takes the output port its marker goes out on.
+
+**A node reads a bus through one reader, and reads directly only where a
+pause cannot catch it out.** `bus.cursor()`, `cursor_at(offset)` and
+`cursor_from_start()` return a `Result`, and opening a second reader on a bus
+the body already opened one on fails the node, naming both lines. The first
+time a run of the body reaches a place it can pause (a bus read, a stream
+pull, `state.read`, `state.wait`, a yield; a place is its line and the bus,
+stream or state field it reads, so buses read in turn at one line are a place
+each), no direct read (a bus reader's
+`next`, `next_json`, `next_message` or `next_bytes`, a stream's `next`,
+`try_next` or `drain`) may have happened before it in that run, except inside
+a `state.once` that finished; otherwise the node fails there, naming both
+lines (`read directly (not through its state) at ... before it ...`). The
+check runs on every run, so a body that takes another path on its resume
+fails where the paths split. Reads made while the firing holds its run
+(`ctx.hold()`) are exempt while it holds; once the hold is dropped, its last
+held read counts as a direct read for every place after. `bus.wait_for` is not
+a read. If you need a
+message again after a pause, read it with the new
+`state.read(|s| &mut s.field, &mut reader)`, which hands back the item in the
+field when it is filled and reads into it otherwise, saving it with the rest
+of the state at the next save (a pause, `save()`, or the end of a `once` or
+`wait`). `state.once`'s work now gets the state,
+`state.once(|s| &mut s.f, async |st| { .. })`, so a finished phase of reads
+can go inside it. A message's kind and JSON value come from the new
+`BusEntry::as_json()`. For the rule and the shapes it allows, go and read
+"Reading a bus or a stream across a pause" in the node docs.
+
+**A run paused before this update fails when it picks up**, naming the node
+and saying to start it again with `weft run --seed=<run>`, which reuses what
+it already did. Runs that are not paused are not affected.
+
+**Local infra is named after its install, so two installs on one machine
+running the same project no longer share a container or a database.**
+Before, they shared one name, so the second could not start, or started its
+database on the first one's data. Your local databases keep their data: the
+first time an install starts an infra node after this update, it copies each
+disk from its old volume into one under the new name, then removes the old
+volume. Infra still running from before keeps running, but weft can no longer
+reach its doors: a node calling it fails, saying to run `weft infra stop`
+then `weft infra start`, which moves it over. If two installs on the machine
+ran the same infra on one old volume, weft cannot tell whose data it holds, so
+the start refuses and names the command to settle it: `weft infra take-disk
+<volume>`, run under the install whose data it is. A start also refuses a
+volume that has this install's name but belongs to another install.
+
+**A connection now carries its service in its type.** Before, wiring a
+Mistral connection into a fal node compiled, and the node sent the Mistral key
+to fal. A connection is now typed with its service, `Access[fal]`: each access
+node takes and puts out its own service's (a node of yours that declares a
+`service` types its connection input with it), every catalog node's connection
+input names the service it takes (a union like `Access[openai] | Access[anthropic]` when
+it takes several), and the compiler refuses any other. A bare `Access` takes
+any service, but a bare `Access` no longer fits an `Access[fal]` input, so if a
+group or included file of yours passes a connection through a port typed
+`Access`, write the service on it (`db: Access[postgres]`). A connection of
+another service arriving at a node's input when it runs fails the node, naming
+both.
+
+**Route and Socket check their callers themselves; ApiKeyAuth and HmacAuth
+are gone.** `auth` on a `Route` or `Socket` is now a setting: `"none"` (the
+default), `"api_keys"` (what ApiKeyAuth did: `X-Api-Key`, or a Bearer
+token), `"hmac_sha256"` (what HmacAuth did: `X-Signature` over
+`<timestamp>.<body>`), `"hmac_sha1"`, `"hmac_sha512"`, `"ed25519"` or
+`"ecdsa_p256"` (the same layout, with that algorithm), `"oidc"`, or a whole
+verify block for any other scheme. The
+keys or the secret live in a connection of the route's own, picked on each
+install, so each gated route needs it once after this update: `weft connect
+<route> --grant <id>` picks the connection the old auth node used (`weft
+connect --list` shows its id), or `weft connect <route>` stores a new one. A
+route whose `auth` names a scheme and has no connection fails to activate,
+saying so. `weft connect` now takes the node as its argument
+(`weft connect <node>`), and `--node` is gone.
+
+**A node's rules on values are written with one kind, `value`.** A node
+`metadata.json` using `config_present`, `config_nonempty`, `config_equals`,
+`config_in_set`, `config_matches`, `config_item_count`, `config_items_fit`,
+`config_in_range` or `config_field_in_set`, or an input's `minItems`, now
+fails to load, naming `value`. Write `{ "kind": "value", "field": "x" }`
+with the checks you need (`nonempty`, `equals`, `oneOf`, `matches`, `count`,
+`range`, `length`, `unique`, `each`); `minItems: 2` becomes a rule refusing
+`not { "kind": "value", "field": "x", "count": { "min": 2 } }`. A node's own
+rule `input_source_type` fails to load too: type the input with its service
+instead (`"type": "Access[slack]"`).
+
+**A node's rules now hold for values that arrive on a wire.** A rule in a
+node's `metadata.json` that the compiler could not decide, because its value
+comes from another node, is now checked before the node runs, with the value
+that arrived. A program that compiled and ran with a wired value breaking a
+rule now fails at that node with the rule's own message, and a wired `_error`
+does not catch it. Fix the value upstream.
+
+**A blank optional text counts as not given.** An optional input that takes
+text (`String`, or a union with `String` in it, like `String | List[String]`)
+that arrives empty or only spaces is treated as absent: the node gets no value
+(or the input's default), and a node needing one of several inputs counts it
+as missing. So these nodes now skip instead of failing: GmailSend when `to`,
+`cc` and `bcc` are all blank or missing, or `text` and `html` both are;
+GmailLabel when `add` and `remove` both are; NotionAppendBlocks when `content`
+is blank and `blocks` is missing.
+If your program relied on that failure, check for the skip instead.
+
+**A `datetime` setting must be a moment with its zone**, like
+`2026-09-03T11:00:00+02:00`. WaitUntil's and GoogleCalendarListEvents' dates are
+held to it: a written one at compile time, a wired one before the node runs.
+
+**A bus that ended failed now fails the node reading it**, with `the bus
+ended failed: <why>`, instead of reading as a clean end.
+
+**A message on a bus goes out to a caller with its files as links and its
+secrets revealed.** A bus carries no type, so `Stream` reads each message's
+markers instead: a stored file in it goes out as a link, and a secret as its
+value. Before, either one was refused.
+
+**For your own nodes:**
+
+- `storage.put_from_url(url, mime, filename, keep)` takes the file's type
+  second (`None` takes the server's).
+- A `PollDelta` takes `paging` (`None` for a list that fits one answer).
+- `client::cursor_paged` hands its request closure the cursor
+  (`|cursor| ..`), and `CursorPaging.param` is an `Option` (`None` when the
+  cursor goes in the body).
+
+**The rest:**
+
+**`weft test-node` takes several packages or nodes at once**
+(`weft test-node slack telegram`) and builds them together.
+
+**Poll triggers no longer lose a burst.** A trigger polling a list that
+comes in pages (Gmail's, Notion's, Airtable's new-item triggers) follows the
+pages until it meets an item it has seen, and fires every new one, instead
+of firing only the first page. More than 50 pages of new items between two
+polls fails the poll, firing nothing, and the log says so.
+
+**A cancelled run stops waiting on a slow server.** Every request a node
+sends through weft's clients, an infra endpoint's call, a storage read or a
+write of bytes or a stream, a provider socket and a bus read now end the moment the run is
+cancelled, so nodes that did not watch for a cancel themselves (an HTTP
+request, a text-to-speech call, an embedding) no longer keep a cancelled run
+alive.
+
+**A node can clean up what it made at a provider, however it ends.**
+`ctx.after_node(CancelCall::delete(url).always(), &access)` puts the call
+on the run's record and sends it once when the node ends, even after a
+crash. The ElevenLabs nodes use it for the files they upload for a job, so
+a cancelled or crashed run no longer leaves them in your account.
+
+**A durable run's record is written faster again.** Since costs and secrets
+got tables of their own, every write of a run's record paid for saving them
+even when it had none; it now does that work only when the run reported a
+cost or holds a secret.
+
+**A bus or a stream no longer keeps a run from pausing.** When every node
+waits and one of them waits on something outside the run (a timer, a form),
+the run pauses with its buses open; the next worker opens them again with the
+same members, and every node carries on where it stopped. A node that paused
+behind messages the bus no longer holds when it comes back (an ephemeral bus
+keeps none over a pause, and any bus drops what falls out of its window) fails
+saying so, instead of skipping them. A node holds one name per bus. A node
+reading a whole stream with `drain` can pause too: weft saves the items it
+was holding with the node's state, and the resumed `drain` starts from them
+and takes the rest, so a node draining a stream fed by a node waiting on a
+person no longer keeps the worker up for as long as that person takes. A
+pausing run writes its buses' open journal windows at once, instead of
+waiting for each window to run out (a second by default) before it lets go
+of its worker.
+
+**A node that saves a state runs again from it when its worker dies**,
+instead of being failed, in a durable run.
+
+**A run stays on its worker a while before it pauses.** A trigger's new
+`pauseAfterSecs` (default 10, `0` pauses at once as before, at most 3600, and
+`weft run --pause-after-secs` for one run) is how long a run that can pause
+stays on its worker, quiet, once every node it is running waits, before it
+pauses: a wait's answer that arrives in that time goes straight into the
+waiting call, so a run fed by frequent messages no longer pauses and resumes
+for each one. A run now pauses in one way only: every node it runs waits,
+the window runs out, and every waiting call pauses together. A hand-back (the
+cloud's 59-minute limit, a worker stopping, maintenance) pauses at once.
+
+**A caller on the line is never cut off by a wait.** While a route's caller
+is connected, a wait holds the run on its worker for as long as the caller
+stays (`holdSecs` only counts once nobody is on the line, or with `0`, which
+still refuses such a wait at once). At a cloud install's 59-minute limit on
+one connection, a route with `outlivesCaller` on gives the nodes its run is
+running 5 seconds to end, then ends its caller's connection with a `504`
+(the reason, saying to reconnect, is on the run's record for `weft logs`) and
+the run goes on in a fresh worker (a node still running then runs again from its saved
+state, or fails as cut short if it keeps none); with it off, the run is
+cancelled as before.
+
+**`ctx.projects().declare` without an id** takes one from the call, so a call
+carried again after a lost answer finds the project the first one made.
+
+## 2026-11-02 (0.2.289)
+
+**A group's or a loop's `@file` value now shows and edits in the editor.** A
+value written on a group's or a loop's port with `@file` (or a text `@asset`)
+shows the file's content in the box's config strip, like a node's field does,
+and editing it saves to the file. The badge beside it switches between `@file`
+and `@asset`.
+
+**Two commands publishing the same file at once no longer fail.** When two
+`weft` commands uploaded a file with the same content at the same moment, the
+second could stop with "the unfinished upload ... could not be picked up". It
+now waits for the first to finish and uses that file.
+
+## 2026-11-02 (0.2.288)
+
+**What breaks after this update:**
+
+**A build no longer copies a `@file`'s text into the program.** The program
+names the file by a hash of its content, the version stores the file, and the
+worker that runs the program reads it, so a large SQL script or prompt no
+longer makes every copy of the program large. A text `@asset` is stored the
+same way. `weft maintenance off` stores the text an older build kept for a
+text `@asset` read as a `String` and builds it again as usual; one read as
+another type (a `Number`, a JSON shape) no longer says what the file held, so
+that project is not built again, and the lift names the file: run `weft
+resync` in its folder.
+
+**`weft status` asks the install in a POST.** Only a CLI from this update can
+ask an install from this update, which `./setup.sh` gives you both of.
+
+**The rest:**
+
+**`weft activate` says which triggers it leaves behind** the build it used,
+and `weft activate --no-build` turns triggers on with the build the install
+has registered without building the folder (for a deploy's exit trap).
+
+**`weft status --json` says `on` for each trigger copy**, true when it is on,
+behind the build or not.
+
+**A 502, 503 or 504 that weft did not write says what it most often means**
+(the dispatcher's copy ran out of memory) and how to raise it, and a read is
+asked once more first.
+
+**`weft tree` and `weft freeze` no longer sync the folder.**
+
+**A worker that ran out of memory says so** in the error of the node it was
+running, with how full it was and `weft workers set --memory`.
+
+**A run carried on while its files could not be read waits instead of
+failing.** When the store (or the broker) does not answer as a worker picks a
+run up again, the run stays queued, unclaimed, and the worker counts as busy:
+the run is handed out again after a pause that grows to a minute, for as long
+as that lasts, and `weft status` shows the last error under the project's
+workers. `weft workers set` hands it out again at once. A file that is gone
+for good still fails the run, naming `weft resync`.
+
+**On a cloud install, a build's files may take up to a quarter of the
+dispatcher's memory**: a larger one fails on its own instead of stopping the
+copy serving every other request.
+
+## 2026-11-01 (0.2.287)
+
+**What breaks after this update:**
+
+**A file's scope now says only how long it lives, never who may read it.**
+Every run of every project in your account can read every stored file, for as
+long as it exists. A run's file is deleted when its own time runs out or when
+its run is deleted (its keep time running out, `weft clean`, `weft rm`),
+whichever comes first; it is no longer deleted when its run ends. A project's
+file is deleted when its own time runs out or when its project is deleted,
+whichever comes first, and so is an instance's file, which lives inside its
+project. A shared space's file is deleted only by hand or when its own time
+runs out. Run files stay on disk as long as their runs are kept, so an
+install that keeps many runs keeps more files. The files nodes make (downloads,
+generated pictures and audio, transcripts) no longer carry a 30-day time of
+their own: they last as long as their run.
+
+**Keep File means something else.** `scope: project`, now the default, copies
+the file into the project's files, so it outlives the run that made it.
+`scope: run` leaves the file where it is and only sets its time: `ttlDays` is
+how many idle days it lives, and empty or `0` gives it none. A program that
+relied on the old default (`run`, keeping a run file past its run's end) now
+copies into the project; set `scope: run` to keep the old place.
+
+**The `run-file-kept-past-run` warning is gone,** with the `fileScopeFrom`
+and `keepsInputsPastRun` keys of a node's `metadata.json`. A node that sets
+either no longer loads: remove the key.
+
+**The rest:**
+
+**On a cloud install, an update stops the old weft's copies.** They used to
+decide for themselves that they had been replaced. The install workflow now
+deletes the older revisions of weft's own services once the new ones serve,
+which stops those copies: each finishes what it was answering, closes what it
+held open and gives back the work it was in the middle of, and the editor and
+the workers reconnect to the new copies by themselves (you may see the
+editor's live view reconnect during an update). If you roll a revision out by
+hand outside the workflow, the older copies keep running until the next
+workflow run or until you delete their revisions yourself.
+
+**Part of a loop's body runs on its own.** `--from`, `--target`, `--emit`,
+`--before`, `--group` and `--feed` now take a node or a group inside a loop's
+body. A run that starts and ends inside the body runs that part once, inside
+the loop's first iteration (`#0`), and you hand it what the loop would have
+(the item, the index). A run that holds one end of a loop without the other is
+refused, naming the loop. `weft run` checks where a run starts and ends before
+it builds anything, so a cut it cannot make costs no build.
+
+**A command following something during an update carries on.** A `weft`
+command following a task, an infra command, a maintenance lift or a node's
+tests while a copy of weft stops (an update, or a cloud copy scaled away) is
+answered at once and asks again on a running copy, instead of losing its
+connection. A worker waiting on something weft is doing for it does the same.
+
+**The editor's stored-file picker lists every file of your account,** not only
+the current project's, since any run can read any of them.
+
+## 2026-11-01 (0.2.286)
+
+**The editor extension ships again.** 0.2.285 never reached the stores: its
+webview bundle failed to build. This release carries everything 0.2.285 lists
+below. Nothing to do beyond updating as usual.
+
+## 2026-11-01 (0.2.285)
+
+**What breaks after this update:**
+
+**A database's password is handed over once to whoever takes it.** `weft infra
+env` writing it into a file, or the card's copy button, now hands it over the
+way a run storing it does: the card shows it as handed over from then on, and
+its Reset button mints a new one.
+
+**`weft infra env --as` names the secret it writes.** On a card with more than
+one secret (a database with a `login` role), `--as` used to take whichever one
+still showed its value; it now refuses and lists them, and `--set
+NAME=Label` picks one.
+
+**Tangle's specialists write `cd` and ffmpeg a little differently.** After
+`weft tangle update` in a project, a specialist changes folder only as `cd
+./<folder>`, and names each ffmpeg or ffprobe input's format right before it
+(`ffmpeg -f mp4 -i clip.mp4 ...`); any other form is refused, with a message
+showing this one. In return they may now search the project with `grep` and
+`rg`, look at media with `ffprobe` and make it with `ffmpeg` into their own
+scratch folder, read a database with a read-only `psql` transaction (`psql
+<connection> -c "BEGIN TRANSACTION READ ONLY" -c "<one SELECT, SHOW or
+EXPLAIN>"`), and stop a run they started with `weft stop`, without asking you.
+The commands they may run are now read the way your shell reads them, bash or
+zsh, so a line that only looked harmless is refused.
+
+**On Linux, weft's internal port no longer listens on every address of your
+machine.** It listens on loopback and on the one address Docker gives your
+containers for this machine, which weft asks Docker each time it starts, so
+nothing on your network reaches it any more.
+
+**The rest:**
+
+**A PostgresDatabase makes the roles your program needs.** Since the program
+signs in as `app`, which is no superuser, a database that kept tenants apart
+with roles of its own could no longer make them, `set role` to them, or let a
+site sign in as one, and a setup step writing past a `FORCE` row-level
+security policy was refused. List them in the node's new `roles` input: on
+every start the database makes each one, grants it to `app` (so `set role`
+works), lets one marked `login` sign in through the pooler with a password of
+its own, handed out once like the program's (`weft infra env <node> --into
+.env --set SITE_PASSWORD="<role> password"` takes it, and its Reset button on
+the card mints a new one), and lets one marked
+`bypassRowLevelSecurity` write past every policy. Roles you made by hand keep
+what they own; list them under the same names and the database takes them
+over, except that a `login` role gets a password of its own, so whatever signs
+in as it needs the new one from the card. Taking a role off the list takes back
+what it gave: `app` can no longer `set role` to it, and it signs in and passes
+row-level security no more; the role and what it owns stay. Changing the list
+restarts the database.
+
+**A cloud dispatcher fits in its memory, and keeps the memory you give it.**
+On Cloud Run a role's files are held in its memory, and the dispatcher kept
+up to 1GiB of a build's files there, and 64 programs whatever their size;
+past 512Mi a resync failed with `Service Unavailable`. It now keeps at most
+64MiB of those files there and about 90MiB of programs. The dispatcher gets
+1Gi by default, and each role's memory is a repository variable on your fork
+(`WEFT_DISPATCHER_MEMORY`, `WEFT_BROKER_MEMORY`, `WEFT_LISTENER_MEMORY`,
+`WEFT_SUPERVISOR_MEMORY`, and `WEFT_HOLDER_MEMORY` for the holders): a value set by hand in the Cloud Run console used
+to be put back to 512Mi by every install run, and now the install sets yours.
+
+**A fork's deploy no longer compiles the weft CLI.** The install workflow now
+keeps the CLI it used in your install, and the deploy workflow downloads it
+from there first, checking its sha256, before weft's release and before
+compiling it. Run `weft ci add` again in each project to get the new deploy
+workflow, and the install workflow once, to store the CLI.
+
+**The first project of standard nodes after a cloud update starts at once.**
+The install already built the standard worker, and that project built it
+again, waiting about three minutes; it now runs on the one the install built.
+
+**A node can hand a stored file to its project's own container.** On a local
+install an `internal_link` points at `127.0.0.1`, which inside a container is
+the container itself, so a download from there failed. A node's code now asks
+for `container_link(&file)`, which a project's own container opens on any
+install.
+
+**`weft daemon start` on a Mac says why launchd refused.** The error now
+carries everything `launchctl` printed and its exit status, where it used to
+end at `launchctl bootstrap failed:`. What fails before the runtime even
+starts (a secrets file it cannot read, a binary gone) now lands in the
+install's log, and so does a runtime's panic after its log has rolled over,
+which used to go to a file nobody reads.
+
+## 2026-11-01 (0.2.284)
+
+**What breaks after this update:**
+
+**A shared trigger whose runs reach something per instance is refused.**
+A trigger every instance shares fires runs for no instance, so until now every
+fire of one wired into a per-instance part was refused at run time ("... exists
+once per instance, so this run needs to know which instance it is for"). The
+compiler now refuses the trigger (`shared-trigger-reaches-per-instance`),
+naming what it reaches and why each is per instance: the editor shows the
+error, and the trigger cannot be turned on or fired until it is fixed, while
+the rest of the program runs. Make the trigger per instance too, or keep what
+is per instance out of what it runs. A route or a socket is not refused, since
+each call can name its instance. Under a file included at several sites, only
+the site that reaches something per instance is refused: the same trigger under
+another include of the file still turns on.
+
+**A loop output nothing inside the loop writes is refused**
+(`loop-output-unwritten`), and so is any run that reaches the loop. A gathered
+one would be a list of nothing but nulls, and a carried one would never change,
+so it is almost certainly a port the loop forgot to write. Write the output
+inside the loop, or remove the port.
+
+**If a program of yours had its shared runs refused because a file it includes
+is also included under a per-instance part, run `weft resync` in it** once you
+are on this version, so its triggers run the new build. Until now, including a
+file inside a group with a per-instance part made that file per instance
+everywhere, so a shared route that included the same file had every run
+refused. Each include now decides for itself.
+
+**What now works:**
+
+**The graph shows an included file's nodes per instance where they are.**
+Walked into from the entry file, a file included at several sites shows each
+node per instance at a site where an instance's value reaches it and shared at
+one where none does, even before the install knows about it.
+
+**A loop with no outputs ends.** Until now one over an empty list, and one over
+a list with items, was declared stuck (`... never started, waiting on its scope
+to open`).
+
+**A run whose trigger has `recorded: false` can be tagged**, and a stop by that
+tag reaches it. Tagging writes down the run's start, a small row that goes when
+the run's keep period ends.
+
+**A file stored for its run only, then written somewhere that outlives the run,
+is warned about** (`run-file-kept-past-run`): `scope: run` keeps the file, but
+only its own run can read it, whatever `ttlDays` says. Store it with
+`scope: project` if a later run needs it.
+
+**A bad fire payload names every missing and unknown field at once**, and so
+does every other check of a value against a record type (a typed route body, a
+node's declared output), with the field names now in single quotes.
+
+## 2026-11-01 (0.2.283)
+
+**What breaks after this update:**
+
+**`weft run` starts the run through a task on the install.** The install
+answers the start at once and the command follows it, so a CLI from before
+this update cannot start a run on an install after it, and the other way
+round: update the CLI with the install (`./setup.sh` does both). What the
+command prints is the same, plus a line every half minute while the run is
+being prepared (reading the seed run's results, checking the files they
+name, waiting for the project's lock). The start goes on if the command
+stops, and the same request sent again never starts a second run.
+
+**Every CLI request now has a time limit.** Two minutes for an ordinary
+request, or a long look's hold and half a minute; a request the install
+answers only once its own work is done (an infra start, `weft rm`, a bake,
+a connection) still has none. A look that runs out is said and asked again,
+so a copy of the install replaced in the middle of a request is noticed
+instead of leaving `weft infra upgrade` or a build silent for an hour. If
+you wrapped weft in a script that relied on a request waiting longer than
+that, it now gets an error saying the install did not answer in time.
+
+**If you script `weft ... --json`, check the exit code** (or the one line's
+`"phase": "error"`) before reading fields such as `.triggers`: on any
+failure the command prints that error line and exits with a failure code.
+The deploy workflow `weft ci add` writes now does this; run `weft ci add`
+again to get it.
+
+**What is new:**
+
+**`weft status` shows the fires and calls a trigger drops.** A fire refused
+before any run starts (the program cannot run a part the fire reaches, the
+trigger takes no work, it has no armed program) was answered as handled and
+only logged, so a trigger could drop every fire for days with nothing in
+`weft status`. Each trigger now says how many fires and calls it dropped in
+the last minute or two and why the last one was dropped, and the editor
+marks it `dropping`.
+
+**`weft resync` refuses before taking anything down when a trigger could
+not come back here.** A trigger whose connection needs the service to send
+events to your weft, on an install the internet cannot reach, used to be
+refused only once it was already down, and stayed down. The resync now asks
+before it takes anything down, and names each such trigger and the fix.
+It also says where it is every half minute, including which triggers it is
+turning back on and what their setup waits on.
+
+**A stale bake says what moved.** `weft run --fire` refused after an update
+saying the code changed, when only weft had: an update builds every program
+again. It now says whether the graph, a node's code or only the program's
+worker changed, and still names `weft bake`. A stored bake that no longer
+reads no longer fails the read of the others; a fire that needs it names it.
+
+**A run a program starts is started once.** A program's call that starts a
+run and is sent again (its answer lost on the way) now answers the run it
+started instead of starting a second one.
+
+**A schema change that gives up waiting on a lock says what held it** and
+how to find it.
+
+## 2026-11-01 (39a50c84)
+
+**Triggers come back after an update again.** Since 0.2.281, the triggers
+`weft maintenance on` took down could stay down: `weft resync` warned "a
+resync or the maintenance lift activated outside the task that drives it;
+this is a bug in weft" for each of them, and running it again changed
+nothing. Both `weft maintenance off` and the `weft resync` that brings back
+what a lift left now bring them back. If you updated to 0.2.281 or 0.2.282
+and your triggers are still down, run `weft resync` in the project once you
+are on this version. A trigger renamed or removed since it was last on is no
+longer brought back with the others: the lift says it is no trigger of the
+program any more and forgets it, where it used to fail the whole group with
+it.
+
+**A resync no longer waits forever on a run that already ended.** A run that
+ended in the moment a resync (or a deactivate) started waiting on it was never
+heard ending, so the wait never finished and the new version never took over.
+
 ## 2026-10-31 (0.2.282)
 
 **What breaks after this update:**

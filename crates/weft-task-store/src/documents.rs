@@ -49,8 +49,10 @@ use serde_json::Value;
 use crate::db::{Client, Param, Pool, Transaction};
 use weft_core::stored::{apply, current_version, round_trip, Kind, Op, Version};
 
-/// How many rows one batch carries forward.
-const BATCH: i64 = 500;
+/// How many rows one batch carries forward. Kept small: a batch is written in one
+/// statement, and 500 programs of a few MB each passed Postgres' 1 GB message limit
+/// ("invalid message length"), which looped the boot.
+const BATCH: i64 = 20;
 
 /// One column of JSON documents and what carries its rows to today. Made
 /// from the type it holds ([`Document::of`]), so its steps and the check
